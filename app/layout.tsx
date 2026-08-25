@@ -6,6 +6,7 @@ const geist = Geist({ variable: '--font-geist-sans', subsets: ['latin-ext'] });
 const newsreader = Newsreader({ variable: '--font-newsreader', subsets: ['latin-ext'] });
 
 export const metadata: Metadata = {
+  metadataBase: new URL('https://net-ve-dieu-kho-noi.vancuong-0399.chatgpt.site'),
   title: 'Nét — Vẽ điều khó nói',
   description: 'Vẽ, ghi chú và gửi hình ảnh như một tin nhắn bình thường.',
   openGraph: {
