@@ -103,7 +103,7 @@ export const messages = pgTable('messages', {
   sequence: bigint('sequence', { mode: 'number' }).generatedAlwaysAsIdentity(),
   roomId: uuid('room_id').notNull().references(() => rooms.id, { onDelete: 'cascade' }),
   senderId: text('sender_id').references(() => users.id, { onDelete: 'set null' }),
-  guestSessionId: uuid('guest_session_id').references(() => guestSessions.id, { onDelete: 'cascade' }),
+  guestSessionId: uuid('guest_session_id').references(() => guestSessions.id, { onDelete: 'set null' }),
   senderName: text('sender_name').notNull(),
   type: messageType('type').notNull(),
   body: text('body'),

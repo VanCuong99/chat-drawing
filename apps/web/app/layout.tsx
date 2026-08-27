@@ -6,7 +6,11 @@ const geist = Geist({ variable: '--font-geist-sans', subsets: ['latin-ext'] });
 const newsreader = Newsreader({ variable: '--font-newsreader', subsets: ['latin-ext'] });
 
 export const metadata: Metadata = {
-  metadataBase: new URL('https://net-ve-dieu-kho-noi.vancuong-0399.chatgpt.site'),
+  metadataBase: new URL(
+    process.env.VERCEL_PROJECT_PRODUCTION_URL
+      ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
+      : 'http://localhost:3000',
+  ),
   title: 'Nét — Vẽ điều khó nói',
   description: 'Vẽ, ghi chú và gửi hình ảnh như một tin nhắn bình thường.',
   manifest: '/manifest.webmanifest',

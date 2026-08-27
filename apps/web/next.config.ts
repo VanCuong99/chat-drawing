@@ -1,5 +1,17 @@
 import type { NextConfig } from 'next';
 
-const nextConfig: NextConfig = {};
+const apiOrigin = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001').replace(/\/$/, '');
+if (process.env.VERCEL && (!process.env.NEXT_PUBLIC_API_URL || !process.env.NEXT_PUBLIC_REALTIME_URL)) {
+  throw new Error('NEXT_PUBLIC_API_URL and NEXT_PUBLIC_REALTIME_URL are required for Vercel deployments.');
+}
+
+const nextConfig: NextConfig = {
+  outputFileTracingRoot: new URL('../..', import.meta.url).pathname,
+  async rewrites() {
+    return {
+      fallback: [{ source: '/api/:path*', destination: `${apiOrigin}/api/:path*` }],
+    };
+  },
+};
 
 export default nextConfig;

@@ -95,6 +95,6 @@ test('bộ chọn hình mở cạnh toolbar và vẽ được hình thang @criti
   await expect(page.getByRole('dialog', { name: 'Studio Nét' })).toBeHidden();
   const endResponse = page.waitForResponse((response) => response.url().endsWith('/api/guest') && response.request().method() === 'DELETE');
   await page.getByRole('button', { name: 'Kết thúc phiên khách' }).click();
-  await page.getByRole('button', { name: 'Xoá và kết thúc phiên' }).click();
+  await page.getByRole('button', { name: 'Kết thúc phiên', exact: true }).click();
   expect((await endResponse).status()).toBe(200);
 });

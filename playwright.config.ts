@@ -6,6 +6,7 @@ import { loadEnvFile } from 'node:process';
 if (existsSync('.env')) loadEnvFile('.env');
 process.env.DATABASE_URL ??= 'postgresql://net:net@localhost:5432/net';
 process.env.AUTH_JWT_SECRET ??= 'net-e2e-local-auth-secret-never-use-in-production';
+process.env.CRON_SECRET ??= 'net-e2e-local-cron-secret-never-use-in-production';
 
 const runAddress = `2001:db8:${randomBytes(2).toString('hex')}:${randomBytes(2).toString('hex')}::1`;
 const e2eRateLimitSecret = 'net-e2e-local-only';

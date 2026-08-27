@@ -4,13 +4,15 @@ import { ConsoleLogger, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import helmet from 'helmet';
-import { json, raw, urlencoded } from 'express';
+import { json, raw, urlencoded, type NextFunction, type Request, type Response } from 'express';
+import { waitUntil } from '@vercel/functions';
 import { ApiExceptionFilter } from './observability/api-exception.filter';
 import { AppModule } from './app.module';
 import { SocketIoAdapter } from './realtime/socket-io.adapter';
 import { AbuseProtectionMiddleware } from './security/abuse-protection.middleware';
 import { RequestContextMiddleware } from './observability/request-context.middleware';
 import { configBoolean, configInteger } from './config/runtime-config';
+import { RealtimeOutboxService } from './realtime/realtime-outbox.service';
 
 async function bootstrap() {
   const jsonLogs = process.env.LOG_FORMAT === 'json' || process.env.NODE_ENV === 'production';
@@ -23,10 +25,19 @@ async function bootstrap() {
   if (trustProxyHops > 0) app.getHttpAdapter().getInstance().set('trust proxy', trustProxyHops);
   const requestContextMiddleware = app.get(RequestContextMiddleware);
   const abuseProtectionMiddleware = app.get(AbuseProtectionMiddleware);
+  const realtimeOutbox = app.get(RealtimeOutboxService);
   app.use(requestContextMiddleware.use.bind(requestContextMiddleware));
   app.use(abuseProtectionMiddleware.use.bind(abuseProtectionMiddleware));
+  app.use((_request: Request, _response: Response, next: NextFunction) => {
+    const drain = realtimeOutbox.triggerDrain();
+    if (process.env.VERCEL) waitUntil(drain);
+    next();
+  });
   const origin = config.get<string>('WEB_ORIGIN', 'http://localhost:3000');
   const redisUrl = config.get<string>('REDIS_URL');
+  if (process.env.NODE_ENV === 'production' && !redisUrl) {
+    throw new Error('REDIS_URL is required in production so realtime events remain consistent across instances.');
+  }
   const allowedOrigins = origin.split(',').map((value) => value.trim().replace(/\/$/, '')).filter(Boolean);
   if (!allowedOrigins.length) throw new Error('WEB_ORIGIN must contain at least one absolute origin.');
   for (const allowedOrigin of allowedOrigins) {

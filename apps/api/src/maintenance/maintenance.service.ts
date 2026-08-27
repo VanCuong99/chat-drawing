@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import { Cron } from '@nestjs/schedule';
 import { AssetsService } from '../assets/assets.service';
 import { ChatService } from '../chat/chat.service';
 import { RateLimitService } from '../security/rate-limit.service';
@@ -15,11 +14,11 @@ export class MaintenanceService {
     private readonly outbox: RealtimeOutboxService,
   ) {}
 
-  @Cron('0 * * * * *')
   async cleanup() {
     if (this.running) return;
     this.running = true;
     try {
+      await this.outbox.drainForMaintenance();
       await this.chat.cleanupExpiredGuests();
       await this.assets.cleanupOrphans();
       await this.limits.cleanup();

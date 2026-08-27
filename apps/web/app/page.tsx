@@ -1,4 +1,4 @@
-import { chatGPTSignInPath, chatGPTSignOutPath, createApiToken, getChatGPTUser } from '@/src/server/chatgpt-auth';
+import { createApiToken, getAuthenticatedUser, signInPath, signOutPath } from '@/src/server/auth';
 import NetApp from '@/src/features/chat/net-app';
 
 export const dynamic = 'force-dynamic';
@@ -10,14 +10,14 @@ export default async function Home({ searchParams }: { searchParams?: Promise<{ 
     ? roomParameter
     : '';
   const returnTo = inviteCode ? `/?room=${encodeURIComponent(inviteCode)}` : '/';
-  const user = await getChatGPTUser();
+  const user = await getAuthenticatedUser();
   const apiToken = user ? await createApiToken(user) : null;
   return (
     <NetApp
       initialUser={user ? { id: user.userId, displayName: user.displayName, email: user.email } : null}
       initialApiToken={apiToken}
-      signInPath={chatGPTSignInPath(returnTo)}
-      signOutPath={chatGPTSignOutPath('/')}
+      signInPath={signInPath(returnTo)}
+      signOutPath={signOutPath('/')}
     />
   );
 }

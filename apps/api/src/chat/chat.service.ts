@@ -9,6 +9,7 @@ import {
   guestSessions,
   ilike,
   inArray,
+  isNotNull,
   isNull,
   lt,
   messages,
@@ -121,63 +122,100 @@ export class ChatService {
     const displayName = this.requireText(displayNameInput, 'Tên hiển thị', 2, 60);
     const inviteCode = typeof inviteCodeInput === 'string' ? inviteCodeInput.trim() : '';
     const now = Date.now();
-    let [room] = inviteCode
-      ? await this.db.select().from(rooms).where(eq(rooms.inviteCode, inviteCode)).limit(1)
-      : [];
-    if (inviteCode && (!room || !room.allowGuests)) throw new NotFoundException('Link mời không hợp lệ hoặc phòng không nhận khách.');
-    if (!room) {
-      [room] = await this.db.insert(rooms).values({ name: `Phiên của ${displayName}`, kind: 'guest', inviteCode: this.makeCode(), allowGuests: true, createdAt: now }).returning();
-    }
     const expiresAt = this.actors.guestTtl();
-    const [session] = await this.db.insert(guestSessions).values({ roomId: room.id, displayName, createdAt: now, lastSeenAt: now, expiresAt }).returning();
-    const [firstMessage] = await this.db.select({ id: messages.id }).from(messages).where(eq(messages.roomId, room.id)).limit(1);
-    if (!firstMessage) {
-      await this.db.insert(messages).values({ roomId: room.id, guestSessionId: session.id, senderName: 'Nét', type: 'system', body: 'Phiên khách đã bắt đầu. Nội dung của bạn sẽ được xoá khi kết thúc phiên.', createdAt: now + 1, expiresAt });
-    }
-    return { sessionId: session.id, expiresAt, roomId: room.id, roomName: room.name };
+    const [candidate] = inviteCode
+      ? await this.db.select({ id: rooms.id }).from(rooms).where(eq(rooms.inviteCode, inviteCode)).limit(1)
+      : [];
+    if (inviteCode && !candidate) throw new NotFoundException('Link mời không hợp lệ hoặc phòng không nhận khách.');
+    return this.db.transaction(async (tx) => {
+      let room: typeof rooms.$inferSelect;
+      if (candidate) {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${candidate.id}, 0))`);
+        const [availableRoom] = await tx.select().from(rooms)
+          .where(and(eq(rooms.id, candidate.id), eq(rooms.inviteCode, inviteCode), eq(rooms.allowGuests, true))).limit(1);
+        if (!availableRoom) throw new NotFoundException('Link mời không hợp lệ hoặc phòng không nhận khách.');
+        room = availableRoom;
+      } else {
+        [room] = await tx.insert(rooms).values({ name: `Phiên của ${displayName}`, kind: 'guest', inviteCode: this.makeCode(), allowGuests: true, createdAt: now }).returning();
+      }
+      const [session] = await tx.insert(guestSessions).values({ roomId: room.id, displayName, createdAt: now, lastSeenAt: now, expiresAt }).returning();
+      const [firstMessage] = await tx.select({ id: messages.id }).from(messages).where(eq(messages.roomId, room.id)).limit(1);
+      if (!firstMessage) {
+        const [authenticatedMember] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers)
+          .where(eq(roomMembers.roomId, room.id)).limit(1);
+        await tx.insert(messages).values({ roomId: room.id, guestSessionId: session.id, senderName: 'Nét', type: 'system', body: 'Phiên khách đã bắt đầu. Nội dung chỉ là tạm thời trong phòng chỉ có khách; trong phòng có thành viên đăng nhập, nội dung đã gửi có thể được giữ lại.', createdAt: now + 1, expiresAt: authenticatedMember ? null : expiresAt });
+      }
+      return { sessionId: session.id, expiresAt, roomId: room.id, roomName: room.name };
+    });
   }
 
   async endGuest(actor: Actor) {
     if (actor.kind !== 'guest') throw new UnauthorizedException('Phiên khách không còn hiệu lực.');
-    await this.endGuestById(actor.id);
-    return { ok: true };
+    const retained = await this.endGuestById(actor.id);
+    return { ok: true, retained };
   }
 
   async endGuestById(guestId: string) {
     const ended = await this.db.transaction(async (tx) => {
+      const [candidate] = await tx.select({ roomId: guestSessions.roomId }).from(guestSessions)
+        .where(eq(guestSessions.id, guestId)).limit(1);
+      if (!candidate) return null;
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${candidate.roomId}, 0))`);
       const [guest] = await tx.select().from(guestSessions).where(eq(guestSessions.id, guestId)).for('update').limit(1);
       if (!guest) return null;
-      const [assetRows, messageRows] = await Promise.all([
-        tx.select({ key: assets.key }).from(assets).where(eq(assets.guestSessionId, guestId)),
+      const [member, assetRows, messageRows] = await Promise.all([
+        tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.roomId, guest.roomId)).limit(1),
+        tx.select({ key: assets.key, status: assets.status }).from(assets).where(eq(assets.guestSessionId, guestId)),
         tx.select({ id: messages.id }).from(messages).where(eq(messages.guestSessionId, guestId)),
       ]);
-      if (assetRows.length) {
+      const retainSharedContent = member.length > 0;
+      const disposableAssets = retainSharedContent
+        ? assetRows.filter((asset) => asset.status !== 'attached')
+        : assetRows;
+      if (disposableAssets.length) {
         await tx.update(assets).set({ status: 'deleting' }).where(and(
           eq(assets.guestSessionId, guestId),
-          inArray(assets.key, assetRows.map((asset) => asset.key)),
+          inArray(assets.key, disposableAssets.map((asset) => asset.key)),
         ));
+      }
+      if (retainSharedContent) {
+        await tx.update(assets).set({
+          guestSessionId: null,
+          ownerKey: `retained-guest:${guestId}`,
+          expiresAt: null,
+        }).where(and(eq(assets.guestSessionId, guestId), eq(assets.status, 'attached')));
+        await tx.update(messages).set({ guestSessionId: null, expiresAt: null }).where(eq(messages.guestSessionId, guestId));
+      } else if (messageRows.length) {
+        await tx.delete(messages).where(eq(messages.guestSessionId, guestId));
       }
       const outboxId = await this.outbox.enqueue(tx, guest.roomId, 'guest.ended', {
         guestSessionId: guestId,
-        messageIds: messageRows.map((message) => message.id),
+        retained: retainSharedContent,
+        messageIds: retainSharedContent ? [] : messageRows.map((message) => message.id),
       });
       await tx.delete(reactions).where(eq(reactions.actorKey, `guest:${guestId}`));
       await tx.delete(guestSessions).where(eq(guestSessions.id, guestId));
-      return { guest, assetRows, messageRows, outboxId };
+      return { guest, disposableAssets, outboxId, retainSharedContent };
     });
-    if (!ended) return;
+    if (!ended) return false;
     await this.outbox.deliverIds([ended.outboxId]);
-    await this.assetService.deleteKeys(ended.assetRows.map((asset) => asset.key));
+    await this.assetService.deleteKeys(ended.disposableAssets.map((asset) => asset.key));
     const [room] = await this.db.select({ kind: rooms.kind }).from(rooms).where(eq(rooms.id, ended.guest.roomId)).limit(1);
     if (room?.kind === 'guest') {
-      const [member, activeGuest, retainedAsset] = await Promise.all([
-        this.db.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.roomId, ended.guest.roomId)).limit(1),
-        this.db.select({ id: guestSessions.id }).from(guestSessions).where(eq(guestSessions.roomId, ended.guest.roomId)).limit(1),
-        this.db.select({ key: assets.key }).from(assets).where(eq(assets.roomId, ended.guest.roomId)).limit(1),
-      ]);
-      if (!member[0] && !activeGuest[0] && !retainedAsset[0]) await this.db.delete(rooms).where(eq(rooms.id, ended.guest.roomId));
+      await this.db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${ended.guest.roomId}, 0))`);
+        const [member, activeGuest, retainedAsset] = await Promise.all([
+          tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.roomId, ended.guest.roomId)).limit(1),
+          tx.select({ id: guestSessions.id }).from(guestSessions).where(eq(guestSessions.roomId, ended.guest.roomId)).limit(1),
+          tx.select({ key: assets.key }).from(assets).where(eq(assets.roomId, ended.guest.roomId)).limit(1),
+        ]);
+        if (!member[0] && !activeGuest[0] && !retainedAsset[0]) {
+          await tx.delete(rooms).where(eq(rooms.id, ended.guest.roomId));
+        }
+      });
     }
     this.realtime.disconnectActor(`guest:${guestId}`);
+    return ended.retainSharedContent;
   }
 
   async searchUsers(actor: Actor, queryInput: unknown) {
@@ -220,8 +258,21 @@ export class ChatService {
     const [room] = await this.db.select({ id: rooms.id }).from(rooms).where(eq(rooms.inviteCode, inviteCode)).limit(1);
     if (!room) throw new NotFoundException('Không tìm thấy cuộc trò chuyện từ link mời.');
     const outboxId = await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${room.id}, 0))`);
+      const [availableRoom] = await tx.select({ id: rooms.id }).from(rooms)
+        .where(and(eq(rooms.id, room.id), eq(rooms.inviteCode, inviteCode))).limit(1);
+      if (!availableRoom) throw new NotFoundException('Cuộc trò chuyện không còn tồn tại.');
       await tx.insert(roomMembers).values({ roomId: room.id, userId: actor.id, role: 'member', joinedAt: Date.now() })
         .onConflictDoNothing({ target: [roomMembers.roomId, roomMembers.userId] });
+      await tx.update(messages).set({ expiresAt: null }).where(and(
+        eq(messages.roomId, room.id),
+        isNotNull(messages.guestSessionId),
+      ));
+      await tx.update(assets).set({ expiresAt: null }).where(and(
+        eq(assets.roomId, room.id),
+        isNotNull(assets.guestSessionId),
+        eq(assets.status, 'attached'),
+      ));
       return this.outbox.enqueue(tx, room.id, 'room.updated', { memberId: actor.id });
     });
     await this.outbox.deliverIds([outboxId]);
@@ -322,6 +373,8 @@ export class ChatService {
     }
     const now = Date.now();
     const result = await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${roomId}, 0))`);
+      let guestContentExpiresAt = actor.kind === 'guest' ? actor.expiresAt : null;
       if (clientRequestId) {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${clientRequestId}, 0))`);
         const [existing] = await tx.select({
@@ -344,9 +397,12 @@ export class ChatService {
         const [valid] = await tx.select({ id: guestSessions.id }).from(guestSessions)
           .where(and(eq(guestSessions.id, actor.id), eq(guestSessions.roomId, roomId), gt(guestSessions.expiresAt, now))).for('update').limit(1);
         if (!valid) throw new UnauthorizedException('Phiên khách đã kết thúc trước khi tin nhắn được gửi.');
+        const [authenticatedMember] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers)
+          .where(eq(roomMembers.roomId, roomId)).limit(1);
+        if (authenticatedMember) guestContentExpiresAt = null;
       }
       if (body.assetKey) {
-        const attached = await tx.update(assets).set({ status: 'attached' }).where(and(
+        const attached = await tx.update(assets).set({ status: 'attached', expiresAt: guestContentExpiresAt }).where(and(
           eq(assets.key, body.assetKey), eq(assets.roomId, roomId), eq(assets.ownerKey, actor.actorKey), eq(assets.status, 'pending'),
         )).returning({ key: assets.key });
         if (!attached.length) throw new BadRequestException('Hình ảnh đã được dùng bởi một tin nhắn khác.');
@@ -364,7 +420,7 @@ export class ChatService {
         canvasVersion,
         clientRequestId,
         createdAt: now,
-        expiresAt: actor.kind === 'guest' ? actor.expiresAt : null,
+        expiresAt: guestContentExpiresAt,
       }).returning({ id: messages.id, sequence: messages.sequence, createdAt: messages.createdAt, canvasVersion: messages.canvasVersion });
       const outboxId = await this.outbox.enqueue(tx, roomId, 'message.created', { messageId: inserted.id, sequence: inserted.sequence });
       return { ...inserted, outboxId };

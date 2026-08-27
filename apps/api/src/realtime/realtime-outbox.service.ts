@@ -21,11 +21,13 @@ import { telemetry } from '../observability/telemetry';
 
 const BATCH_SIZE = 50;
 const LEASE_MS = 30_000;
+const BACKGROUND_MAX_BATCHES = 2;
+const MAINTENANCE_MAX_BATCHES = 10;
 
 @Injectable()
 export class RealtimeOutboxService {
   private readonly logger = new Logger(RealtimeOutboxService.name);
-  private draining = false;
+  private drainPromise: Promise<void> | null = null;
 
   constructor(
     @Inject(DATABASE) private readonly db: NetDatabase,
@@ -52,18 +54,46 @@ export class RealtimeOutboxService {
   }
 
   async deliverIds(ids: string[]) {
-    if (!ids.length) return;
-    await this.drain(ids);
+    if (!ids.length || !this.realtime.isReady()) return;
+    let remaining = [...new Set(ids)];
+    while (remaining.length) {
+      const claimed = await this.claim(remaining);
+      if (!claimed.length) return;
+      for (const event of claimed) await this.deliver(event);
+      const deliveredIds = new Set(claimed.map((event) => event.id));
+      remaining = remaining.filter((id) => !deliveredIds.has(id));
+    }
   }
 
-  async drain(onlyIds?: string[]) {
-    if (this.draining || !this.realtime.isReady()) return;
-    this.draining = true;
+  triggerDrain() {
+    return this.drain(BACKGROUND_MAX_BATCHES).catch((error) => {
+      this.logger.warn({
+        event: 'outbox.drain.failed',
+        message: error instanceof Error ? error.message.slice(0, 500) : 'Unknown outbox drain error',
+      });
+    });
+  }
+
+  async drainForMaintenance() {
+    while (this.drainPromise) await this.drainPromise;
+    await this.drain(MAINTENANCE_MAX_BATCHES);
+  }
+
+  async drain(maxBatches = BACKGROUND_MAX_BATCHES) {
+    if (!this.realtime.isReady()) return;
+    if (this.drainPromise) return this.drainPromise;
+    const run = (async () => {
+      for (let batch = 0; batch < maxBatches && this.realtime.isReady(); batch += 1) {
+        const claimed = await this.claim();
+        for (const event of claimed) await this.deliver(event);
+        if (claimed.length < BATCH_SIZE) break;
+      }
+    })();
+    this.drainPromise = run;
     try {
-      const claimed = await this.claim(onlyIds);
-      for (const event of claimed) await this.deliver(event);
+      await run;
     } finally {
-      this.draining = false;
+      if (this.drainPromise === run) this.drainPromise = null;
     }
   }
 

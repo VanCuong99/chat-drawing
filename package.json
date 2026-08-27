@@ -17,7 +17,7 @@
     "start:web": "pnpm --filter @net/web start",
     "start:api": "pnpm --filter @net/api start",
     "lint": "pnpm --filter @net/web lint && pnpm --filter @net/api lint",
-    "check:infra": "node scripts/validate-nginx.mjs && AUTH_JWT_SECRET=local-compose-validation-secret-32bytes docker compose config --quiet",
+    "check:infra": "node scripts/validate-nginx.mjs && AUTH_JWT_SECRET=local-compose-validation-secret-32bytes NEON_AUTH_BASE_URL=http://localhost:9999 NEON_AUTH_COOKIE_SECRET=local-compose-cookie-secret-32bytes docker compose config --quiet",
     "security:audit": "pnpm audit --prod",
     "clean": "node scripts/clean-generated.mjs",
     "db:up": "docker compose up -d postgres",
@@ -33,6 +33,12 @@
     "@playwright/test": "1.62.1",
     "concurrently": "9.2.1",
     "socket.io-client": "4.8.3"
+  },
+  "pnpm": {
+    "overrides": {
+      "@esbuild-kit/core-utils>esbuild": "0.25.12",
+      "@nestjs/config>lodash": "4.18.1"
+    }
   },
   "type": "module"
 }

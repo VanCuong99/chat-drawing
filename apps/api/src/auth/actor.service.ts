@@ -1,5 +1,5 @@
 import { ForbiddenException, Inject, Injectable, UnauthorizedException } from '@nestjs/common';
-import { and, eq, gt, guestSessions, messages, reactions, roomMembers, users, assets, type NetDatabase } from '@net/database';
+import { and, eq, gt, guestSessions, isNotNull, messages, reactions, roomMembers, users, assets, type NetDatabase } from '@net/database';
 import type { Request } from 'express';
 import { JwtService } from '@nestjs/jwt';
 import { DATABASE } from '../database/database.module';
@@ -59,9 +59,9 @@ export class ActorService {
         if (!guest) return null;
         const expiresAt = now + GUEST_TTL_MS;
         await tx.update(guestSessions).set({ lastSeenAt: now, expiresAt }).where(eq(guestSessions.id, guest.id));
-        await tx.update(messages).set({ expiresAt }).where(eq(messages.guestSessionId, guest.id));
+        await tx.update(messages).set({ expiresAt }).where(and(eq(messages.guestSessionId, guest.id), isNotNull(messages.expiresAt)));
         await tx.update(reactions).set({ expiresAt }).where(eq(reactions.actorKey, `guest:${guest.id}`));
-        await tx.update(assets).set({ expiresAt }).where(eq(assets.guestSessionId, guest.id));
+        await tx.update(assets).set({ expiresAt }).where(and(eq(assets.guestSessionId, guest.id), isNotNull(assets.expiresAt)));
         return { kind: 'guest', id: guest.id, actorKey: `guest:${guest.id}`, displayName: guest.displayName, email: null, expiresAt, roomId: guest.roomId };
       });
     }

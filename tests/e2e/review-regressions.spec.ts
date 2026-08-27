@@ -87,7 +87,7 @@ test('lỗi bootstrap tạm thời giữ nguyên guest credential và cho phép 
 test('link đăng nhập giữ nguyên mã mời trong return_to @critical', async ({ page }) => {
   const inviteCode = 'reviewInvite2026';
   await page.goto(`/?room=${inviteCode}`);
-  const href = await page.getByRole('link', { name: 'Đăng nhập với ChatGPT' }).getAttribute('href');
+  const href = await page.getByRole('link', { name: 'Đăng nhập tài khoản' }).getAttribute('href');
   expect(href).toBeTruthy();
   expect(new URL(href!, 'http://localhost:3000').searchParams.get('return_to')).toBe(`/?room=${inviteCode}`);
 });

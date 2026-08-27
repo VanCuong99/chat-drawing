@@ -92,7 +92,7 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     await expect(pageB.locator('.message-bubble').getByText(fromBob, { exact: true })).toBeVisible();
     const ended = pageB.waitForResponse((response) => response.url().endsWith('/api/guest') && response.request().method() === 'DELETE');
     await pageB.getByRole('button', { name: 'Kết thúc phiên khách' }).click();
-    await pageB.getByRole('button', { name: 'Xoá và kết thúc phiên' }).click();
+    await pageB.getByRole('button', { name: 'Kết thúc phiên', exact: true }).click();
     expect((await ended).status()).toBe(200);
     sessionB = '';
     await expect(pageB.getByRole('heading', { name: /Có những điều/ })).toBeVisible();
@@ -103,7 +103,7 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
 
     const aliceEnded = pageA.waitForResponse((response) => response.url().endsWith('/api/guest') && response.request().method() === 'DELETE');
     await pageA.getByRole('button', { name: 'Kết thúc phiên khách' }).click();
-    await pageA.getByRole('button', { name: 'Xoá và kết thúc phiên' }).click();
+    await pageA.getByRole('button', { name: 'Kết thúc phiên', exact: true }).click();
     expect((await aliceEnded).status()).toBe(200);
     sessionA = '';
   } finally {

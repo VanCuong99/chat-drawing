@@ -32,6 +32,6 @@ test('Studio không bị cắt ở màn hình ngang thấp và mobile @critical'
   await page.getByRole('button', { name: /Đóng/ }).click();
   await page.getByRole('button', { name: 'Mở danh sách trò chuyện' }).click();
   await page.getByRole('button', { name: 'Kết thúc phiên khách' }).click();
-  await page.getByRole('button', { name: 'Xoá và kết thúc phiên' }).click();
+  await page.getByRole('button', { name: 'Kết thúc phiên', exact: true }).click();
   await expect(page.getByRole('heading', { name: /Có những điều/ })).toBeVisible();
 });

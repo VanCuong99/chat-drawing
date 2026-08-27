@@ -10,7 +10,7 @@ Các lớp trong repository xử lý phần application abuse và resource exhau
 2. NestJS có token bucket và concurrency ceiling để shed load trước controller. Đây là lớp theo process; ngưỡng nghiệp vụ ghi dữ liệu vẫn được kiểm tra atomic trong PostgreSQL để dùng chung giữa các replica.
 3. Socket.IO chỉ cho WebSocket, kiểm tra Origin chính xác, buffer tối đa 16 KiB, giới hạn số socket/actor và tần suất event subscribe.
 4. PostgreSQL pool có giới hạn connection, connection/query/statement timeout. Transaction được giữ ngắn; outbox worker claim batch bằng `FOR UPDATE SKIP LOCKED`.
-5. Asset có giới hạn byte/count/pending theo owner. Multi-host phải dùng `STORAGE_DRIVER=s3`; local volume chỉ phù hợp một Docker host.
+5. Asset có giới hạn byte/count/pending theo owner. Vercel production phải dùng private `STORAGE_DRIVER=blob`; local volume chỉ phù hợp local/Docker một host.
 
 Giá trị trong `.env.example` là baseline, không phải con số phổ quát. Điều chỉnh bằng load test với traffic thật; giảm từ từ và theo dõi 429/latency thay vì đoán.
 
@@ -50,7 +50,7 @@ Metrics tùy chỉnh hiện có:
 ## Realtime và triển khai nhiều replica
 
 - Cấu hình Redis là bắt buộc khi có nhiều API replica; nếu không, room Socket.IO chỉ tồn tại trong một process.
-- Mọi event nghiệp vụ được ghi vào `realtime_outbox` cùng transaction dữ liệu. Worker lease row, phát at-least-once rồi đánh dấu published. UI phải chịu được event trùng và luôn HTTP catch-up sau reconnect.
+- Mọi event nghiệp vụ được ghi vào `realtime_outbox` cùng transaction dữ liệu. Request tạo event chờ phát event của chính nó; cron maintenance drain backlog theo batch, lease row, phát at-least-once rồi đánh dấu published. UI phải chịu được event trùng và luôn HTTP catch-up sau reconnect.
 - `message.client_request_id` là UUID idempotency key. Client retry với đúng key cũ; không sinh key mới cho cùng một lần bấm gửi.
 - `message.sequence` là thứ tự chuẩn cho pagination/read state; không dùng timestamp client.
 - Theo dõi số row outbox chưa publish, `attempts`, `last_error` và tuổi row cũ nhất. Row đã publish được dọn sau 24 giờ.
@@ -64,9 +64,9 @@ Metrics tùy chỉnh hiện có:
 ## Checklist production
 
 - Secret JWT ngẫu nhiên tối thiểu 32 byte, lấy từ secret manager; không commit `.env`.
-- OAuth/OIDC hoặc trusted identity proxy thực sự; không bật trust identity header từ Internet.
+- Neon Auth/OIDC được cấu hình đúng origin; web không tin identity header do trình duyệt tự gửi.
 - CDN/WAF/DDoS protection, TLS, origin firewall và health checks.
-- S3-compatible storage private bucket, encryption, lifecycle, backup và CORS tối thiểu.
+- Vercel Blob private store, token chỉ đặt ở API, lifecycle/backup phù hợp và không public URL object thô.
 - Redis TLS/auth nếu đi qua mạng; PostgreSQL TLS và user quyền tối thiểu.
 - Centralized JSON logs, OTLP collector private, dashboard/alerts và retention budget.
 - Chạy `pnpm build`, `pnpm lint`, migration và full E2E trước rollout.

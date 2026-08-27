@@ -59,7 +59,7 @@ export class AssetsService {
       });
     });
     try {
-      await this.storage.put(key, bytes);
+      await this.storage.put(key, bytes, mimeType);
       const [ledger] = await this.db.select({ status: assets.status, guestSessionId: assets.guestSessionId }).from(assets).where(eq(assets.key, key)).limit(1);
       if (!ledger || ledger.status !== 'pending' || (actor.kind === 'guest' && ledger.guestSessionId !== actor.id)) {
         await this.storage.delete(key);

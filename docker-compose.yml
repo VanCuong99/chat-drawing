@@ -73,14 +73,8 @@ services:
       HTTP_MAX_REQUESTS_PER_SOCKET: ${HTTP_MAX_REQUESTS_PER_SOCKET:-1000}
       UPLOAD_DIR: /app/uploads
       STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
-      S3_BUCKET: ${S3_BUCKET:-}
-      S3_REGION: ${S3_REGION:-ap-southeast-1}
-      S3_ENDPOINT: ${S3_ENDPOINT:-}
-      S3_PREFIX: ${S3_PREFIX:-net-assets}
-      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-false}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
-      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      BLOB_READ_WRITE_TOKEN: ${BLOB_READ_WRITE_TOKEN:-}
+      BLOB_PREFIX: ${BLOB_PREFIX:-net-assets}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -121,13 +115,15 @@ services:
       context: .
       dockerfile: Dockerfile.web
       args:
+        NEXT_PUBLIC_API_URL: http://api:3001
         NEXT_PUBLIC_REALTIME_URL: /chat
     depends_on:
       api:
         condition: service_healthy
     environment:
       AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:?Set AUTH_JWT_SECRET to at least 32 random characters}
-      TRUST_CHATGPT_IDENTITY_HEADERS: ${TRUST_CHATGPT_IDENTITY_HEADERS:-false}
+      NEON_AUTH_BASE_URL: ${NEON_AUTH_BASE_URL:?Set NEON_AUTH_BASE_URL for authenticated mode}
+      NEON_AUTH_COOKIE_SECRET: ${NEON_AUTH_COOKIE_SECRET:?Set NEON_AUTH_COOKIE_SECRET}
     init: true
     security_opt:
       - no-new-privileges:true
