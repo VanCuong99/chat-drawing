@@ -1,0 +1,1 @@
+ALTER TABLE "palette_colors" ADD COLUMN "components" jsonb DEFAULT '[]'::jsonb NOT NULL;

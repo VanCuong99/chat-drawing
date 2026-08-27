@@ -1,0 +1,1 @@
+ALTER TABLE "palette_colors" ADD CONSTRAINT "palette_colors_components_count_check" CHECK (jsonb_array_length("palette_colors"."components") = 0 or jsonb_array_length("palette_colors"."components") between 2 and 12);

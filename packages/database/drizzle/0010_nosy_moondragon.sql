@@ -1,0 +1,1 @@
+CREATE INDEX "assets_owner_status_idx" ON "assets" USING btree ("owner_key","status");

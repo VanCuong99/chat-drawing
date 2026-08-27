@@ -1,0 +1,22 @@
+FROM node:22-alpine AS build
+RUN corepack enable
+WORKDIR /app
+ARG NEXT_PUBLIC_REALTIME_URL=/chat
+ENV NEXT_PUBLIC_REALTIME_URL=$NEXT_PUBLIC_REALTIME_URL
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY apps/api/package.json apps/api/package.json
+COPY apps/web/package.json apps/web/package.json
+COPY packages/pigment/package.json packages/pigment/package.json
+COPY packages/database/package.json packages/database/package.json
+RUN pnpm install --frozen-lockfile
+COPY . .
+RUN pnpm build:web
+
+FROM node:22-alpine AS runtime
+RUN corepack enable
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --chown=node:node --from=build /app ./
+USER node
+EXPOSE 3000
+CMD ["pnpm", "start:web"]

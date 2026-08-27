@@ -1,0 +1,2 @@
+ALTER TABLE "palette_colors" ADD CONSTRAINT "palette_colors_single_owner_check" CHECK (("palette_colors"."user_id" is not null) <> ("palette_colors"."guest_session_id" is not null));--> statement-breakpoint
+ALTER TABLE "palette_colors" ADD CONSTRAINT "palette_colors_ratio_check" CHECK ("palette_colors"."ratio" between 1 and 99);

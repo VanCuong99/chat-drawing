@@ -1,0 +1,27 @@
+import { Controller, HttpCode, Post, Req } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import type { Request } from 'express';
+import { ActorService } from '../auth/actor.service';
+import { RateLimitService } from '../security/rate-limit.service';
+
+@Controller('realtime')
+export class RealtimeController {
+  constructor(private readonly actors: ActorService, private readonly jwt: JwtService, private readonly limits: RateLimitService) {}
+
+  @Post('token')
+  @HttpCode(200)
+  async token(@Req() request: Request) {
+    const actor = await this.actors.require(request);
+    await this.limits.consume('realtime:token', actor.actorKey, 30, 60 * 1000);
+    return {
+      token: await this.jwt.signAsync({
+        sub: actor.id,
+        kind: actor.kind,
+        actorKey: actor.actorKey,
+        displayName: actor.displayName,
+        email: actor.email ?? undefined,
+        roomId: actor.kind === 'guest' ? actor.roomId : undefined,
+      }, { expiresIn: '2m' }),
+    };
+  }
+}

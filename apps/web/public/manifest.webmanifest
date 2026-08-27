@@ -1,0 +1,14 @@
+{
+  "name": "Nét — Vẽ điều khó nói",
+  "short_name": "Nét",
+  "description": "Nhắn tin bằng chữ, ảnh và những nét vẽ có thể tiếp tục.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#fbfaf7",
+  "theme_color": "#6f4ee8",
+  "lang": "vi",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

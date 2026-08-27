@@ -1,0 +1,27 @@
+FROM node:22-alpine AS build
+RUN corepack enable
+WORKDIR /app
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY apps/api/package.json apps/api/package.json
+COPY apps/web/package.json apps/web/package.json
+COPY packages/pigment/package.json packages/pigment/package.json
+COPY packages/database/package.json packages/database/package.json
+RUN pnpm install --frozen-lockfile
+COPY apps/api apps/api
+COPY packages/pigment packages/pigment
+COPY packages/database packages/database
+RUN pnpm build:packages && pnpm --filter @net/api build
+
+FROM node:22-alpine AS runtime
+RUN corepack enable
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /app/package.json /app/pnpm-lock.yaml /app/pnpm-workspace.yaml ./
+COPY --chown=node:node --from=build /app/node_modules node_modules
+COPY --chown=node:node --from=build /app/apps/api apps/api
+COPY --chown=node:node --from=build /app/packages/pigment packages/pigment
+COPY --chown=node:node --from=build /app/packages/database packages/database
+RUN mkdir -p /app/uploads && chown node:node /app/uploads
+USER node
+EXPOSE 3001
+CMD ["pnpm", "start:api"]

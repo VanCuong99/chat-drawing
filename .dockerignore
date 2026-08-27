@@ -1,0 +1,13 @@
+node_modules
+.next
+.vinext
+**/dist
+apps/api/dist
+packages/database/dist
+packages/pigment/dist
+.data
+.wrangler
+.git
+test-results
+playwright-report
+.env*

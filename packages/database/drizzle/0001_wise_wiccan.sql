@@ -1,0 +1,3 @@
+ALTER TABLE "messages" ADD CONSTRAINT "messages_asset_key_assets_key_fk" FOREIGN KEY ("asset_key") REFERENCES "public"."assets"("key") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "messages" ADD CONSTRAINT "messages_reply_to_id_messages_id_fk" FOREIGN KEY ("reply_to_id") REFERENCES "public"."messages"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "messages" ADD CONSTRAINT "messages_canvas_parent_id_messages_id_fk" FOREIGN KEY ("canvas_parent_id") REFERENCES "public"."messages"("id") ON DELETE set null ON UPDATE no action;

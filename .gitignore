@@ -1,5 +1,5 @@
 # dependencies
-/node_modules
+**/node_modules/
 /.pnp
 .pnp.*
 .yarn/*
@@ -10,10 +10,13 @@
 
 # testing
 /coverage
+/playwright-report
+/test-results
+/.playwright-cli/
 
 # next.js
-/.next/
-/.vinext/
+**/.next/
+**/.vinext/
 /out/
 
 # misc
@@ -28,11 +31,17 @@ yarn-error.log*
 
 # local environment
 .env*
+!.env.example
 
 # deployment and generated files
 .vercel
 next-env.d.ts
-/dist/
-/.wrangler/
+**/dist/
+**/.wrangler/
 /outputs/
 /work/
+/.data/
+/apps/api/.data/
+/packages/database/dist/
+/packages/pigment/dist/
+/apps/api/dist/

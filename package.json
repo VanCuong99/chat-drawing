@@ -1,5 +1,5 @@
 {
-  "name": "sites-project",
+  "name": "@net/workspace",
   "version": "0.1.0",
   "private": true,
   "packageManager": "pnpm@10.26.2",
@@ -7,34 +7,32 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "vinext dev",
-    "build": "vinext build",
-    "start": "vinext start",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
-  },
-  "dependencies": {
-    "next": "16.2.6",
-    "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "dev": "pnpm build:packages && concurrently -k -n web,api -c blue,magenta \"pnpm dev:web\" \"pnpm dev:api\"",
+    "dev:web": "pnpm --filter @net/web dev",
+    "dev:api": "pnpm --filter @net/api dev",
+    "build:packages": "pnpm --filter @net/pigment build && pnpm --filter @net/database build",
+    "build": "pnpm build:packages && pnpm --filter @net/api build && pnpm --filter @net/web build",
+    "build:web": "pnpm --filter @net/pigment build && pnpm --filter @net/web build",
+    "start": "concurrently -k -n web,api -c blue,magenta \"pnpm start:web\" \"pnpm start:api\"",
+    "start:web": "pnpm --filter @net/web start",
+    "start:api": "pnpm --filter @net/api start",
+    "lint": "pnpm --filter @net/web lint && pnpm --filter @net/api lint",
+    "check:infra": "node scripts/validate-nginx.mjs && AUTH_JWT_SECRET=local-compose-validation-secret-32bytes docker compose config --quiet",
+    "security:audit": "pnpm audit --prod",
+    "clean": "node scripts/clean-generated.mjs",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "db:generate": "pnpm --filter @net/database db:generate",
+    "db:migrate": "pnpm --filter @net/database db:migrate",
+    "db:studio": "pnpm --filter @net/database db:studio",
+    "test:e2e": "playwright test --reporter=list"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "1.37.1",
-    "@cloudflare/workers-types": "4.20260515.1",
-    "@openai/sites-vite-plugin": "^0.1.0 || ^0.2.0",
-    "@tailwindcss/postcss": "4.2.1",
-    "@types/node": "22.19.19",
-    "@types/react": "19.2.14",
-    "@types/react-dom": "19.2.3",
-    "@vitejs/plugin-react": "6.0.2",
-    "@vitejs/plugin-rsc": "0.5.26",
-    "eslint": "9.39.4",
-    "eslint-config-next": "16.2.6",
-    "react-server-dom-webpack": "19.2.6",
-    "tailwindcss": "4.2.1",
-    "typescript": "5.9.3",
-    "vinext": "1.0.0-beta.3",
-    "vite": "8.0.13",
-    "wrangler": "4.92.0"
+    "@net/database": "workspace:*",
+    "@net/pigment": "workspace:*",
+    "@playwright/test": "1.62.1",
+    "concurrently": "9.2.1",
+    "socket.io-client": "4.8.3"
   },
   "type": "module"
 }
