@@ -20,10 +20,6 @@ function authErrorMessage(error: { code?: string; message?: string } | null, fal
   return error?.message || fallback;
 }
 
-function completionPath(returnTo: string) {
-  return `/auth/complete?returnTo=${encodeURIComponent(returnTo)}`;
-}
-
 export async function signInAction(formData: FormData) {
   const email = formText(formData, 'email').toLowerCase();
   const password = formText(formData, 'password');
@@ -31,7 +27,7 @@ export async function signInAction(formData: FormData) {
   if (!email || !password) errorRedirect('/auth/sign-in', 'Vui lòng nhập email và mật khẩu.', returnTo);
   const { error } = await auth.signIn.email({ email, password });
   if (error) errorRedirect('/auth/sign-in', authErrorMessage(error, 'Không thể đăng nhập.'), returnTo);
-  redirect(completionPath(returnTo));
+  redirect(returnTo);
 }
 
 export async function signUpAction(formData: FormData) {
@@ -51,5 +47,5 @@ export async function signUpAction(formData: FormData) {
   if (signInError) {
     errorRedirect('/auth/sign-in', 'Tài khoản đã được tạo. Hãy đăng nhập để vào không gian chat.', returnTo);
   }
-  redirect(completionPath(returnTo));
+  redirect(returnTo);
 }
