@@ -55,37 +55,65 @@ export class ChatService {
       : await this.db.select({ roomId: guestSessions.roomId, lastReadSequence: guestSessions.lastReadSequence }).from(guestSessions).where(eq(guestSessions.id, actor.id));
     const roomIds = accessRows.map((row) => row.roomId);
     if (!roomIds.length) return [];
-    const [roomRows, latest, unreadRows] = await Promise.all([
+    const activeMessageCondition = or(isNull(messages.expiresAt), gt(messages.expiresAt, Date.now()));
+    const ownMessageCondition = actor.kind === 'user'
+      ? or(isNull(messages.senderId), ne(messages.senderId, actor.id))
+      : or(isNull(messages.guestSessionId), ne(messages.guestSessionId, actor.id));
+    const unreadQuery = actor.kind === 'user'
+      ? this.db.select({ roomId: messages.roomId, count: sql<number>`count(*)::int` })
+        .from(messages)
+        .innerJoin(roomMembers, and(
+          eq(roomMembers.roomId, messages.roomId),
+          eq(roomMembers.userId, actor.id),
+          gt(messages.sequence, roomMembers.lastReadSequence),
+        ))
+        .where(and(inArray(messages.roomId, roomIds), activeMessageCondition, ownMessageCondition))
+        .groupBy(messages.roomId)
+      : this.db.select({ roomId: messages.roomId, count: sql<number>`count(*)::int` })
+        .from(messages)
+        .innerJoin(guestSessions, and(
+          eq(guestSessions.roomId, messages.roomId),
+          eq(guestSessions.id, actor.id),
+          gt(messages.sequence, guestSessions.lastReadSequence),
+        ))
+        .where(and(inArray(messages.roomId, roomIds), activeMessageCondition, ownMessageCondition))
+        .groupBy(messages.roomId);
+    const [roomRows, latest, unreadRows, statisticRows] = await Promise.all([
       this.db.select().from(rooms).where(inArray(rooms.id, roomIds)),
       this.db.selectDistinctOn([messages.roomId], {
         roomId: messages.roomId,
         type: messages.type,
         body: messages.body,
         createdAt: messages.createdAt,
-      }).from(messages).where(and(inArray(messages.roomId, roomIds), or(isNull(messages.expiresAt), gt(messages.expiresAt, Date.now()))))
+      }).from(messages).where(and(inArray(messages.roomId, roomIds), activeMessageCondition))
         .orderBy(messages.roomId, desc(messages.sequence)),
-      Promise.all(accessRows.map(async ({ roomId, lastReadSequence }) => {
-        const ownMessageCondition = actor.kind === 'user'
-          ? or(isNull(messages.senderId), ne(messages.senderId, actor.id))
-          : or(isNull(messages.guestSessionId), ne(messages.guestSessionId, actor.id));
-        const unread = await this.db.select({ id: messages.id }).from(messages).where(and(
-          eq(messages.roomId, roomId),
-          gt(messages.sequence, lastReadSequence),
-          or(isNull(messages.expiresAt), gt(messages.expiresAt, Date.now())),
-          ownMessageCondition,
-        ));
-        return [roomId, unread.length] as const;
-      })),
+      unreadQuery,
+      this.db.select({
+        roomId: messages.roomId,
+        messageCount: sql<number>`count(*)::int`,
+        mediaCount: sql<number>`count(*) filter (where ${messages.assetKey} is not null)::int`,
+      }).from(messages)
+        .where(and(inArray(messages.roomId, roomIds), activeMessageCondition))
+        .groupBy(messages.roomId),
     ]);
     const latestByRoom = new Map(latest.map((message) => [message.roomId, message]));
-    const unreadByRoom = new Map(unreadRows);
+    const unreadByRoom = new Map(unreadRows.map((row) => [row.roomId, row.count]));
+    const statisticsByRoom = new Map(statisticRows.map((row) => [row.roomId, row]));
     return roomRows.map((room) => {
       const last = latestByRoom.get(room.id);
       const preview = !last ? 'Bắt đầu một câu chuyện mới'
         : last.type === 'canvas' ? 'Đã gửi một bản vẽ'
           : last.type === 'image' ? 'Đã gửi một hình ảnh'
             : last.body ?? 'Tin nhắn mới';
-      return { ...room, preview, lastActivity: last?.createdAt ?? room.createdAt, unreadCount: unreadByRoom.get(room.id) ?? 0 };
+      const statistics = statisticsByRoom.get(room.id);
+      return {
+        ...room,
+        preview,
+        lastActivity: last?.createdAt ?? room.createdAt,
+        unreadCount: unreadByRoom.get(room.id) ?? 0,
+        messageCount: statistics?.messageCount ?? 0,
+        mediaCount: statistics?.mediaCount ?? 0,
+      };
     }).sort((a, b) => b.lastActivity - a.lastActivity);
   }
 
@@ -200,17 +228,30 @@ export class ChatService {
     return { roomId: room.id };
   }
 
-  async listMessages(roomId: string, actor: Actor, limitInput?: unknown, cursorInput?: unknown) {
+  async listMessages(roomId: string, actor: Actor, limitInput?: unknown, cursorInput?: unknown, queryInput?: unknown) {
     await this.actors.assertRoomAccess(roomId, actor);
     const now = Date.now();
     const limit = Math.min(100, Math.max(20, Number(limitInput) || 80));
+    const query = typeof queryInput === 'string'
+      ? queryInput.trim().replaceAll('%', '').replaceAll('_', '').slice(0, 80)
+      : '';
     const beforeSequence = Number(cursorInput);
-    const cursorCondition = Number.isSafeInteger(beforeSequence) && beforeSequence > 0 ? lt(messages.sequence, beforeSequence) : undefined;
-    const rows = await this.db.select().from(messages).where(and(
+    const cursorCondition = !query && Number.isSafeInteger(beforeSequence) && beforeSequence > 0 ? lt(messages.sequence, beforeSequence) : undefined;
+    const queryCondition = query
+      ? or(ilike(messages.senderName, `%${query}%`), ilike(messages.body, `%${query}%`))
+      : undefined;
+    const messageCondition = and(
       eq(messages.roomId, roomId),
       or(isNull(messages.expiresAt), gt(messages.expiresAt, now)),
       cursorCondition,
-    )).orderBy(desc(messages.sequence)).limit(limit);
+      queryCondition,
+    );
+    const [rows, totalRows] = await Promise.all([
+      this.db.select().from(messages).where(messageCondition).orderBy(desc(messages.sequence)).limit(limit),
+      query
+        ? this.db.select({ count: sql<number>`count(*)::int` }).from(messages).where(messageCondition)
+        : Promise.resolve([]),
+    ]);
     rows.reverse();
     const messageIds = rows.map((message) => message.id);
     const [reactionRows, memberReaders, guestReaders] = await Promise.all([
@@ -235,7 +276,12 @@ export class ChatService {
         + guestReaders.filter((reader) => reader.id !== message.guestSessionId && this.hasRead(reader, message)).length,
     })));
     const oldest = output[0];
-    return { messages: output, readAt: now, nextCursor: output.length === limit && oldest ? String(oldest.sequence) : null };
+    return {
+      messages: output,
+      readAt: now,
+      nextCursor: !query && output.length === limit && oldest ? String(oldest.sequence) : null,
+      totalCount: query ? totalRows[0]?.count ?? 0 : null,
+    };
   }
 
   async sendMessage(roomId: string, actor: Actor, body: { type?: string; text?: unknown; assetKey?: string; replyToId?: string | null; canvasParentId?: string | null; clientRequestId?: string }) {
@@ -379,10 +425,11 @@ export class ChatService {
   }
 
   private async seedFirstRoom(actor: Extract<Actor, { kind: 'user' }>) {
-    const [existing] = await this.db.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.userId, actor.id)).limit(1);
-    if (existing) return;
-    const now = Date.now();
     await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`seed-first-room:${actor.id}`}, 0))`);
+      const [existing] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.userId, actor.id)).limit(1);
+      if (existing) return;
+      const now = Date.now();
       const [room] = await tx.insert(rooms).values({ name: 'Minh Anh', kind: 'direct', createdBy: actor.id, inviteCode: this.makeCode(), allowGuests: true, createdAt: now }).returning({ id: rooms.id });
       await tx.insert(roomMembers).values({ roomId: room.id, userId: actor.id, role: 'owner', joinedAt: now });
       await tx.insert(messages).values([

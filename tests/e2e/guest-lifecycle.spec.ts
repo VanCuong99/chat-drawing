@@ -140,6 +140,7 @@ test('guest gửi text, reaction, reply, canvas rồi xoá toàn bộ phiên @cr
   await page.unroute(`**/api/assets/${assetKey}/access`);
   const endResponse = page.waitForResponse((response) => response.url().endsWith('/api/guest') && response.request().method() === 'DELETE');
   await page.getByRole('button', { name: 'Kết thúc phiên khách' }).click();
+  await page.getByRole('button', { name: 'Xoá và kết thúc phiên' }).click();
   expect((await endResponse).status()).toBe(200);
   await expect(page.getByRole('heading', { name: /Có những điều/ })).toBeVisible();
   await expect(page.getByText('Phiên khách và nội dung tạm thời đã được xoá.')).toBeVisible();

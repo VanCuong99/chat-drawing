@@ -59,8 +59,9 @@ export class ChatController {
     @Param('id') roomId: string,
     @Query('limit') limit?: string,
     @Query('before') before?: string,
+    @Query('q') query?: string,
   ) {
-    return this.chat.listMessages(roomId, await this.actors.require(request), limit, before);
+    return this.chat.listMessages(roomId, await this.actors.require(request), limit, before, query);
   }
 
   @Post('rooms/:id/messages')

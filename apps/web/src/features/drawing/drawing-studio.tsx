@@ -12,6 +12,7 @@ import {
 } from 'react';
 import { MAX_PIGMENT_COMPONENTS, mixPigmentHex, pigmentPercentages, type PigmentComponent } from '@net/pigment';
 import type { PaletteColorView } from '@/src/shared/chat.types';
+import AppDialog from '@/src/shared/app-dialog';
 
 const CANVAS_WIDTH = 1200;
 const CANVAS_HEIGHT = 720;
@@ -459,6 +460,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const [mixerName, setMixerName] = useState('');
   const [paletteSaving, setPaletteSaving] = useState(false);
   const [paletteError, setPaletteError] = useState('');
+  const [paletteDeleteTarget, setPaletteDeleteTarget] = useState<PaletteColorView | null>(null);
   const [fontSize, setFontSize] = useState(46);
   const [textValue, setTextValue] = useState('');
   const [selectedTextId, setSelectedTextId] = useState<string | null>(null);
@@ -1116,7 +1118,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
                   <button type="button" className="add-pigment" onClick={addMixerComponent} disabled={mixerComponents.length >= MAX_PIGMENT_COMPONENTS} aria-label="Thêm màu thành phần">＋ Thêm màu <span>{mixerComponents.length}/{MAX_PIGMENT_COMPONENTS}</span></button>
                   <p className="mix-parts-note">Thêm từ 2 đến 12 màu. Mỗi “phần pha” được chuẩn hóa thành nồng độ đầu vào của toàn bộ hỗn hợp; từng ô vẫn được giữ riêng trong công thức đã lưu.</p>
                   <button type="button" className="use-mixed-color" onClick={() => applyPaletteColor(mixedColor)}>Dùng màu đã pha</button>
-                  <label className="mix-name" htmlFor="mixed-color-name">Tên trong bảng màu<input id="mixed-color-name" value={mixerName} onChange={(event) => setMixerName(event.target.value)} maxLength={40} placeholder={`Màu pha ${paletteColors.length + 1}`} aria-label="Tên màu đã pha" /></label>
+                  <label className="mix-name" htmlFor="mixed-color-name">Tên trong bảng màu<input id="mixed-color-name" name="mixed-color-name" autoComplete="off" value={mixerName} onChange={(event) => setMixerName(event.target.value)} maxLength={40} placeholder={`Màu pha ${paletteColors.length + 1}…`} aria-label="Tên màu đã pha" /></label>
                   <button type="button" className="save-mixed-color" onClick={() => void saveMixedColor()} disabled={paletteLoading || paletteMutating || paletteSaving || paletteColors.length >= 24}>{paletteLoading ? 'Đang mở bảng màu…' : paletteMutating || paletteSaving ? 'Đang lưu…' : paletteColors.length >= 24 ? 'Bảng màu đã đủ 24 màu' : 'Lưu công thức vào bảng màu'}</button>
                   <p className="pigment-note">Mô phỏng gần đúng hỗn hợp nhiều màu bằng Kubelka–Munk từ sRGB/D65. Phần trăm là nồng độ đầu vào của mô hình, không phải công thức vật liệu thật; muốn dự đoán sơn/mực chính xác cần dữ liệu K/S đo cho từng pigment, chất kết dính và nền giấy.</p>
                   {paletteError ? <p className="palette-error" role="alert">{paletteError}</p> : null}
@@ -1129,7 +1131,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
                     <div key={savedColor.id} className="saved-color">
                       <button type="button" className={color.toUpperCase() === savedColor.color ? 'saved-color-use active' : 'saved-color-use'} onClick={() => applyPaletteColor(savedColor.color, savedColor.name)} aria-label={`Dùng màu ${savedColor.name}`} aria-pressed={color.toUpperCase() === savedColor.color}><i style={{ background: savedColor.color }} /><span><strong>{savedColor.name}</strong><small>{savedColor.color} · {savedColor.components.length} màu · KM v{savedColor.model.version}</small></span></button>
                       <button type="button" className="saved-color-load" onClick={() => loadPaletteFormula(savedColor)} aria-label={`Nạp công thức ${savedColor.name}`} disabled={paletteLoading || paletteMutating}>↗</button>
-                      <button type="button" className="saved-color-delete" onClick={() => void deletePaletteColor(savedColor)} aria-label={`Xóa màu ${savedColor.name}`} disabled={paletteLoading || paletteMutating}>×</button>
+                      <button type="button" className="saved-color-delete" onClick={() => setPaletteDeleteTarget(savedColor)} aria-label={`Xóa màu ${savedColor.name}`} disabled={paletteLoading || paletteMutating}>×</button>
                     </div>
                   ))}</div> : <p className="empty-palette">{paletteLoading ? 'Đang mở bảng màu…' : 'Pha một màu rồi lưu lại để dùng cho những lần vẽ sau.'}</p>}
                   {!mixerOpen && paletteError ? <p className="palette-error" role="alert">{paletteError}</p> : null}
@@ -1146,6 +1148,14 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
 
         <footer className="studio-footer"><label><span>Lời nhắn đi kèm</span><input name="drawing-caption" autoComplete="off" value={caption} onChange={(event) => setCaption(event.target.value)} placeholder="Thêm bối cảnh cho bản vẽ…" maxLength={2000} aria-label="Lời nhắn cho bản vẽ" /></label><div><span>{sourceUrl ? 'Bản gốc được giữ nguyên · ' : ''}PNG 1200 × 720</span><button className="primary-button" onClick={() => void send()} disabled={paletteMutating || sending || sourceLoading || sourceError}>{paletteMutating ? 'Đang lưu bảng màu…' : sending ? 'Đang gửi…' : 'Gửi bản vẽ'}</button></div></footer>
       </section>
+      <AppDialog open={Boolean(paletteDeleteTarget)} onClose={() => setPaletteDeleteTarget(null)} labelledBy="delete-palette-title" describedBy="delete-palette-description" className="confirmation-backdrop">
+        <section className="dialog-card confirmation-dialog">
+          <span className="eyebrow destructive">Xoá khỏi bảng màu</span>
+          <h2 id="delete-palette-title">Xoá “{paletteDeleteTarget?.name}”?</h2>
+          <p id="delete-palette-description">Công thức pha màu đã lưu sẽ bị xoá. Các nét đã vẽ bằng màu này không thay đổi.</p>
+          <div className="confirmation-actions"><button type="button" onClick={() => setPaletteDeleteTarget(null)}>Giữ lại màu</button><button type="button" className="danger-button" onClick={() => { const target = paletteDeleteTarget; setPaletteDeleteTarget(null); if (target) void deletePaletteColor(target); }}>Xoá màu</button></div>
+        </section>
+      </AppDialog>
     </div>
   );
 }

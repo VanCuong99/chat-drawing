@@ -15,6 +15,8 @@ export type RoomView = {
   preview: string;
   lastActivity: number;
   unreadCount: number;
+  messageCount: number;
+  mediaCount: number;
 };
 
 export type ReactionView = { emoji: string; count: number; reacted: boolean };
