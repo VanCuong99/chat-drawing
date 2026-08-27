@@ -1,9 +1,9 @@
 import { expect, test } from '@playwright/test';
-import { access } from 'node:fs/promises';
+import { access, unlink } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { assets, createDatabase, eq, guestSessions, reactions } from '@net/database';
+import { assets, createDatabase, eq, guestSessions, messages, reactions, rooms } from '@net/database';
 
-test('guest gửi text, reaction, reply, canvas rồi xoá toàn bộ phiên @critical', async ({ page, request }) => {
+test('guest kết thúc phiên thì mất quyền truy cập nhưng tin nhắn và canvas vẫn được giữ lại @critical', async ({ page, request }) => {
   const uniqueName = `Guest E2E ${Date.now()}`;
   await page.goto('/');
 
@@ -11,7 +11,13 @@ test('guest gửi text, reaction, reply, canvas rồi xoá toàn bộ phiên @cr
   await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(uniqueName);
   const guestResponse = page.waitForResponse((response) => response.url().endsWith('/api/guest') && response.request().method() === 'POST');
   await page.getByRole('button', { name: 'Vào không gian Nét' }).click();
-  expect((await guestResponse).status()).toBe(200);
+  const createdGuestResponse = await guestResponse;
+  expect(createdGuestResponse.status()).toBe(200);
+  const createdGuest = await createdGuestResponse.json() as { sessionId: string; roomId: string };
+  const originalHeaders = { 'x-net-guest-session': createdGuest.sessionId };
+  const bootstrap = await request.get('http://localhost:3001/api/bootstrap', { headers: originalHeaders });
+  expect(bootstrap.status()).toBe(200);
+  const inviteCode = ((await bootstrap.json()).rooms as Array<{ inviteCode: string }>)[0].inviteCode;
   await expect(page.getByText('kết nối trực tiếp')).toBeVisible();
 
   const composer = page.getByRole('textbox', { name: 'Nội dung tin nhắn' });
@@ -143,14 +149,49 @@ test('guest gửi text, reaction, reply, canvas rồi xoá toàn bộ phiên @cr
   await page.getByRole('button', { name: 'Kết thúc phiên', exact: true }).click();
   expect((await endResponse).status()).toBe(200);
   await expect(page.getByRole('heading', { name: /Có những điều/ })).toBeVisible();
-  await expect(page.getByText('Phiên khách và nội dung tạm thời đã được xoá.')).toBeVisible();
+  await expect(page.getByText('Phiên khách đã kết thúc. Bạn không còn quyền truy cập; hình ảnh và tin nhắn đã gửi vẫn được giữ lại.')).toBeVisible();
 
-  const deletedAsset = await request.get(new URL(assetPath!, 'http://localhost:3000').toString());
-  expect(deletedAsset.status()).toBe(401);
-  await expect(access(resolve('apps/api/.data/uploads', assetKey)).then(() => true).catch(() => false)).resolves.toBe(false);
+  const revokedAssetUrl = await request.get(new URL(assetPath!, 'http://localhost:3000').toString());
+  expect(revokedAssetUrl.status()).toBe(401);
+  const revokedSession = await request.get(`http://localhost:3001/api/rooms/${createdGuest.roomId}/messages`, { headers: originalHeaders });
+  expect(revokedSession.status()).toBe(401);
+
+  const observerResponse = await request.post('http://localhost:3001/api/guest', { data: { displayName: `Observer ${Date.now()}`, inviteCode } });
+  expect(observerResponse.status()).toBe(200);
+  const observer = await observerResponse.json() as { sessionId: string };
+  const observerHeaders = { 'x-net-guest-session': observer.sessionId };
+  const retainedHistory = await request.get(`http://localhost:3001/api/rooms/${createdGuest.roomId}/messages`, { headers: observerHeaders });
+  expect(retainedHistory.status()).toBe(200);
+  const retainedMessages = (await retainedHistory.json()).messages as Array<{ body: string | null; type: string; assetKey: string | null; assetUrl: string | null }>;
+  expect(retainedMessages.some((message) => message.body === 'Tin nhắn tạm thời')).toBe(true);
+  expect(retainedMessages.some((message) => message.body === 'Nội dung trả lời')).toBe(true);
+  const retainedCanvas = retainedMessages.find((message) => message.type === 'canvas' && message.assetKey === assetKey);
+  expect(retainedCanvas?.assetUrl).toBeTruthy();
+  const retainedAsset = await request.get(new URL(retainedCanvas!.assetUrl!, 'http://localhost:3001').toString());
+  expect(retainedAsset.status()).toBe(200);
+  await expect(access(resolve('apps/api/.data/uploads', assetKey)).then(() => true).catch(() => false)).resolves.toBe(true);
+
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error('DATABASE_URL is required for guest retention E2E');
+  const { db, pool } = createDatabase(databaseUrl, 1);
+  try {
+    const retainedRows = await db.select({ guestSessionId: messages.guestSessionId, expiresAt: messages.expiresAt }).from(messages).where(eq(messages.roomId, createdGuest.roomId));
+    expect(retainedRows.length).toBeGreaterThanOrEqual(3);
+    expect(retainedRows.every((message) => message.guestSessionId === null && message.expiresAt === null)).toBe(true);
+    const [retainedAssetRow] = await db.select({ guestSessionId: assets.guestSessionId, expiresAt: assets.expiresAt, ownerKey: assets.ownerKey, status: assets.status }).from(assets).where(eq(assets.key, assetKey));
+    expect(retainedAssetRow).toMatchObject({ guestSessionId: null, expiresAt: null, ownerKey: `retained-guest:${createdGuest.sessionId}`, status: 'attached' });
+  } finally {
+    await request.delete('http://localhost:3001/api/guest', { headers: observerHeaders }).catch(() => undefined);
+    await db.delete(rooms).where(eq(rooms.id, createdGuest.roomId));
+    await unlink(resolve('apps/api/.data/uploads', assetKey)).catch(() => undefined);
+    await pool.end();
+  }
 });
 
 test('read cursor không đánh dấu tin đến sau lần tải danh sách là đã xem @critical', async ({ request }) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error('DATABASE_URL is required for read cursor E2E');
+  const { db, pool } = createDatabase(databaseUrl, 1);
   const stamp = Date.now();
   const guestAResponse = await request.post('http://localhost:3001/api/guest', { data: { displayName: `Read A ${stamp}` } });
   expect(guestAResponse.status()).toBe(200);
@@ -192,6 +233,8 @@ test('read cursor không đánh dấu tin đến sau lần tải danh sách là 
       request.delete('http://localhost:3001/api/guest', { headers: headersA }),
       request.delete('http://localhost:3001/api/guest', { headers: headersB }),
     ]);
+    await db.delete(rooms).where(eq(rooms.id, guestA.roomId));
+    await pool.end();
   }
 });
 
@@ -241,6 +284,7 @@ test('kết thúc guest tuần tự hoá với upload và reaction đang chạy 
     }
   } finally {
     await request.delete('http://localhost:3001/api/guest', { headers }).catch(() => undefined);
+    await db.delete(rooms).where(eq(rooms.id, guest.roomId));
     await pool.end();
   }
 });

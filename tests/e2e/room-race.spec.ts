@@ -54,7 +54,7 @@ test('response cũ không ghi đè phòng vừa chọn @critical', async ({ page
   await expect(page.getByRole('main').getByText('Tin A mới nhất')).toBeVisible();
 });
 
-test('poll loại tin guest đã bị xoá khỏi shared room @critical', async ({ page }) => {
+test('poll loại tin đã bị xoá khỏi shared room @critical', async ({ page }) => {
   let getCount = 0;
   let markSecondGet!: () => void;
   const secondGet = new Promise<void>((resolve) => { markSecondGet = resolve; });
@@ -69,7 +69,7 @@ test('poll loại tin guest đã bị xoá khỏi shared room @critical', async 
     }
     getCount += 1;
     if (getCount === 1) {
-      await route.fulfill({ json: { messages: [message('guest-message', 'shared-room', 'Tin guest sắp bị xoá')], nextCursor: null } });
+      await route.fulfill({ json: { messages: [message('deleted-message', 'shared-room', 'Tin sắp bị xoá')], nextCursor: null } });
     } else {
       await route.fulfill({ json: { messages: [], nextCursor: null } });
       markSecondGet();
@@ -77,7 +77,7 @@ test('poll loại tin guest đã bị xoá khỏi shared room @critical', async 
   });
 
   await page.goto('/');
-  await expect(page.getByRole('main').getByText('Tin guest sắp bị xoá')).toBeVisible();
+  await expect(page.getByRole('main').getByText('Tin sắp bị xoá')).toBeVisible();
   await secondGet;
-  await expect(page.getByRole('main').getByText('Tin guest sắp bị xoá')).toHaveCount(0);
+  await expect(page.getByRole('main').getByText('Tin sắp bị xoá')).toHaveCount(0);
 });

@@ -27,10 +27,12 @@ test('pha từ nhiều sắc tố, lưu và nạp lại công thức trong palet
   await page.getByRole('button', { name: 'Mở canvas' }).click();
 
   await expect(page.getByRole('button', { name: 'Màu nước', exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: 'Mở bộ pha sắc tố' }).click();
-  const mixer = page.getByRole('region', { name: 'Bộ pha sắc tố' });
+  await page.getByRole('button', { name: 'Mở pha màu nâng cao' }).click();
+  const mixer = page.getByRole('region', { name: 'Pha màu nâng cao' });
   await expect(mixer).toBeVisible();
-  await expect(mixer.getByText('Kubelka–Munk', { exact: true })).toBeVisible();
+  await expect(mixer.getByText('Trộn nhiều màu', { exact: true })).toBeVisible();
+  await mixer.getByText('Thông tin mô phỏng màu').click();
+  await expect(mixer.getByText(/Kubelka–Munk/)).toBeVisible();
   await expect(mixer.getByText(/Mô phỏng gần đúng/)).toBeVisible();
 
   const components = mixer.getByRole('list', { name: 'Các màu thành phần' });
@@ -71,15 +73,15 @@ test('pha từ nhiều sắc tố, lưu và nạp lại công thức trong palet
   await page.unroute('**/api/palette');
   await expect(page.getByRole('button', { name: 'Dùng màu Nâu trung tính ba màu' })).toBeVisible();
 
-  await mixer.getByRole('button', { name: 'Đóng bộ pha sắc tố' }).click();
+  await mixer.getByRole('button', { name: 'Đóng pha màu nâng cao' }).click();
   await page.getByRole('button', { name: 'Đóng Esc', exact: true }).click();
   await page.reload();
   await expect(page.getByText('kết nối trực tiếp')).toBeVisible();
   await page.getByRole('button', { name: 'Mở canvas' }).click();
   await expect(page.getByRole('button', { name: 'Dùng màu Nâu trung tính ba màu' })).toBeVisible();
   await page.getByRole('button', { name: 'Nạp công thức Nâu trung tính ba màu' }).click();
-  await expect(page.getByRole('region', { name: 'Bộ pha sắc tố' }).getByRole('listitem')).toHaveCount(3);
-  await expect(page.getByRole('region', { name: 'Bộ pha sắc tố' }).getByText('#705C71')).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Pha màu nâng cao' }).getByRole('listitem')).toHaveCount(3);
+  await expect(page.getByRole('region', { name: 'Pha màu nâng cao' }).getByText('#705C71')).toBeVisible();
 
   await page.getByRole('button', { name: 'Đóng Esc', exact: true }).click();
   const databaseUrl = process.env.DATABASE_URL;

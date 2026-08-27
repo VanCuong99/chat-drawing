@@ -71,6 +71,8 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const [guestModal, setGuestModal] = useState(false);
   const [guestEndConfirmOpen, setGuestEndConfirmOpen] = useState(false);
   const [guestName, setGuestName] = useState('');
+  const [guestFormError, setGuestFormError] = useState('');
+  const [guestErrorField, setGuestErrorField] = useState<'name' | 'form' | null>(null);
   const [inviteCode, setInviteCode] = useState(() => typeof window === 'undefined' ? '' : new URLSearchParams(window.location.search).get('room') ?? '');
   const [createRoomOpen, setCreateRoomOpen] = useState(false);
   const [roomName, setRoomName] = useState('');
@@ -95,6 +97,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const [bootstrapRetry, setBootstrapRetry] = useState(0);
   const [apiToken, setApiToken] = useState(initialApiToken);
   const fileRef = useRef<HTMLInputElement>(null);
+  const guestNameRef = useRef<HTMLInputElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const messageScrollRef = useRef<HTMLElement>(null);
   const conversationAtBottomRef = useRef(false);
@@ -208,7 +211,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
         }
       }).catch((bootstrapError) => {
         if (bootstrapError instanceof ApiRequestError && bootstrapError.status === 401 && savedGuest) {
-          clearGuestSession('Phiên khách đã hết hạn. Bạn không còn quyền truy cập; nội dung có thể được giữ lại trong phòng có thành viên đăng nhập.');
+          clearGuestSession('Phiên khách đã hết hạn. Bạn không còn quyền truy cập; hình ảnh và tin nhắn đã gửi vẫn được giữ lại.');
           return;
         }
         setError(navigator.onLine
@@ -258,7 +261,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       lastTouch = now;
       void api('/api/guest/activity', { method: 'POST' }).catch((activityError) => {
         if (activityError instanceof ApiRequestError && activityError.status === 401 && sessionStorage.getItem('net_guest_session')) {
-          clearGuestSession('Phiên khách đã hết hạn. Bạn không còn quyền truy cập; nội dung có thể được giữ lại trong phòng có thành viên đăng nhập.');
+          clearGuestSession('Phiên khách đã hết hạn. Bạn không còn quyền truy cập; hình ảnh và tin nhắn đã gửi vẫn được giữ lại.');
         }
       });
     };
@@ -304,7 +307,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       });
     } catch (loadError) {
       if (loadError instanceof ApiRequestError && loadError.status === 401 && guestSession) {
-        clearGuestSession('Phiên khách đã hết hạn. Bạn không còn quyền truy cập; nội dung có thể được giữ lại trong phòng có thành viên đăng nhập.');
+        clearGuestSession('Phiên khách đã hết hạn. Bạn không còn quyền truy cập; hình ảnh và tin nhắn đã gửi vẫn được giữ lại.');
         return;
       }
       if (!quiet) setError(loadError instanceof Error ? loadError.message : 'Không thể tải tin nhắn.');
@@ -353,7 +356,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       .catch((readError) => {
         readMarkers.current.delete(activeRoomId);
         if (readError instanceof ApiRequestError && readError.status === 401 && guestSession) {
-          clearGuestSession('Phiên khách đã hết hạn. Bạn không còn quyền truy cập; nội dung có thể được giữ lại trong phòng có thành viên đăng nhập.');
+          clearGuestSession('Phiên khách đã hết hạn. Bạn không còn quyền truy cập; hình ảnh và tin nhắn đã gửi vẫn được giữ lại.');
         }
       });
   }, [activeRoomId, api, clearGuestSession, conversationAtBottom, guestSession, infoOpen, messages, normalizedMessageQuery, pageVisible, studio]);
@@ -425,19 +428,38 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
         });
         socket.on('reaction.updated', refreshActiveRoom);
         socket.on('messages.read', refreshActiveRoom);
-        socket.on('guest.ended', (payload: { roomId?: string; guestSessionId?: string; messageIds?: string[]; retained?: boolean }) => {
+        socket.on('guest.ended', (payload: { roomId?: string; guestSessionId?: string; messageIds?: string[]; retained?: boolean; removedReactions?: Array<{ messageId: string; emoji: string }> }) => {
           if (actor?.kind === 'guest' && payload.guestSessionId === actorId) {
             endingGuestRef.current = true;
             clearGuestSession('');
-            setNotice(payload.retained
-              ? 'Phiên khách đã kết thúc. Nội dung đã gửi được giữ lại cho thành viên đăng nhập.'
-              : 'Phiên khách và nội dung tạm thời đã được xoá.');
+            setNotice('Phiên khách đã kết thúc. Bạn không còn quyền truy cập; hình ảnh và tin nhắn đã gửi vẫn được giữ lại.');
             return;
           }
           if (payload.roomId === activeRoomRef.current && payload.messageIds?.length) {
             const deletedIds = new Set(payload.messageIds);
             setMessages((current) => current.filter((message) => !deletedIds.has(message.id)));
             setMessageSearchResults((current) => current.filter((message) => !deletedIds.has(message.id)));
+          }
+          if (payload.roomId === activeRoomRef.current && payload.removedReactions?.length) {
+            const removedByMessage = new Map<string, Set<string>>();
+            for (const removed of payload.removedReactions) {
+              const emojis = removedByMessage.get(removed.messageId) ?? new Set<string>();
+              emojis.add(removed.emoji);
+              removedByMessage.set(removed.messageId, emojis);
+            }
+            const removeEndedGuestReactions = (current: MessageView[]) => current.map((message) => {
+              const removedEmojis = removedByMessage.get(message.id);
+              if (!removedEmojis) return message;
+              return {
+                ...message,
+                reactions: message.reactions.flatMap((reaction) => {
+                  if (!removedEmojis.has(reaction.emoji)) return [reaction];
+                  return reaction.count > 1 ? [{ ...reaction, count: reaction.count - 1 }] : [];
+                }),
+              };
+            });
+            setMessages(removeEndedGuestReactions);
+            setMessageSearchResults(removeEndedGuestReactions);
           }
           refreshActiveRoom(payload);
           void loadBootstrap();
@@ -510,15 +532,31 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
 
   const startGuest = async (event: FormEvent) => {
     event.preventDefault();
-    setBusy(true); setError('');
+    const displayName = guestName.trim();
+    if (!displayName) {
+      setGuestFormError('Vui lòng nhập tên hiển thị.');
+      setGuestErrorField('name');
+      guestNameRef.current?.focus();
+      return;
+    }
+    if (displayName.length < 2) {
+      setGuestFormError('Tên hiển thị cần ít nhất 2 ký tự.');
+      setGuestErrorField('name');
+      guestNameRef.current?.focus();
+      return;
+    }
+    setBusy(true); setGuestFormError(''); setGuestErrorField(null);
     try {
-      const data = await api<{ sessionId: string }>('/api/guest', { method: 'POST', body: JSON.stringify({ displayName: guestName, inviteCode: inviteCode || undefined }) }, null);
+      const data = await api<{ sessionId: string }>('/api/guest', { method: 'POST', body: JSON.stringify({ displayName, inviteCode: inviteCode || undefined }) }, null);
       sessionStorage.setItem('net_guest_session', data.sessionId);
       endingGuestRef.current = false;
       setGuestSession(data.sessionId);
       setGuestModal(false);
       await loadBootstrap(data.sessionId);
-    } catch (startError) { setError(startError instanceof Error ? startError.message : 'Không thể bắt đầu phiên khách.'); }
+    } catch (startError) {
+      setGuestFormError(startError instanceof Error ? startError.message : 'Không thể bắt đầu phiên khách.');
+      setGuestErrorField('form');
+    }
     setBusy(false);
   };
 
@@ -530,12 +568,12 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       const result = await api<{ retained?: boolean }>('/api/guest', { method: 'DELETE' });
       clearGuestSession('');
       setNotice(result.retained
-        ? 'Phiên khách đã kết thúc. Bạn không còn quyền truy cập; nội dung đã gửi được giữ lại cho thành viên đăng nhập.'
-        : 'Phiên khách và nội dung tạm thời đã được xoá.');
+        ? 'Phiên khách đã kết thúc. Bạn không còn quyền truy cập; hình ảnh và tin nhắn đã gửi vẫn được giữ lại.'
+        : 'Phiên khách đã kết thúc.');
     } catch (endError) {
       if (endError instanceof ApiRequestError && endError.status === 401) {
         clearGuestSession('');
-        setNotice('Phiên khách đã hết hạn. Bạn không còn quyền truy cập; nội dung có thể được giữ lại trong phòng có thành viên đăng nhập.');
+        setNotice('Phiên khách đã hết hạn. Bạn không còn quyền truy cập; hình ảnh và tin nhắn đã gửi vẫn được giữ lại.');
       } else {
         endingGuestRef.current = false;
         setError(endError instanceof Error ? endError.message : 'Chưa thể kết thúc phiên. Vui lòng thử lại.');
@@ -742,6 +780,10 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const visibleMessages = useMemo(() => normalizedMessageQuery
     ? normalizedMessageQuery.length >= 2 ? messageSearchResults : []
     : messages, [messageSearchResults, messages, normalizedMessageQuery]);
+  const showInviteOnboarding = Boolean(activeRoom?.allowGuests)
+    && !normalizedMessageQuery
+    && (activeRoom?.messageCount ?? messages.length) <= 1
+    && messages.every((message) => message.type === 'system');
 
   if (phase === 'loading') return <div className="boot-screen"><Logo /><span className="loading-line" /><p>{error || 'Đang mở không gian của bạn…'}</p>{error && <button className="primary-button" onClick={() => { setError(''); setBootstrapRetry((current) => current + 1); }}>Thử kết nối lại</button>}</div>;
 
@@ -754,7 +796,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
             <span className="eyebrow">Nhắn bằng chữ. Tiếp lời bằng nét.</span>
             <h1>Có những điều,<br /><em>vẽ ra dễ hơn nói.</em></h1>
             <p>Nét là messenger dành cho những ý tưởng còn dang dở — gửi text, ảnh hoặc canvas; người nhận có thể vẽ tiếp thành một phiên bản mới.</p>
-            <div className="hero-actions"><a className="hero-primary" href={signInPath}>Đăng nhập tài khoản <span>→</span></a><button onClick={() => setGuestModal(true)}>Tiếp tục với tư cách khách</button></div>
+            <div className="hero-actions"><a className="hero-primary" href={signInPath}>Đăng nhập tài khoản <span>→</span></a><button onClick={() => { setError(''); setGuestFormError(''); setGuestErrorField(null); setGuestModal(true); }}>Tiếp tục với tư cách khách</button></div>
             <small>{inviteCode ? 'Bạn đang mở một link mời. Đăng nhập hoặc nhập tên để tham gia.' : 'Khách không cần tài khoản · Mất quyền truy cập khi kết thúc phiên'}</small>
           </div>
           <div className="hero-demo" aria-label="Minh hoạ cuộc trò chuyện bằng chữ và nét vẽ">
@@ -769,14 +811,14 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           <article><b>02</b><span>Vẽ tiếp, không ghi đè</span><p>Mỗi lần chỉnh sửa tạo một phiên bản có lịch sử rõ ràng.</p></article>
           <article><b>03</b><span>Riêng tư theo cách của bạn</span><p>Tài khoản lưu lâu dài; khách mất quyền truy cập khi phiên kết thúc.</p></article>
         </section>
-        <AppDialog open={guestModal} onClose={() => setGuestModal(false)} labelledBy="guest-dialog-title" describedBy="guest-dialog-description">
-            <form className="dialog-card guest-dialog" onSubmit={startGuest}>
-              <button type="button" className="dialog-close" onClick={() => setGuestModal(false)} aria-label="Đóng">×</button>
+        <AppDialog open={guestModal} onClose={() => { setGuestModal(false); setGuestFormError(''); setGuestErrorField(null); }} labelledBy="guest-dialog-title" describedBy="guest-dialog-description">
+            <form className="dialog-card guest-dialog" onSubmit={startGuest} noValidate>
+              <button type="button" className="dialog-close" onClick={() => { setGuestModal(false); setGuestFormError(''); setGuestErrorField(null); }} aria-label="Đóng">×</button>
               <span className="eyebrow">Phiên khách</span><h2 id="guest-dialog-title">{inviteCode ? 'Tham gia cuộc trò chuyện' : 'Bắt đầu một phiên tạm thời'}</h2>
-              <p id="guest-dialog-description">Phiên hết hạn sau 2 giờ không hoạt động. Nội dung sẽ bị xoá trong phòng chỉ có khách, hoặc được giữ lại nếu phòng có thành viên đăng nhập.</p>
-              <label>Tên hiển thị<input name="guest-name" autoComplete="nickname" value={guestName} onChange={(event) => setGuestName(event.target.value)} placeholder="Ví dụ: Cường…" minLength={2} maxLength={60} /></label>
-              <label>Mã mời <small>(không bắt buộc)</small><input name="invite-code" autoComplete="off" spellCheck={false} value={inviteCode} onChange={(event) => setInviteCode(event.target.value)} placeholder="Dán mã hoặc mở link mời…" /></label>
-              {error && <p className="form-error" role="alert">{error}</p>}
+              <p id="guest-dialog-description">Phiên hết hạn sau 2 giờ không hoạt động. Khi phiên kết thúc, bạn mất quyền truy cập nhưng hình ảnh và tin nhắn đã gửi vẫn được giữ lại.</p>
+              <label>Tên hiển thị<input ref={guestNameRef} name="guest-name" autoComplete="nickname" value={guestName} onChange={(event) => { setGuestName(event.target.value); setGuestFormError(''); setGuestErrorField(null); }} placeholder="Ví dụ: Cường…" maxLength={60} aria-invalid={guestErrorField === 'name'} aria-describedby={guestErrorField === 'name' ? 'guest-form-error' : undefined} /></label>
+              <label>Mã mời <small>(không bắt buộc)</small><input name="invite-code" autoComplete="off" spellCheck={false} value={inviteCode} onChange={(event) => { setInviteCode(event.target.value); setGuestFormError(''); setGuestErrorField(null); }} placeholder="Dán mã hoặc mở link mời…" /></label>
+              {guestFormError && <p id="guest-form-error" className="form-error" role="alert" aria-live="polite">{guestFormError}</p>}
               <button className="primary-button wide" disabled={busy}>{busy ? 'Đang mở phiên…' : 'Vào không gian Nét'}</button>
             </form>
         </AppDialog>
@@ -796,7 +838,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           {filteredRooms.map((room) => <button key={room.id} className={room.id === activeRoomId ? 'room-item active' : 'room-item'} onClick={() => selectRoom(room.id)}><span className="avatar" style={avatarStyle(room.name)}>{room.name.slice(0, 1)}</span><span><strong>{room.name}</strong><small>{room.preview}</small></span><span className="room-meta"><time>{timeLabel(room.lastActivity)}</time>{room.unreadCount > 0 && <b aria-label={`${room.unreadCount} tin chưa đọc`}>{Math.min(room.unreadCount, 99)}</b>}</span></button>)}
           {!filteredRooms.length && <p className="empty-copy">Không tìm thấy cuộc trò chuyện.</p>}
         </div>
-        {actor?.kind === 'guest' && <div className="guest-retention"><span>Phiên tạm thời</span><p>Bạn mất quyền truy cập khi kết thúc; nội dung có thể được giữ lại trong phòng có tài khoản.</p></div>}
+        {actor?.kind === 'guest' && <div className="guest-retention"><span>Phiên tạm thời</span><p>Bạn mất quyền truy cập khi kết thúc; hình ảnh và tin nhắn đã gửi vẫn được giữ lại.</p></div>}
         <div className="account-card"><span className="avatar" style={avatarStyle(actor?.id ?? 'guest')}>{actor?.displayName.slice(0, 1)}</span><span><strong>{actor?.displayName}</strong><small>{actor?.kind === 'user' ? actor.email : 'Khách · tối đa 2 giờ'}</small></span>{actor?.kind === 'user' ? <a href={signOutPath} title="Đăng xuất" aria-label="Đăng xuất">↗</a> : <button className="end-session-button" onClick={() => setGuestEndConfirmOpen(true)} aria-label="Kết thúc phiên khách">Kết thúc phiên</button>}</div>
       </aside>
 
@@ -808,6 +850,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
             <section ref={messageScrollRef} className="message-scroll" aria-live="polite" aria-label="Lịch sử tin nhắn">
               <div className="message-lane"><div className="day-pill">Hôm nay</div>
                 {nextCursor && !normalizedMessageQuery && <button className="load-older" onClick={() => void loadOlder()} disabled={loadingOlder}>{loadingOlder ? 'Đang tải…' : 'Tải tin nhắn cũ hơn'}</button>}
+                {showInviteOnboarding && <section className="invite-onboarding" aria-labelledby="invite-onboarding-title"><span aria-hidden="true">↗</span><div><h2 id="invite-onboarding-title">Mời một người cùng vẽ</h2><p>Sao chép link để người khác vào phòng, nhắn tin và tiếp nối bản vẽ với bạn.</p></div><button className="primary-button" onClick={() => void copyInvite()}>Mời một người</button></section>}
                 {!visibleMessages.length && <div className="conversation-empty"><span>⌁</span><h2>{normalizedMessageQuery ? 'Không tìm thấy tin nhắn' : 'Bắt đầu bằng một lời hoặc một nét'}</h2><p>{normalizedMessageQuery.length === 1 ? 'Nhập ít nhất 2 ký tự để tìm trong toàn bộ lịch sử.' : normalizedMessageQuery ? 'Thử một từ khoá khác.' : 'Nhắn điều gì đó, gửi ảnh hoặc mở canvas.'}</p></div>}
                 {visibleMessages.map((message) => {
                   const own = actor?.kind === 'user' ? message.senderId === actor.id : message.guestSessionId === actor?.id;
@@ -844,7 +887,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
               <input ref={fileRef} hidden name="message-image" aria-label="Tệp hình ảnh" type="file" accept="image/png,image/jpeg,image/gif,image/webp" onChange={(event) => void attachImage(event)} />
               <p><kbd>Enter</kbd> gửi · <kbd>Shift</kbd> + <kbd>Enter</kbd> xuống dòng · ảnh tối đa 8 MB</p>
             </footer>
-            {infoOpen && <aside className="info-drawer"><button className="dialog-close" onClick={() => setInfoOpen(false)} aria-label="Đóng">×</button><span className="avatar info-avatar" style={avatarStyle(activeRoom.name)}>{activeRoom.name.slice(0, 1)}</span><h2>{activeRoom.name}</h2><p>Không gian để mọi người tiếp nối ý tưởng bằng chữ và nét vẽ.</p><div className="info-stats"><span><strong>{activeRoom.messageCount ?? messages.length}</strong><small>Tin nhắn</small></span><span><strong>{activeRoom.mediaCount ?? messages.filter((item) => item.assetKey).length}</strong><small>Ảnh & nét</small></span></div>{activeRoom.allowGuests && <><label>Link mời<input name="invite-link" readOnly value={`${typeof window !== 'undefined' ? window.location.origin : ''}/?room=${activeRoom.inviteCode}`} /></label><button className="primary-button wide" onClick={() => void copyInvite()}>Sao chép link mời</button></>}<small className="privacy-note">🔒 Thành viên đăng nhập được lưu lâu dài. Nội dung do khách tạo sẽ hết hạn theo phiên.</small></aside>}
+            {infoOpen && <aside className="info-drawer"><button className="dialog-close" onClick={() => setInfoOpen(false)} aria-label="Đóng">×</button><span className="avatar info-avatar" style={avatarStyle(activeRoom.name)}>{activeRoom.name.slice(0, 1)}</span><h2>{activeRoom.name}</h2><p>Không gian để mọi người tiếp nối ý tưởng bằng chữ và nét vẽ.</p><div className="info-stats"><span><strong>{activeRoom.messageCount ?? messages.length}</strong><small>Tin nhắn</small></span><span><strong>{activeRoom.mediaCount ?? messages.filter((item) => item.assetKey).length}</strong><small>Ảnh & nét</small></span></div>{activeRoom.allowGuests && <><label>Link mời<input name="invite-link" readOnly value={`${typeof window !== 'undefined' ? window.location.origin : ''}/?room=${activeRoom.inviteCode}`} /></label><button className="primary-button wide" onClick={() => void copyInvite()}>Sao chép link mời</button></>}<small className="privacy-note">🔒 Thành viên đăng nhập được lưu lâu dài. Khách mất quyền truy cập khi phiên kết thúc; nội dung đã gửi vẫn được giữ lại.</small></aside>}
           </>
         ) : <div className="no-room"><Logo /><h1>Chưa có cuộc trò chuyện</h1><p>{actor?.kind === 'user' ? 'Tạo một không gian mới rồi mời ai đó cùng vẽ.' : 'Link mời không còn hiệu lực.'}</p>{actor?.kind === 'user' && <button className="primary-button" onClick={() => setCreateRoomOpen(true)}>Tạo cuộc trò chuyện</button>}</div>}
       </main>
@@ -869,7 +912,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
         <section className="dialog-card confirmation-dialog">
           <span className="eyebrow destructive">Không thể hoàn tác</span>
           <h2 id="end-guest-title">Kết thúc phiên khách?</h2>
-          <p id="end-guest-description">Bạn sẽ mất quyền truy cập ngay. Nội dung trong phòng chỉ có khách sẽ bị xoá; nội dung đã gửi trong phòng có thành viên đăng nhập sẽ được giữ lại cho họ.</p>
+          <p id="end-guest-description">Bạn sẽ mất quyền truy cập ngay. Hình ảnh và tin nhắn đã gửi vẫn được giữ lại trong cuộc trò chuyện.</p>
           <div className="confirmation-actions"><button type="button" onClick={() => setGuestEndConfirmOpen(false)}>Giữ lại phiên</button><button type="button" className="danger-button" onClick={() => void endGuest()}>Kết thúc phiên</button></div>
         </section>
       </AppDialog>

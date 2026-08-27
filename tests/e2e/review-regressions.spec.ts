@@ -141,7 +141,7 @@ test('refresh realtime không huỷ pagination và không đánh dấu tin chưa
   await expect(page.getByText('Tin mới chưa xem 101', { exact: true })).toBeAttached();
 });
 
-test('guest.ended loại nội dung guest khỏi phần lịch sử cũ đã tải @critical', async ({ page, request }) => {
+test('guest.ended giữ nội dung guest trong phần lịch sử cũ đã tải @critical', async ({ page, request }) => {
   test.setTimeout(45_000);
   const createdA = await request.post(`${API_URL}/guest`, { data: { displayName: `Retained A ${Date.now()}` } });
   expect(createdA.ok()).toBe(true);
@@ -157,6 +157,9 @@ test('guest.ended loại nội dung guest khỏi phần lịch sử cũ đã t�
   try {
     const oldGuestMessage = await request.post(`${API_URL}/rooms/${guestA.roomId}/messages`, { headers: headersB, data: { type: 'text', text: 'Tin guest nằm ngoài trang mới nhất' } });
     expect(oldGuestMessage.ok()).toBe(true);
+    const oldGuestMessageId = ((await oldGuestMessage.json()) as { id: string }).id;
+    const reacted = await request.post(`${API_URL}/messages/${oldGuestMessageId}/reactions`, { headers: headersB, data: { emoji: '❤️' } });
+    expect(reacted.ok()).toBe(true);
     const retained = await Promise.all(Array.from({ length: 100 }, (_, index) => request.post(`${API_URL}/rooms/${guestA.roomId}/messages`, { headers: headersA, data: { type: 'text', text: `Tin được giữ ${index + 1}` } })));
     expect(retained.every((response) => response.ok())).toBe(true);
 
@@ -165,18 +168,29 @@ test('guest.ended loại nội dung guest khỏi phần lịch sử cũ đã t�
     await expect(page.getByText('kết nối trực tiếp')).toBeVisible();
     await page.getByRole('button', { name: 'Tải tin nhắn cũ hơn' }).click();
     await expect(page.getByText('Tin guest nằm ngoài trang mới nhất', { exact: true })).toBeVisible();
+    const oldGuestArticle = page.getByRole('article').filter({ hasText: 'Tin guest nằm ngoài trang mới nhất' });
+    await expect(oldGuestArticle.getByRole('button', { name: /❤️ 1/ })).toBeVisible();
 
     const ended = await request.delete(`${API_URL}/guest`, { headers: headersB });
     expect(ended.ok()).toBe(true);
-    await expect(page.getByText('Tin guest nằm ngoài trang mới nhất', { exact: true })).toHaveCount(0);
+    await expect(page.getByText('Tin guest nằm ngoài trang mới nhất', { exact: true })).toBeVisible();
+    await expect(oldGuestArticle.getByRole('button', { name: /❤️ 1/ })).toHaveCount(0);
   } finally {
     await request.delete(`${API_URL}/guest`, { headers: headersA });
     await request.delete(`${API_URL}/guest`, { headers: headersB }).catch(() => undefined);
+    const databaseUrl = process.env.DATABASE_URL;
+    if (!databaseUrl) throw new Error('DATABASE_URL is required for guest retention cleanup E2E');
+    const { db, pool } = createDatabase(databaseUrl, 1);
+    await db.delete(rooms).where(eq(rooms.id, guestA.roomId));
+    await pool.end();
   }
 });
 
 test('search và thống kê phòng bao phủ cả lịch sử chưa tải @critical', async ({ request }) => {
   test.setTimeout(45_000);
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error('DATABASE_URL is required for message search E2E');
+  const { db, pool } = createDatabase(databaseUrl, 1);
   const created = await request.post(`${API_URL}/guest`, { data: { displayName: `Search history ${Date.now()}` } });
   expect(created.ok()).toBe(true);
   const guest = await created.json() as { sessionId: string; roomId: string };
@@ -200,6 +214,8 @@ test('search và thống kê phòng bao phủ cả lịch sử chưa tải @crit
     expect(result.messages.map((item) => item.body)).toEqual(['Kim chỉ nam nằm trong trang cũ nhất']);
   } finally {
     await request.delete(`${API_URL}/guest`, { headers });
+    await db.delete(rooms).where(eq(rooms.id, guest.roomId));
+    await pool.end();
   }
 });
 

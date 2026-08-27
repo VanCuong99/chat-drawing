@@ -431,6 +431,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const eraserCursorRef = useRef<HTMLSpanElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
+  const toolRailRef = useRef<HTMLElement>(null);
   const dialogRef = useRef<HTMLElement>(null);
   const shapeButtonRef = useRef<HTMLButtonElement>(null);
   const mixerToggleRef = useRef<HTMLButtonElement>(null);
@@ -472,16 +473,35 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const [sourceError, setSourceError] = useState(false);
   const [sourceReady, setSourceReady] = useState(0);
   const [hint, setHint] = useState('Kéo trên giấy để bắt đầu');
+  const [toolRailHasMore, setToolRailHasMore] = useState(false);
   const actions = history.present.actions;
   const paper = history.present.paper;
   const size = tool === 'text' ? fontSize : isSizedTool(tool) ? toolSizes[tool] : toolSizes.pen;
   const sizeLimits = tool === 'text' ? { min: 20, max: 96 } : isSizedTool(tool) ? TOOL_SIZE_LIMITS[tool] : TOOL_SIZE_LIMITS.pen;
   const isDirty = history.past.length > 0 || history.future.length > 0 || actions.length > 0 || paper !== 'white' || Boolean(caption.trim()) || Boolean(textValue.trim());
+  const canSendCanvas = Boolean(sourceUrl) || actions.length > 0 || paper !== 'white';
   const pigmentFormula = useMemo(() => mixerComponents.map(({ color: componentColor, weight }) => ({ color: componentColor, weight })), [mixerComponents]);
   const mixedColor = useMemo(() => mixPigmentHex(pigmentFormula), [pigmentFormula]);
   const mixerPercentages = useMemo(() => pigmentPercentages(pigmentFormula), [pigmentFormula]);
 
   useEffect(() => { actionsRef.current = actions; }, [actions]);
+
+  useEffect(() => {
+    const rail = toolRailRef.current;
+    if (!rail) return;
+    const updateOverflowCue = () => {
+      const horizontal = rail.scrollWidth > rail.clientWidth + 4;
+      setToolRailHasMore(horizontal && rail.scrollLeft + rail.clientWidth < rail.scrollWidth - 4);
+    };
+    updateOverflowCue();
+    rail.addEventListener('scroll', updateOverflowCue, { passive: true });
+    const observer = new ResizeObserver(updateOverflowCue);
+    observer.observe(rail);
+    return () => {
+      rail.removeEventListener('scroll', updateOverflowCue);
+      observer.disconnect();
+    };
+  }, []);
 
   const paintPreview = useCallback((preview?: DrawAction | null, paperOverride?: Paper, selectedText?: TextAction | null) => {
     const canvas = canvasRef.current;
@@ -860,6 +880,10 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const send = async () => {
     const canvas = canvasRef.current;
     if (!canvas || sendingRef.current || sourceLoading || sourceError || paletteMutating) return;
+    if (!canSendCanvas) {
+      setHint('Hãy vẽ ít nhất một nét hoặc chọn loại giấy trước khi gửi.');
+      return;
+    }
     if (textDragFrameRef.current !== null) {
       window.cancelAnimationFrame(textDragFrameRef.current);
       textDragFrameRef.current = null;
@@ -1051,6 +1075,17 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const closedShapeTool = isClosedShapeTool(tool);
   const editingTool = tool !== 'hand';
   const paletteAvailable = tool !== 'hand' && tool !== 'eraser';
+  const sendLabel = sourceError
+    ? 'Không tải được bản gốc'
+    : sourceLoading
+      ? 'Đang tải bản gốc…'
+      : paletteMutating
+        ? 'Đang lưu bảng màu…'
+        : sending
+          ? 'Đang gửi…'
+          : canSendCanvas
+            ? 'Gửi bản vẽ'
+            : 'Vẽ trước khi gửi';
 
   return (
     <div className="studio-backdrop">
@@ -1058,15 +1093,17 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
         <header className="studio-header advanced-studio-header">
           <button className="plain-button" onClick={requestClose} disabled={paletteMutating} data-studio-initial-focus>Đóng <kbd>Esc</kbd></button>
           <div><small>{sourceUrl ? `Tiếp nối phiên bản ${version ?? 1}` : 'Canvas 1200 × 720'}</small><h2 id="studio-title">Studio Nét</h2></div>
-          <button className="primary-button" onClick={() => void send()} disabled={paletteMutating || sending || sourceLoading || sourceError}>{sourceError ? 'Không tải được bản gốc' : sourceLoading ? 'Đang tải bản gốc…' : paletteMutating ? 'Đang lưu bảng màu…' : sending ? 'Đang gửi…' : 'Gửi bản vẽ'}</button>
+          <button className="primary-button" onClick={() => void send()} disabled={!canSendCanvas || paletteMutating || sending || sourceLoading || sourceError} title={!canSendCanvas ? 'Hãy vẽ ít nhất một nét hoặc chọn loại giấy trước khi gửi' : undefined}>{sendLabel}</button>
         </header>
 
         <div className="studio-workspace">
-          <aside className="tool-rail" aria-label="Công cụ vẽ">
-            {RAIL_TOOLS.map((item) => <button key={item.id} className={tool === item.id ? 'tool-button active' : 'tool-button'} data-tool-id={item.id} onClick={() => selectTool(item.id)} title={`${item.label} — phím ${item.key}`} aria-label={`${item.label} (${item.key})`} aria-pressed={tool === item.id}><b><ToolIcon tool={item.id} /></b><span>{item.label}</span></button>)}
-            <button ref={shapeButtonRef} className={closedShapeTool ? 'tool-button active' : 'tool-button'} data-tool-id="shape" onClick={toggleShapeMenu} title={`Chọn hình dạng — đang dùng ${activeShape.label}`} aria-label={`Hình dạng (${activeShape.label})`} aria-pressed={closedShapeTool} aria-haspopup="dialog" aria-expanded={shapeMenuOpen} aria-controls="shape-picker"><b><ToolIcon tool={selectedShape} /></b><span>Hình dạng</span></button>
-            <button className={tool === 'text' ? 'tool-button active' : 'tool-button'} data-tool-id="text" onClick={() => selectTool('text')} title={`${TEXT_TOOL.label} — phím ${TEXT_TOOL.key}`} aria-label={`${TEXT_TOOL.label} (${TEXT_TOOL.key})`} aria-pressed={tool === 'text'}><b><ToolIcon tool="text" /></b><span>{TEXT_TOOL.label}</span></button>
-          </aside>
+          <div className={toolRailHasMore ? 'tool-rail-shell has-more' : 'tool-rail-shell'}>
+            <aside ref={toolRailRef} className="tool-rail" aria-label="Công cụ vẽ">
+              {RAIL_TOOLS.map((item) => <button key={item.id} className={tool === item.id ? 'tool-button active' : 'tool-button'} data-tool-id={item.id} onClick={() => selectTool(item.id)} title={`${item.label} — phím ${item.key}`} aria-label={`${item.label} (${item.key})`} aria-pressed={tool === item.id}><b><ToolIcon tool={item.id} /></b><span>{item.label}</span></button>)}
+              <button ref={shapeButtonRef} className={closedShapeTool ? 'tool-button active' : 'tool-button'} data-tool-id="shape" onClick={toggleShapeMenu} title={`Chọn hình dạng — đang dùng ${activeShape.label}`} aria-label={`Hình dạng (${activeShape.label})`} aria-pressed={closedShapeTool} aria-haspopup="dialog" aria-expanded={shapeMenuOpen} aria-controls="shape-picker"><b><ToolIcon tool={selectedShape} /></b><span>Hình dạng</span></button>
+              <button className={tool === 'text' ? 'tool-button active' : 'tool-button'} data-tool-id="text" onClick={() => selectTool('text')} title={`${TEXT_TOOL.label} — phím ${TEXT_TOOL.key}`} aria-label={`${TEXT_TOOL.label} (${TEXT_TOOL.key})`} aria-pressed={tool === 'text'}><b><ToolIcon tool="text" /></b><span>{TEXT_TOOL.label}</span></button>
+            </aside>
+          </div>
 
           {shapeMenuOpen ? <>
             <div className="shape-popover-dismiss" aria-hidden="true" onPointerDown={() => { setShapeMenuOpen(false); shapeButtonRef.current?.focus(); }} />
@@ -1096,10 +1133,10 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
 
           <aside className="tool-inspector" aria-label="Thuộc tính công cụ">
             {editingTool ? <>
-              <section><div className="inspector-title"><span>Màu sắc</span><output>{color.toUpperCase()}</output></div><div className="advanced-color-row">{COLORS.map((item) => <button key={item} className={color.toUpperCase() === item.toUpperCase() ? 'color active' : 'color'} style={{ background: item }} onClick={() => setColor(item)} aria-label={`Chọn màu ${item}`} aria-pressed={color.toUpperCase() === item.toUpperCase()} />)}<label className="custom-color" title="Màu tuỳ chỉnh">＋<input type="color" name="custom-color" value={color} onChange={(event) => setColor(event.target.value.toUpperCase())} aria-label="Chọn màu tuỳ chỉnh" /></label></div>{paletteAvailable ? <button ref={mixerToggleRef} type="button" className="mixer-toggle" onClick={() => { setMixerOpen((open) => !open); setPaletteError(''); }} aria-label={mixerOpen ? 'Đóng bộ pha sắc tố' : 'Mở bộ pha sắc tố'} aria-expanded={mixerOpen} aria-controls="pigment-mixer"><span aria-hidden="true">◒</span>{mixerOpen ? 'Đóng bộ pha' : 'Pha sắc tố mới'}</button> : null}</section>
+              <section><div className="inspector-title"><span>Màu sắc</span><output>{color.toUpperCase()}</output></div><div className="advanced-color-row">{COLORS.map((item) => <button key={item} className={color.toUpperCase() === item.toUpperCase() ? 'color active' : 'color'} style={{ background: item }} onClick={() => setColor(item)} aria-label={`Chọn màu ${item}`} aria-pressed={color.toUpperCase() === item.toUpperCase()} />)}<label className="custom-color" title="Màu tuỳ chỉnh">＋<input type="color" name="custom-color" value={color} onChange={(event) => setColor(event.target.value.toUpperCase())} aria-label="Chọn màu tuỳ chỉnh" /></label></div>{paletteAvailable ? <button ref={mixerToggleRef} type="button" className="mixer-toggle" onClick={() => { setMixerOpen((open) => !open); setPaletteError(''); }} aria-label={mixerOpen ? 'Đóng pha màu nâng cao' : 'Mở pha màu nâng cao'} aria-expanded={mixerOpen} aria-controls="pigment-mixer"><span aria-hidden="true">◒</span>{mixerOpen ? 'Đóng pha màu' : 'Pha màu nâng cao'}</button> : null}</section>
               {paletteAvailable && mixerOpen ? (
-                <section id="pigment-mixer" className="pigment-mixer" role="region" aria-label="Bộ pha sắc tố">
-                  <div className="mixer-heading"><div><small>Kubelka–Munk</small><strong>Công thức nhiều màu</strong></div><button type="button" onClick={() => closeMixer(true)} aria-label="Đóng bộ pha sắc tố">×</button></div>
+                <section id="pigment-mixer" className="pigment-mixer" role="region" aria-label="Pha màu nâng cao">
+                  <div className="mixer-heading"><div><small>Pha màu nâng cao</small><strong>Trộn nhiều màu</strong></div><button type="button" onClick={() => closeMixer(true)} aria-label="Đóng pha màu nâng cao">×</button></div>
                   <div className="mixer-preview-sticky">
                     <div className="mixed-result"><span style={{ background: mixedColor }} aria-hidden="true" /><div><small>Màu sau khi pha</small><strong>{mixedColor}</strong></div><output>{mixerComponents.length} thành phần</output></div>
                     <div className="mixture-composition" aria-label="Tỷ lệ đã chuẩn hóa">{mixerComponents.map((component, index) => <i key={component.id} style={{ background: component.color, width: `${mixerPercentages[index]}%` }} title={`Màu ${index + 1}: ${mixerPercentages[index]}%`} />)}</div>
@@ -1116,11 +1153,11 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
                     ))}
                   </div>
                   <button type="button" className="add-pigment" onClick={addMixerComponent} disabled={mixerComponents.length >= MAX_PIGMENT_COMPONENTS} aria-label="Thêm màu thành phần">＋ Thêm màu <span>{mixerComponents.length}/{MAX_PIGMENT_COMPONENTS}</span></button>
-                  <p className="mix-parts-note">Thêm từ 2 đến 12 màu. Mỗi “phần pha” được chuẩn hóa thành nồng độ đầu vào của toàn bộ hỗn hợp; từng ô vẫn được giữ riêng trong công thức đã lưu.</p>
+                  <p className="mix-parts-note">Thêm từ 2 đến 12 màu. Số phần cho biết mỗi màu góp bao nhiêu; Nét tự quy đổi thành tỷ lệ phần trăm.</p>
                   <button type="button" className="use-mixed-color" onClick={() => applyPaletteColor(mixedColor)}>Dùng màu đã pha</button>
                   <label className="mix-name" htmlFor="mixed-color-name">Tên trong bảng màu<input id="mixed-color-name" name="mixed-color-name" autoComplete="off" value={mixerName} onChange={(event) => setMixerName(event.target.value)} maxLength={40} placeholder={`Màu pha ${paletteColors.length + 1}…`} aria-label="Tên màu đã pha" /></label>
                   <button type="button" className="save-mixed-color" onClick={() => void saveMixedColor()} disabled={paletteLoading || paletteMutating || paletteSaving || paletteColors.length >= 24}>{paletteLoading ? 'Đang mở bảng màu…' : paletteMutating || paletteSaving ? 'Đang lưu…' : paletteColors.length >= 24 ? 'Bảng màu đã đủ 24 màu' : 'Lưu công thức vào bảng màu'}</button>
-                  <p className="pigment-note">Mô phỏng gần đúng hỗn hợp nhiều màu bằng Kubelka–Munk từ sRGB/D65. Phần trăm là nồng độ đầu vào của mô hình, không phải công thức vật liệu thật; muốn dự đoán sơn/mực chính xác cần dữ liệu K/S đo cho từng pigment, chất kết dính và nền giấy.</p>
+                  <details className="pigment-details"><summary>Thông tin mô phỏng màu</summary><p className="pigment-note">Mô phỏng gần đúng hỗn hợp nhiều màu bằng Kubelka–Munk từ sRGB/D65. Tỷ lệ là dữ liệu đầu vào của mô hình, không phải công thức vật liệu thật; muốn dự đoán sơn hoặc mực chính xác cần dữ liệu K/S đo cho từng sắc tố, chất kết dính và nền giấy.</p></details>
                   {paletteError ? <p className="palette-error" role="alert">{paletteError}</p> : null}
                 </section>
               ) : null}
@@ -1129,7 +1166,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
                   <div className="inspector-title"><span>Bảng màu của bạn</span><output>{paletteLoading ? 'Đang tải…' : `${paletteColors.length}/24`}</output></div>
                   {paletteColors.length ? <div className="saved-palette">{paletteColors.map((savedColor) => (
                     <div key={savedColor.id} className="saved-color">
-                      <button type="button" className={color.toUpperCase() === savedColor.color ? 'saved-color-use active' : 'saved-color-use'} onClick={() => applyPaletteColor(savedColor.color, savedColor.name)} aria-label={`Dùng màu ${savedColor.name}`} aria-pressed={color.toUpperCase() === savedColor.color}><i style={{ background: savedColor.color }} /><span><strong>{savedColor.name}</strong><small>{savedColor.color} · {savedColor.components.length} màu · KM v{savedColor.model.version}</small></span></button>
+                      <button type="button" className={color.toUpperCase() === savedColor.color ? 'saved-color-use active' : 'saved-color-use'} onClick={() => applyPaletteColor(savedColor.color, savedColor.name)} aria-label={`Dùng màu ${savedColor.name}`} aria-pressed={color.toUpperCase() === savedColor.color}><i style={{ background: savedColor.color }} /><span><strong>{savedColor.name}</strong><small>{savedColor.color} · {savedColor.components.length} màu · công thức v{savedColor.model.version}</small></span></button>
                       <button type="button" className="saved-color-load" onClick={() => loadPaletteFormula(savedColor)} aria-label={`Nạp công thức ${savedColor.name}`} disabled={paletteLoading || paletteMutating}>↗</button>
                       <button type="button" className="saved-color-delete" onClick={() => setPaletteDeleteTarget(savedColor)} aria-label={`Xóa màu ${savedColor.name}`} disabled={paletteLoading || paletteMutating}>×</button>
                     </div>
@@ -1146,7 +1183,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
           </aside>
         </div>
 
-        <footer className="studio-footer"><label><span>Lời nhắn đi kèm</span><input name="drawing-caption" autoComplete="off" value={caption} onChange={(event) => setCaption(event.target.value)} placeholder="Thêm bối cảnh cho bản vẽ…" maxLength={2000} aria-label="Lời nhắn cho bản vẽ" /></label><div><span>{sourceUrl ? 'Bản gốc được giữ nguyên · ' : ''}PNG 1200 × 720</span><button className="primary-button" onClick={() => void send()} disabled={paletteMutating || sending || sourceLoading || sourceError}>{paletteMutating ? 'Đang lưu bảng màu…' : sending ? 'Đang gửi…' : 'Gửi bản vẽ'}</button></div></footer>
+        <footer className="studio-footer"><label><span>Lời nhắn đi kèm</span><input name="drawing-caption" autoComplete="off" value={caption} onChange={(event) => setCaption(event.target.value)} placeholder="Thêm bối cảnh cho bản vẽ…" maxLength={2000} aria-label="Lời nhắn cho bản vẽ" /></label><div><span>{sourceUrl ? 'Bản gốc được giữ nguyên · ' : ''}PNG 1200 × 720</span><button className="primary-button" onClick={() => void send()} disabled={!canSendCanvas || paletteMutating || sending || sourceLoading || sourceError} title={!canSendCanvas ? 'Hãy vẽ ít nhất một nét hoặc chọn loại giấy trước khi gửi' : undefined}>{sendLabel}</button></div></footer>
       </section>
       <AppDialog open={Boolean(paletteDeleteTarget)} onClose={() => setPaletteDeleteTarget(null)} labelledBy="delete-palette-title" describedBy="delete-palette-description" className="confirmation-backdrop">
         <section className="dialog-card confirmation-dialog">

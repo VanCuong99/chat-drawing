@@ -1,4 +1,5 @@
 import { expect, test, type BrowserContext, type Page } from '@playwright/test';
+import { createDatabase, inArray, rooms } from '@net/database';
 
 const API_URL = 'http://localhost:3001/api';
 
@@ -10,9 +11,9 @@ async function startGuest(page: Page, name: string, inviteUrl = '/') {
   await page.getByRole('button', { name: 'Vào không gian Nét' }).click();
   const response = await created;
   expect(response.status()).toBe(200);
-  const body = await response.json() as { sessionId: string };
+  const body = await response.json() as { sessionId: string; roomId: string };
   await expect(page.getByText('kết nối trực tiếp')).toBeVisible();
-  return body.sessionId;
+  return body;
 }
 
 async function sendText(page: Page, text: string) {
@@ -31,6 +32,9 @@ async function safelyEnd(context: BrowserContext, page: Page, sessionId: string)
 
 test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kết thúc sau reload @critical', async ({ browser, request }) => {
   test.setTimeout(90_000);
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error('DATABASE_URL is required for two-party chat E2E');
+  const { db, pool } = createDatabase(databaseUrl, 1);
   const contextA = await browser.newContext({ baseURL: 'http://localhost:3000' });
   const contextB = await browser.newContext({ baseURL: 'http://localhost:3000' });
   const pageA = await contextA.newPage();
@@ -41,15 +45,20 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
   let sessionA = '';
   let sessionB = '';
   let otherSession = '';
+  const roomIds = new Set<string>();
 
   try {
     const stamp = Date.now();
-    sessionA = await startGuest(pageA, `Alice QA ${stamp}`);
+    const guestA = await startGuest(pageA, `Alice QA ${stamp}`);
+    sessionA = guestA.sessionId;
+    roomIds.add(guestA.roomId);
     await pageA.getByRole('button', { name: 'Thông tin cuộc trò chuyện' }).click();
     const inviteUrl = await pageA.getByLabel('Link mời').inputValue();
     expect(inviteUrl).toContain('?room=');
     await pageA.locator('.info-drawer').getByRole('button', { name: 'Đóng' }).click();
-    sessionB = await startGuest(pageB, `Bob QA ${stamp}`, inviteUrl);
+    const guestB = await startGuest(pageB, `Bob QA ${stamp}`, inviteUrl);
+    sessionB = guestB.sessionId;
+    roomIds.add(guestB.roomId);
 
     const fromAlice = `Alice gửi Bob ${stamp}`;
     const aliceArticle = await sendText(pageA, fromAlice);
@@ -81,7 +90,9 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
 
     const other = await request.post(`${API_URL}/guest`, { data: { displayName: `Phòng khác ${stamp}` } });
     expect(other.status()).toBe(200);
-    otherSession = ((await other.json()) as { sessionId: string }).sessionId;
+    const otherGuest = (await other.json()) as { sessionId: string; roomId: string };
+    otherSession = otherGuest.sessionId;
+    roomIds.add(otherGuest.roomId);
     const otherBootstrap = await request.get(`${API_URL}/bootstrap`, { headers: { 'x-net-guest-session': otherSession } });
     const otherRoom = ((await otherBootstrap.json()).rooms as Array<{ inviteCode: string }>)[0];
     await pageB.goto(`/?room=${otherRoom.inviteCode}`);
@@ -96,7 +107,7 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     expect((await ended).status()).toBe(200);
     sessionB = '';
     await expect(pageB.getByRole('heading', { name: /Có những điều/ })).toBeVisible();
-    await expect(pageA.locator('.message-bubble').getByText(fromBob, { exact: true })).toHaveCount(0);
+    await expect(pageA.locator('.message-bubble').getByText(fromBob, { exact: true })).toBeVisible();
     await expect(pageA.getByRole('article').filter({ hasText: missedWhileOffline })).toBeVisible();
     await expect(aliceArticle).toContainText('Đã gửi');
     expect(pageErrors).toEqual([]);
@@ -114,5 +125,7 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     ]);
     await contextA.close();
     await contextB.close();
+    if (roomIds.size) await db.delete(rooms).where(inArray(rooms.id, [...roomIds]));
+    await pool.end();
   }
 });

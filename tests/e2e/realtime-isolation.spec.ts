@@ -39,6 +39,9 @@ async function subscribe(socket: Socket, roomId: string) {
 }
 
 test('WebSocket chỉ phát message vào đúng room đã được cấp quyền @critical', async ({ request }) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error('DATABASE_URL is required for realtime isolation E2E');
+  const { db, pool } = createDatabase(databaseUrl, 1);
   const guestA = await createGuest(request, `Realtime A ${Date.now()}`);
   const guestB = await createGuest(request, `Realtime B ${Date.now()}`);
   const [socketA, socketB] = await Promise.all([
@@ -79,6 +82,8 @@ test('WebSocket chỉ phát message vào đúng room đã được cấp quyền
       request.delete(`${apiOrigin}/api/guest`, { headers: { 'x-net-guest-session': guestA.sessionId } }),
       request.delete(`${apiOrigin}/api/guest`, { headers: { 'x-net-guest-session': guestB.sessionId } }),
     ]);
+    await db.delete(rooms).where(inArray(rooms.id, [guestA.roomId, guestB.roomId]));
+    await pool.end();
   }
 });
 

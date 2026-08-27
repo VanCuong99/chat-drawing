@@ -80,11 +80,15 @@ test('retry đồng thời chỉ tạo một message và một realtime event @c
   } finally {
     socket.disconnect();
     await request.delete(`${apiOrigin}/api/guest`, { headers });
+    await db.delete(rooms).where(eq(rooms.id, guest.roomId));
     await pool.end();
   }
 });
 
 test('sequence giữ đúng pagination/read khi message đến đồng thời @critical', async ({ request }) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error('DATABASE_URL is required for sequence E2E');
+  const { db, pool } = createDatabase(databaseUrl, 1);
   const stamp = Date.now();
   const guestA = await createGuest(request, `Sequence A ${stamp}`);
   const headersA = { 'x-net-guest-session': guestA.sessionId };
@@ -121,6 +125,8 @@ test('sequence giữ đúng pagination/read khi message đến đồng thời @c
       request.delete(`${apiOrigin}/api/guest`, { headers: headersA }),
       request.delete(`${apiOrigin}/api/guest`, { headers: headersB }),
     ]);
+    await db.delete(rooms).where(eq(rooms.id, guestA.roomId));
+    await pool.end();
   }
 });
 
@@ -193,7 +199,7 @@ test('join, guest send và end dùng cùng room lock, không để nội dung sh
   }
 });
 
-test('guest mới join không nhận session ma khi guest cuối cleanup phòng @critical', async ({ request }) => {
+test('guest mới vẫn join được đúng phòng khi guest trước kết thúc đồng thời @critical', async ({ request }) => {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error('DATABASE_URL is required for guest cleanup lock E2E');
   const { db, pool } = createDatabase(databaseUrl, 3);
@@ -220,18 +226,16 @@ test('guest mới join không nhận session ma khi guest cuối cleanup phòng 
     await lockClient.query('commit');
     const [ended, joined] = await Promise.all([endPromise, joinPromise]);
     expect(ended.status()).toBe(200);
-    expect([200, 404]).toContain(joined.status());
-    if (joined.status() === 200) {
-      const joinedBody = await joined.json() as { sessionId: string; roomId: string };
-      secondSessionId = joinedBody.sessionId;
-      expect(joinedBody.roomId).toBe(firstGuest.roomId);
-      const verified = await request.get(`${apiOrigin}/api/bootstrap`, {
-        headers: { 'x-net-guest-session': secondSessionId },
-      });
-      expect(verified.status()).toBe(200);
-      await expect(verified.json()).resolves.toMatchObject({ actor: { id: secondSessionId, kind: 'guest' } });
-      expect(await db.select({ id: guestSessions.id }).from(guestSessions).where(eq(guestSessions.id, secondSessionId))).toHaveLength(1);
-    }
+    expect(joined.status()).toBe(200);
+    const joinedBody = await joined.json() as { sessionId: string; roomId: string };
+    secondSessionId = joinedBody.sessionId;
+    expect(joinedBody.roomId).toBe(firstGuest.roomId);
+    const verified = await request.get(`${apiOrigin}/api/bootstrap`, {
+      headers: { 'x-net-guest-session': secondSessionId },
+    });
+    expect(verified.status()).toBe(200);
+    await expect(verified.json()).resolves.toMatchObject({ actor: { id: secondSessionId, kind: 'guest' } });
+    expect(await db.select({ id: guestSessions.id }).from(guestSessions).where(eq(guestSessions.id, secondSessionId))).toHaveLength(1);
   } finally {
     await lockClient.query('rollback').catch(() => undefined);
     lockClient.release();
@@ -319,6 +323,7 @@ test('event mutation hiện tại được ưu tiên, không chờ toàn bộ ou
   } finally {
     await db.delete(realtimeOutbox).where(eq(realtimeOutbox.roomId, guest.roomId));
     await request.delete(`${apiOrigin}/api/guest`, { headers }).catch(() => undefined);
+    await db.delete(rooms).where(eq(rooms.id, guest.roomId));
     await pool.end();
   }
 });

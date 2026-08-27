@@ -26,10 +26,20 @@ test('Studio không bị cắt ở màn hình ngang thấp và mobile @critical'
   expect(mobileBox!.x).toBe(0);
   expect(mobileBox!.y).toBeGreaterThanOrEqual(0);
   expect(mobileBox!.y + mobileBox!.height).toBeLessThanOrEqual(844);
-  await expect(page.getByRole('button', { name: 'Gửi bản vẽ', exact: true }).first()).toBeInViewport();
+  await expect(page.getByRole('button', { name: 'Vẽ trước khi gửi', exact: true }).first()).toBeInViewport();
+  await expect(page.getByRole('button', { name: 'Vẽ trước khi gửi', exact: true }).first()).toBeDisabled();
   await expect(page.getByRole('textbox', { name: 'Lời nhắn cho bản vẽ' })).toBeInViewport();
+  const toolRailShell = page.locator('.tool-rail-shell');
+  await expect(toolRailShell).toHaveClass(/has-more/);
+  await expect.poll(() => toolRailShell.evaluate((element) => getComputedStyle(element, '::after').content)).toContain('Thêm');
+  await page.locator('.tool-rail').evaluate((rail) => { rail.scrollLeft = rail.scrollWidth; rail.dispatchEvent(new Event('scroll')); });
+  await expect(toolRailShell).not.toHaveClass(/has-more/);
+  await expect(page.getByRole('button', { name: /Chèn chữ/ })).toBeInViewport();
 
   await page.getByRole('button', { name: /Đóng/ }).click();
+  await page.getByRole('button', { name: 'Tìm trong tin nhắn' }).click();
+  await expect(page.getByRole('textbox', { name: 'Tìm nội dung tin nhắn' })).toBeVisible();
+  await page.getByRole('button', { name: 'Đóng tìm kiếm' }).click();
   await page.getByRole('button', { name: 'Mở danh sách trò chuyện' }).click();
   await page.getByRole('button', { name: 'Kết thúc phiên khách' }).click();
   await page.getByRole('button', { name: 'Kết thúc phiên', exact: true }).click();

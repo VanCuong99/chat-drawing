@@ -8,7 +8,7 @@ Nét is a responsive, installable web messenger where people can express an idea
 
 - Authenticated users sign in with ChatGPT. Their rooms, messages, reactions, read state, images, and drawing versions are stored permanently.
 - Guests join with a display name through an invite link or start a temporary room. A guest session expires after two hours of inactivity or immediately when the guest chooses **End session**.
-- Messages, reactions, and uploaded assets created by a guest are deleted when that guest session ends. Authenticated content in the same room remains.
+- When a guest session ends, the guest loses access but sent messages and attached assets remain in the room. Guest reactions, palette data, and unattached temporary uploads are removed.
 - The drawing studio mixes 2–12 display colors simultaneously with a Kubelka–Munk-based sRGB/D65 approximation. Each component has an integer model-concentration parts value from 1–100; the UI shows normalized percentages and preserves duplicate component provenance. It must be described as an approximation because real results depend on measured pigment K/S spectra, binders, substrate, and lighting.
 - A person can name and save up to 24 mixed-color formulas, reuse the result, reload the full component formula for further mixing, and delete it. An authenticated user's palette is persistent; a guest palette belongs to the guest session and is cascade-deleted when that session ends.
 

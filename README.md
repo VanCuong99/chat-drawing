@@ -90,7 +90,7 @@ Asset URL mặc định sống 10 phút (`ASSET_URL_TTL`) và chỉ mang quyền
 
 Authenticated mode dùng Neon Auth ở Next.js. Route server của web đọc session đã ký, sau đó cấp JWT sống ngắn với `issuer=net-web`, `audience=net-api`; NestJS chỉ tin JWT ký bởi `AUTH_JWT_SECRET`. Web và API phải dùng cùng secret, dài tối thiểu 32 byte.
 
-Guest không cần tài khoản và mất quyền khi phiên kết thúc. Trong phòng chỉ có guest, message/asset tạm thời bị xoá; nếu phòng đã có thành viên đăng nhập, nội dung guest đã gửi được giữ lại vĩnh viễn và chỉ guest session bị thu hồi. `joinRoom`, guest send và guest end dùng chung PostgreSQL advisory lock theo room để không sai retention khi chạy đồng thời.
+Guest không cần tài khoản và mất quyền khi phiên kết thúc. Message/asset guest đã gửi được giữ lại trong phòng kể cả khi chưa có thành viên đăng nhập; guest session, reaction và dữ liệu tạm chưa gắn vào tin nhắn bị thu hồi. `joinRoom`, guest send và guest end dùng chung PostgreSQL advisory lock theo room để không sai retention khi chạy đồng thời.
 
 ## Production hiện tại
 

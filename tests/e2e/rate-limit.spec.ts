@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { createDatabase, eq, rooms } from '@net/database';
 
 const API_URL = 'http://localhost:3001/api';
 
@@ -8,6 +9,9 @@ test('rate limit message dùng counter Postgres nguyên tử khi request đồng
   expect(created.status()).toBe(200);
   const guest = await created.json() as { sessionId: string; roomId: string };
   const headers = { 'x-net-guest-session': guest.sessionId };
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error('DATABASE_URL is required for rate limit E2E');
+  const { db, pool } = createDatabase(databaseUrl, 1);
 
   try {
     const responses = await Promise.all(Array.from({ length: 121 }, (_, index) => request.post(`${API_URL}/rooms/${guest.roomId}/messages`, {
@@ -19,5 +23,7 @@ test('rate limit message dùng counter Postgres nguyên tử khi request đồng
     await expect(responses.find((response) => response.status() === 429)!.json()).resolves.toMatchObject({ error: expect.stringContaining('thao tác quá nhanh') });
   } finally {
     await request.delete(`${API_URL}/guest`, { headers });
+    await db.delete(rooms).where(eq(rooms.id, guest.roomId));
+    await pool.end();
   }
 });

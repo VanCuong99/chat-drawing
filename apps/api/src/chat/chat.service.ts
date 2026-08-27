@@ -16,6 +16,7 @@ import {
   ne,
   or,
   reactions,
+  realtimeOutbox,
   roomMembers,
   rooms,
   sql,
@@ -30,6 +31,7 @@ import { RealtimeService } from '../realtime/realtime.service';
 import { RealtimeOutboxService } from '../realtime/realtime-outbox.service';
 
 const EMOJIS = ['❤️', '👍', '✨', '😂', '👀'];
+const EMPTY_GUEST_ROOM_GRACE_MS = 5 * 60 * 1000;
 
 @Injectable()
 export class ChatService {
@@ -143,7 +145,7 @@ export class ChatService {
       if (!firstMessage) {
         const [authenticatedMember] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers)
           .where(eq(roomMembers.roomId, room.id)).limit(1);
-        await tx.insert(messages).values({ roomId: room.id, guestSessionId: session.id, senderName: 'Nét', type: 'system', body: 'Phiên khách đã bắt đầu. Nội dung chỉ là tạm thời trong phòng chỉ có khách; trong phòng có thành viên đăng nhập, nội dung đã gửi có thể được giữ lại.', createdAt: now + 1, expiresAt: authenticatedMember ? null : expiresAt });
+        await tx.insert(messages).values({ roomId: room.id, guestSessionId: session.id, senderName: 'Nét', type: 'system', body: 'Phiên khách đã bắt đầu. Khi phiên kết thúc, khách mất quyền truy cập nhưng hình ảnh và tin nhắn đã gửi vẫn được giữ lại.', createdAt: now + 1, expiresAt: authenticatedMember ? null : expiresAt });
       }
       return { sessionId: session.id, expiresAt, roomId: room.id, roomName: room.name };
     });
@@ -163,59 +165,38 @@ export class ChatService {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${candidate.roomId}, 0))`);
       const [guest] = await tx.select().from(guestSessions).where(eq(guestSessions.id, guestId)).for('update').limit(1);
       if (!guest) return null;
-      const [member, assetRows, messageRows] = await Promise.all([
-        tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.roomId, guest.roomId)).limit(1),
-        tx.select({ key: assets.key, status: assets.status }).from(assets).where(eq(assets.guestSessionId, guestId)),
-        tx.select({ id: messages.id }).from(messages).where(eq(messages.guestSessionId, guestId)),
-      ]);
-      const retainSharedContent = member.length > 0;
-      const disposableAssets = retainSharedContent
-        ? assetRows.filter((asset) => asset.status !== 'attached')
-        : assetRows;
+      const assetRows = await tx.select({ key: assets.key, status: assets.status }).from(assets)
+        .where(eq(assets.guestSessionId, guestId));
+      const removedReactions = await tx.select({ messageId: reactions.messageId, emoji: reactions.emoji }).from(reactions)
+        .where(eq(reactions.actorKey, `guest:${guestId}`));
+      const disposableAssets = assetRows.filter((asset) => asset.status !== 'attached');
       if (disposableAssets.length) {
         await tx.update(assets).set({ status: 'deleting' }).where(and(
           eq(assets.guestSessionId, guestId),
           inArray(assets.key, disposableAssets.map((asset) => asset.key)),
         ));
       }
-      if (retainSharedContent) {
-        await tx.update(assets).set({
-          guestSessionId: null,
-          ownerKey: `retained-guest:${guestId}`,
-          expiresAt: null,
-        }).where(and(eq(assets.guestSessionId, guestId), eq(assets.status, 'attached')));
-        await tx.update(messages).set({ guestSessionId: null, expiresAt: null }).where(eq(messages.guestSessionId, guestId));
-      } else if (messageRows.length) {
-        await tx.delete(messages).where(eq(messages.guestSessionId, guestId));
-      }
+      await tx.update(assets).set({
+        guestSessionId: null,
+        ownerKey: `retained-guest:${guestId}`,
+        expiresAt: null,
+      }).where(and(eq(assets.guestSessionId, guestId), eq(assets.status, 'attached')));
+      await tx.update(messages).set({ guestSessionId: null, expiresAt: null }).where(eq(messages.guestSessionId, guestId));
       const outboxId = await this.outbox.enqueue(tx, guest.roomId, 'guest.ended', {
         guestSessionId: guestId,
-        retained: retainSharedContent,
-        messageIds: retainSharedContent ? [] : messageRows.map((message) => message.id),
+        retained: true,
+        messageIds: [],
+        removedReactions,
       });
       await tx.delete(reactions).where(eq(reactions.actorKey, `guest:${guestId}`));
       await tx.delete(guestSessions).where(eq(guestSessions.id, guestId));
-      return { guest, disposableAssets, outboxId, retainSharedContent };
+      return { guest, disposableAssets, outboxId };
     });
     if (!ended) return false;
     await this.outbox.deliverIds([ended.outboxId]);
     await this.assetService.deleteKeys(ended.disposableAssets.map((asset) => asset.key));
-    const [room] = await this.db.select({ kind: rooms.kind }).from(rooms).where(eq(rooms.id, ended.guest.roomId)).limit(1);
-    if (room?.kind === 'guest') {
-      await this.db.transaction(async (tx) => {
-        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${ended.guest.roomId}, 0))`);
-        const [member, activeGuest, retainedAsset] = await Promise.all([
-          tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.roomId, ended.guest.roomId)).limit(1),
-          tx.select({ id: guestSessions.id }).from(guestSessions).where(eq(guestSessions.roomId, ended.guest.roomId)).limit(1),
-          tx.select({ key: assets.key }).from(assets).where(eq(assets.roomId, ended.guest.roomId)).limit(1),
-        ]);
-        if (!member[0] && !activeGuest[0] && !retainedAsset[0]) {
-          await tx.delete(rooms).where(eq(rooms.id, ended.guest.roomId));
-        }
-      });
-    }
     this.realtime.disconnectActor(`guest:${guestId}`);
-    return ended.retainSharedContent;
+    return true;
   }
 
   async searchUsers(actor: Actor, queryInput: unknown) {
@@ -476,8 +457,36 @@ export class ChatService {
   }
 
   async cleanupExpiredGuests() {
-    const expired = await this.db.select({ id: guestSessions.id }).from(guestSessions).where(lt(guestSessions.expiresAt, Date.now())).limit(30);
+    const now = Date.now();
+    const expired = await this.db.select({ id: guestSessions.id }).from(guestSessions).where(lt(guestSessions.expiresAt, now)).limit(30);
     for (const guest of expired) await this.endGuestById(guest.id);
+    const emptyRoomCandidates = await this.db.select({ id: rooms.id, createdAt: rooms.createdAt }).from(rooms).where(and(
+      eq(rooms.kind, 'guest'),
+      lt(rooms.createdAt, now - EMPTY_GUEST_ROOM_GRACE_MS),
+      sql`not exists (select 1 from ${roomMembers} where ${roomMembers.roomId} = ${rooms.id})`,
+      sql`not exists (select 1 from ${guestSessions} where ${guestSessions.roomId} = ${rooms.id})`,
+      sql`not exists (select 1 from ${messages} where ${messages.roomId} = ${rooms.id} and ${messages.type} <> 'system')`,
+      sql`not exists (select 1 from ${assets} where ${assets.roomId} = ${rooms.id})`,
+    )).orderBy(asc(rooms.createdAt)).limit(30);
+    for (const candidate of emptyRoomCandidates) {
+      await this.db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${candidate.id}, 0))`);
+        const [member, activeGuest, userMessage, remainingAsset, latestGuestEnd] = await Promise.all([
+          tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.roomId, candidate.id)).limit(1),
+          tx.select({ id: guestSessions.id }).from(guestSessions).where(eq(guestSessions.roomId, candidate.id)).limit(1),
+          tx.select({ id: messages.id }).from(messages).where(and(eq(messages.roomId, candidate.id), ne(messages.type, 'system'))).limit(1),
+          tx.select({ key: assets.key }).from(assets).where(eq(assets.roomId, candidate.id)).limit(1),
+          tx.select({ createdAt: realtimeOutbox.createdAt }).from(realtimeOutbox).where(and(
+            eq(realtimeOutbox.roomId, candidate.id),
+            eq(realtimeOutbox.event, 'guest.ended'),
+          )).orderBy(desc(realtimeOutbox.createdAt)).limit(1),
+        ]);
+        const emptySince = latestGuestEnd[0]?.createdAt ?? candidate.createdAt;
+        if (emptySince < now - EMPTY_GUEST_ROOM_GRACE_MS && !member[0] && !activeGuest[0] && !userMessage[0] && !remainingAsset[0]) {
+          await tx.delete(rooms).where(eq(rooms.id, candidate.id));
+        }
+      });
+    }
   }
 
   private async seedFirstRoom(actor: Extract<Actor, { kind: 'user' }>) {
