@@ -2,6 +2,7 @@ import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { getAuthenticatedUser, safeReturnTo } from '@/src/server/auth';
 import { signInAction } from '../actions';
+import AuthSubmitButton from '../auth-submit-button';
 
 export const dynamic = 'force-dynamic';
 
@@ -19,9 +20,9 @@ export default async function SignInPage({ searchParams }: { searchParams?: Prom
         {parameters?.error ? <p className="auth-error" role="alert">{parameters.error}</p> : null}
         <form action={signInAction} className="auth-form">
           <input type="hidden" name="returnTo" value={returnTo} />
-          <label>Email<input required type="email" name="email" autoComplete="email" placeholder="ban@example.com" /></label>
+          <label>Email<input required type="email" name="email" autoComplete="email" spellCheck={false} placeholder="ban@example.com…" /></label>
           <label>Mật khẩu<input required type="password" name="password" autoComplete="current-password" /></label>
-          <button type="submit">Đăng nhập</button>
+          <AuthSubmitButton idleLabel="Đăng nhập" pendingLabel="Đang đăng nhập…" />
         </form>
         <p className="auth-switch">Chưa có tài khoản? <Link href={`/auth/sign-up?returnTo=${encodeURIComponent(returnTo)}`}>Tạo tài khoản miễn phí</Link></p>
         <Link className="auth-guest" href={returnTo}>Tiếp tục với tư cách khách</Link>

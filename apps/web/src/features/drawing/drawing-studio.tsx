@@ -1108,7 +1108,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
           {shapeMenuOpen ? <>
             <div className="shape-popover-dismiss" aria-hidden="true" onPointerDown={() => { setShapeMenuOpen(false); shapeButtonRef.current?.focus(); }} />
             <section id="shape-picker" className="shape-popover" role="dialog" aria-modal="false" aria-labelledby="shape-picker-title" style={shapeMenuPosition}>
-              <header><div><small>Hình học</small><strong id="shape-picker-title">Chọn hình dạng</strong></div><button type="button" onClick={() => { setShapeMenuOpen(false); shapeButtonRef.current?.focus(); }} aria-label="Đóng bộ chọn hình dạng">×</button></header>
+              <header><div><small>Hình học</small><strong id="shape-picker-title">Chọn hình dạng</strong></div><button type="button" onClick={() => { setShapeMenuOpen(false); shapeButtonRef.current?.focus(); }} aria-label="Đóng bộ chọn hình dạng" data-tooltip="Đóng" data-tooltip-placement="below">×</button></header>
               <div className="shape-options" role="group" aria-label="Chọn loại hình">{SHAPE_TOOLS.map((item) => <button key={item.id} type="button" className={selectedShape === item.id ? 'active' : ''} onClick={() => selectTool(item.id)} aria-label={item.label} aria-pressed={selectedShape === item.id}><ToolIcon tool={item.id} /><span>{item.label}</span><kbd>{item.key}</kbd></button>)}</div>
               <p className="shape-tool-help">Chọn xong là vẽ ngay. Giữ <kbd>Shift</kbd> khi kéo để cân đều hai chiều.</p>
             </section>
@@ -1116,9 +1116,9 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
 
           <div className="canvas-panel">
             <div className="canvas-commandbar">
-              <div><button onClick={undo} disabled={!history.past.length} aria-label="Hoàn tác">↶</button><button onClick={redo} disabled={!history.future.length} aria-label="Làm lại">↷</button><button onClick={clear} disabled={!actions.length} aria-label="Xoá các nét mới">⌫</button></div>
+              <div><button onClick={undo} disabled={!history.past.length} aria-label="Hoàn tác" data-tooltip="Hoàn tác" data-tooltip-placement="below">↶</button><button onClick={redo} disabled={!history.future.length} aria-label="Làm lại" data-tooltip="Làm lại" data-tooltip-placement="below">↷</button><button onClick={clear} disabled={!actions.length} aria-label="Xoá các nét mới" data-tooltip="Xoá các nét mới" data-tooltip-placement="below">⌫</button></div>
               <span><strong>{activeTool.label}</strong><kbd>{activeTool.key}</kbd><i aria-hidden="true">·</i>{actions.length} thao tác</span>
-              <div className="zoom-control"><button onClick={() => setZoom((value) => Math.max(50, value - 10))} aria-label="Thu nhỏ">−</button><output>{zoom}%</output><button onClick={() => setZoom((value) => Math.min(180, value + 10))} aria-label="Phóng to">＋</button></div>
+              <div className="zoom-control"><button onClick={() => setZoom((value) => Math.max(50, value - 10))} aria-label="Thu nhỏ" data-tooltip="Thu nhỏ" data-tooltip-placement="below">−</button><output>{zoom}%</output><button onClick={() => setZoom((value) => Math.min(180, value + 10))} aria-label="Phóng to" data-tooltip="Phóng to" data-tooltip-placement="below">＋</button></div>
             </div>
             <div ref={viewportRef} className="canvas-viewport" style={zoomStyle}>
               <div className="canvas-board">
@@ -1136,7 +1136,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
               <section><div className="inspector-title"><span>Màu sắc</span><output>{color.toUpperCase()}</output></div><div className="advanced-color-row">{COLORS.map((item) => <button key={item} className={color.toUpperCase() === item.toUpperCase() ? 'color active' : 'color'} style={{ background: item }} onClick={() => setColor(item)} aria-label={`Chọn màu ${item}`} aria-pressed={color.toUpperCase() === item.toUpperCase()} />)}<label className="custom-color" title="Màu tuỳ chỉnh">＋<input type="color" name="custom-color" value={color} onChange={(event) => setColor(event.target.value.toUpperCase())} aria-label="Chọn màu tuỳ chỉnh" /></label></div>{paletteAvailable ? <button ref={mixerToggleRef} type="button" className="mixer-toggle" onClick={() => { setMixerOpen((open) => !open); setPaletteError(''); }} aria-label={mixerOpen ? 'Đóng pha màu nâng cao' : 'Mở pha màu nâng cao'} aria-expanded={mixerOpen} aria-controls="pigment-mixer"><span aria-hidden="true">◒</span>{mixerOpen ? 'Đóng pha màu' : 'Pha màu nâng cao'}</button> : null}</section>
               {paletteAvailable && mixerOpen ? (
                 <section id="pigment-mixer" className="pigment-mixer" role="region" aria-label="Pha màu nâng cao">
-                  <div className="mixer-heading"><div><small>Pha màu nâng cao</small><strong>Trộn nhiều màu</strong></div><button type="button" onClick={() => closeMixer(true)} aria-label="Đóng pha màu nâng cao">×</button></div>
+                  <div className="mixer-heading"><div><small>Pha màu nâng cao</small><strong>Trộn nhiều màu</strong></div><button type="button" onClick={() => closeMixer(true)} aria-label="Đóng pha màu nâng cao" data-tooltip="Đóng pha màu" data-tooltip-placement="below">×</button></div>
                   <div className="mixer-preview-sticky">
                     <div className="mixed-result"><span style={{ background: mixedColor }} aria-hidden="true" /><div><small>Màu sau khi pha</small><strong>{mixedColor}</strong></div><output>{mixerComponents.length} thành phần</output></div>
                     <div className="mixture-composition" aria-label="Tỷ lệ đã chuẩn hóa">{mixerComponents.map((component, index) => <i key={component.id} style={{ background: component.color, width: `${mixerPercentages[index]}%` }} title={`Màu ${index + 1}: ${mixerPercentages[index]}%`} />)}</div>
@@ -1167,8 +1167,8 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
                   {paletteColors.length ? <div className="saved-palette">{paletteColors.map((savedColor) => (
                     <div key={savedColor.id} className="saved-color">
                       <button type="button" className={color.toUpperCase() === savedColor.color ? 'saved-color-use active' : 'saved-color-use'} onClick={() => applyPaletteColor(savedColor.color, savedColor.name)} aria-label={`Dùng màu ${savedColor.name}`} aria-pressed={color.toUpperCase() === savedColor.color}><i style={{ background: savedColor.color }} /><span><strong>{savedColor.name}</strong><small>{savedColor.color} · {savedColor.components.length} màu · công thức v{savedColor.model.version}</small></span></button>
-                      <button type="button" className="saved-color-load" onClick={() => loadPaletteFormula(savedColor)} aria-label={`Nạp công thức ${savedColor.name}`} disabled={paletteLoading || paletteMutating}>↗</button>
-                      <button type="button" className="saved-color-delete" onClick={() => setPaletteDeleteTarget(savedColor)} aria-label={`Xóa màu ${savedColor.name}`} disabled={paletteLoading || paletteMutating}>×</button>
+                      <button type="button" className="saved-color-load" onClick={() => loadPaletteFormula(savedColor)} aria-label={`Nạp công thức ${savedColor.name}`} data-tooltip="Nạp công thức" disabled={paletteLoading || paletteMutating}>↗</button>
+                      <button type="button" className="saved-color-delete" onClick={() => setPaletteDeleteTarget(savedColor)} aria-label={`Xóa màu ${savedColor.name}`} data-tooltip="Xoá màu" disabled={paletteLoading || paletteMutating}>×</button>
                     </div>
                   ))}</div> : <p className="empty-palette">{paletteLoading ? 'Đang mở bảng màu…' : 'Pha một màu rồi lưu lại để dùng cho những lần vẽ sau.'}</p>}
                   {!mixerOpen && paletteError ? <p className="palette-error" role="alert">{paletteError}</p> : null}
