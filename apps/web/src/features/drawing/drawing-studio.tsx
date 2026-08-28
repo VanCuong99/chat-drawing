@@ -471,14 +471,43 @@ function makeFillAction(image: ImageData, point: Point, color: string, opacity: 
     if (y + 1 < height) enqueue(index + width);
   }
 
+  // Flood fill must stop at the outline, but canvas anti-aliasing leaves a thin
+  // band of background-tinted pixels immediately before the solid stroke. Seal
+  // that single band without enqueueing it, so the fill reaches the visible
+  // edge while never using the softer threshold to leak through the boundary.
+  const edgeTolerance = Math.min(96, tolerance + 72);
+  const edgeMinX = Math.max(0, minX - 1);
+  const edgeMaxX = Math.min(width - 1, maxX + 1);
+  const edgeMinY = Math.max(0, minY - 1);
+  const edgeMaxY = Math.min(height - 1, maxY + 1);
+  for (let y = edgeMinY; y <= edgeMaxY; y += 1) {
+    for (let x = edgeMinX; x <= edgeMaxX; x += 1) {
+      const index = y * width + x;
+      if (visited[index] === 2) continue;
+      const touchesFill = (x > 0 && visited[index - 1] === 2)
+        || (x + 1 < width && visited[index + 1] === 2)
+        || (y > 0 && visited[index - width] === 2)
+        || (y + 1 < height && visited[index + width] === 2);
+      if (!touchesFill) continue;
+      const offset = index * 4;
+      const difference = Math.max(
+        Math.abs(image.data[offset] - target[0]),
+        Math.abs(image.data[offset + 1] - target[1]),
+        Math.abs(image.data[offset + 2] - target[2]),
+        Math.abs(image.data[offset + 3] - target[3]),
+      );
+      if (difference <= edgeTolerance) visited[index] = 3;
+    }
+  }
+
   const spans: number[] = [];
-  for (let y = minY; y <= maxY; y += 1) {
-    let x = minX;
-    while (x <= maxX) {
-      while (x <= maxX && visited[y * width + x] !== 2) x += 1;
-      if (x > maxX) break;
+  for (let y = edgeMinY; y <= edgeMaxY; y += 1) {
+    let x = edgeMinX;
+    while (x <= edgeMaxX) {
+      while (x <= edgeMaxX && visited[y * width + x] < 2) x += 1;
+      if (x > edgeMaxX) break;
       const start = x;
-      while (x + 1 <= maxX && visited[y * width + x + 1] === 2) x += 1;
+      while (x + 1 <= edgeMaxX && visited[y * width + x + 1] >= 2) x += 1;
       spans.push(y, start, x);
       x += 1;
     }
