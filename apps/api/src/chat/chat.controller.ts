@@ -17,6 +17,12 @@ export class ChatController {
   @Get('bootstrap')
   async bootstrap(@Req() request: Request) { return this.chat.bootstrap(await this.actors.resolve(request)); }
 
+  @Get('invites/:code')
+  async invite(@Req() request: Request, @Param('code') code: string) {
+    await this.limits.consume('invite:inspect', this.guestCreateSubject(request), 120, 15 * 60 * 1000);
+    return this.chat.inspectInvite(code);
+  }
+
   @Post('guest')
   @HttpCode(200)
   async createGuest(@Req() request: Request, @Body() body: { displayName?: unknown; inviteCode?: unknown }) {
@@ -90,7 +96,13 @@ export class ChatController {
   }
 
   @Get('health')
-  health() { return { ok: true, service: 'net-api' }; }
+  health() {
+    return {
+      ok: true,
+      service: 'net-api',
+      version: process.env.VERCEL_GIT_COMMIT_SHA ?? process.env.npm_package_version ?? 'local',
+    };
+  }
 
   private guestCreateSubject(request: Request) {
     const secret = this.config.get<string>('E2E_RATE_LIMIT_SECRET');

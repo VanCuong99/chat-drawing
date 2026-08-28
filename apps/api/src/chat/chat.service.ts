@@ -32,6 +32,8 @@ import { RealtimeOutboxService } from '../realtime/realtime-outbox.service';
 
 const EMOJIS = ['❤️', '👍', '✨', '😂', '👀'];
 const EMPTY_GUEST_ROOM_GRACE_MS = 5 * 60 * 1000;
+const ABANDONED_GUEST_ROOM_BATCH = 10;
+const ABANDONED_GUEST_ASSET_BATCH = 50;
 
 @Injectable()
 export class ChatService {
@@ -81,7 +83,7 @@ export class ChatService {
         ))
         .where(and(inArray(messages.roomId, roomIds), activeMessageCondition, ownMessageCondition))
         .groupBy(messages.roomId);
-    const [roomRows, latest, unreadRows, statisticRows] = await Promise.all([
+    const [roomRows, latest, unreadRows, statisticRows, counterpartRows] = await Promise.all([
       this.db.select().from(rooms).where(inArray(rooms.id, roomIds)),
       this.db.selectDistinctOn([messages.roomId], {
         roomId: messages.roomId,
@@ -98,10 +100,17 @@ export class ChatService {
       }).from(messages)
         .where(and(inArray(messages.roomId, roomIds), activeMessageCondition))
         .groupBy(messages.roomId),
+      actor.kind === 'user'
+        ? this.db.select({ roomId: roomMembers.roomId, displayName: users.displayName })
+          .from(roomMembers)
+          .innerJoin(users, eq(users.id, roomMembers.userId))
+          .where(and(inArray(roomMembers.roomId, roomIds), ne(roomMembers.userId, actor.id)))
+        : Promise.resolve([]),
     ]);
     const latestByRoom = new Map(latest.map((message) => [message.roomId, message]));
     const unreadByRoom = new Map(unreadRows.map((row) => [row.roomId, row.count]));
     const statisticsByRoom = new Map(statisticRows.map((row) => [row.roomId, row]));
+    const counterpartByRoom = new Map(counterpartRows.map((row) => [row.roomId, row.displayName]));
     return roomRows.map((room) => {
       const last = latestByRoom.get(room.id);
       const preview = !last ? 'Bắt đầu một câu chuyện mới'
@@ -111,6 +120,7 @@ export class ChatService {
       const statistics = statisticsByRoom.get(room.id);
       return {
         ...room,
+        name: room.kind === 'direct' ? counterpartByRoom.get(room.id) ?? room.name : room.name,
         preview,
         lastActivity: last?.createdAt ?? room.createdAt,
         unreadCount: unreadByRoom.get(room.id) ?? 0,
@@ -118,6 +128,14 @@ export class ChatService {
         mediaCount: statistics?.mediaCount ?? 0,
       };
     }).sort((a, b) => b.lastActivity - a.lastActivity);
+  }
+
+  async inspectInvite(inviteCodeInput: unknown) {
+    const inviteCode = this.requireText(inviteCodeInput, 'Mã mời', 4, 60);
+    const [room] = await this.db.select({ allowGuests: rooms.allowGuests, kind: rooms.kind }).from(rooms)
+      .where(eq(rooms.inviteCode, inviteCode)).limit(1);
+    if (!room || room.kind === 'direct') throw new NotFoundException('Link mời không hợp lệ hoặc đã hết hạn.');
+    return { valid: true, guestAllowed: room.allowGuests };
   }
 
   async createGuest(displayNameInput: unknown, inviteCodeInput?: unknown) {
@@ -134,7 +152,12 @@ export class ChatService {
       if (candidate) {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${candidate.id}, 0))`);
         const [availableRoom] = await tx.select().from(rooms)
-          .where(and(eq(rooms.id, candidate.id), eq(rooms.inviteCode, inviteCode), eq(rooms.allowGuests, true))).limit(1);
+          .where(and(
+            eq(rooms.id, candidate.id),
+            eq(rooms.inviteCode, inviteCode),
+            eq(rooms.allowGuests, true),
+            ne(rooms.kind, 'direct'),
+          )).limit(1);
         if (!availableRoom) throw new NotFoundException('Link mời không hợp lệ hoặc phòng không nhận khách.');
         room = availableRoom;
       } else {
@@ -145,7 +168,17 @@ export class ChatService {
       if (!firstMessage) {
         const [authenticatedMember] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers)
           .where(eq(roomMembers.roomId, room.id)).limit(1);
-        await tx.insert(messages).values({ roomId: room.id, guestSessionId: session.id, senderName: 'Nét', type: 'system', body: 'Phiên khách đã bắt đầu. Khi phiên kết thúc, khách mất quyền truy cập nhưng hình ảnh và tin nhắn đã gửi vẫn được giữ lại.', createdAt: now + 1, expiresAt: authenticatedMember ? null : expiresAt });
+        await tx.insert(messages).values({
+          roomId: room.id,
+          guestSessionId: session.id,
+          senderName: 'Nét',
+          type: 'system',
+          body: authenticatedMember
+            ? 'Phiên khách đã bắt đầu. Khi phiên kết thúc, khách mất quyền truy cập nhưng nội dung đã gửi vẫn được giữ lại trong phòng.'
+            : 'Phiên tạm thời đã bắt đầu. Nội dung chỉ được lưu lâu dài khi phòng có thành viên đăng nhập.',
+          createdAt: now + 1,
+          expiresAt: authenticatedMember ? null : expiresAt,
+        });
       }
       return { sessionId: session.id, expiresAt, roomId: room.id, roomName: room.name };
     });
@@ -167,36 +200,45 @@ export class ChatService {
       if (!guest) return null;
       const assetRows = await tx.select({ key: assets.key, status: assets.status }).from(assets)
         .where(eq(assets.guestSessionId, guestId));
+      const [authenticatedMember] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers)
+        .where(eq(roomMembers.roomId, guest.roomId)).limit(1);
+      const retained = Boolean(authenticatedMember);
+      const guestMessageRows = await tx.select({ id: messages.id }).from(messages)
+        .where(eq(messages.guestSessionId, guestId));
       const removedReactions = await tx.select({ messageId: reactions.messageId, emoji: reactions.emoji }).from(reactions)
         .where(eq(reactions.actorKey, `guest:${guestId}`));
-      const disposableAssets = assetRows.filter((asset) => asset.status !== 'attached');
+      const disposableAssets = retained ? assetRows.filter((asset) => asset.status !== 'attached') : assetRows;
       if (disposableAssets.length) {
         await tx.update(assets).set({ status: 'deleting' }).where(and(
           eq(assets.guestSessionId, guestId),
           inArray(assets.key, disposableAssets.map((asset) => asset.key)),
         ));
       }
-      await tx.update(assets).set({
-        guestSessionId: null,
-        ownerKey: `retained-guest:${guestId}`,
-        expiresAt: null,
-      }).where(and(eq(assets.guestSessionId, guestId), eq(assets.status, 'attached')));
-      await tx.update(messages).set({ guestSessionId: null, expiresAt: null }).where(eq(messages.guestSessionId, guestId));
+      if (retained) {
+        await tx.update(assets).set({
+          guestSessionId: null,
+          ownerKey: `retained-guest:${guestId}`,
+          expiresAt: null,
+        }).where(and(eq(assets.guestSessionId, guestId), eq(assets.status, 'attached')));
+        await tx.update(messages).set({ guestSessionId: null, expiresAt: null }).where(eq(messages.guestSessionId, guestId));
+      } else if (guestMessageRows.length) {
+        await tx.delete(messages).where(inArray(messages.id, guestMessageRows.map((message) => message.id)));
+      }
       const outboxId = await this.outbox.enqueue(tx, guest.roomId, 'guest.ended', {
         guestSessionId: guestId,
-        retained: true,
-        messageIds: [],
+        retained,
+        messageIds: retained ? [] : guestMessageRows.map((message) => message.id),
         removedReactions,
       });
       await tx.delete(reactions).where(eq(reactions.actorKey, `guest:${guestId}`));
       await tx.delete(guestSessions).where(eq(guestSessions.id, guestId));
-      return { guest, disposableAssets, outboxId };
+      return { guest, disposableAssets, outboxId, retained };
     });
     if (!ended) return false;
     await this.outbox.deliverIds([ended.outboxId]);
     await this.assetService.deleteKeys(ended.disposableAssets.map((asset) => asset.key));
     this.realtime.disconnectActor(`guest:${guestId}`);
-    return true;
+    return ended.retained;
   }
 
   async searchUsers(actor: Actor, queryInput: unknown) {
@@ -216,21 +258,48 @@ export class ChatService {
     const memberIds = [...new Set((body.memberIds ?? []).filter((id): id is string => typeof id === 'string' && id !== actor.id))].slice(0, 20);
     const members = memberIds.length ? await this.db.select({ id: users.id, displayName: users.displayName }).from(users).where(inArray(users.id, memberIds)) : [];
     if (members.length !== memberIds.length) throw new BadRequestException('Một thành viên không còn khả dụng.');
-    const suggestedName = members.length === 1 ? `${actor.displayName} & ${members[0].displayName}` : body.name;
+    const requestedName = typeof body.name === 'string' ? body.name.trim() : '';
+    const suggestedName = members.length === 1
+      ? `${actor.displayName} & ${members[0].displayName}`
+      : requestedName || (members.length > 1 ? `Nhóm ${members.slice(0, 3).map((member) => member.displayName).join(', ')}`.slice(0, 60) : body.name);
     const name = this.requireText(suggestedName, 'Tên cuộc trò chuyện', 2, 60);
     const inviteCode = this.makeCode();
     const now = Date.now();
     const created = await this.db.transaction(async (tx) => {
-      const [room] = await tx.insert(rooms).values({ name, kind: memberIds.length === 1 ? 'direct' : 'group', createdBy: actor.id, inviteCode, allowGuests: body.allowGuests !== false, createdAt: now }).returning({ id: rooms.id });
+      if (memberIds.length === 1) {
+        const directKey = [actor.id, memberIds[0]].sort().join(':');
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`direct:${directKey}`}, 0))`);
+        const [actorRooms, targetRooms] = await Promise.all([
+          tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.userId, actor.id)),
+          tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.userId, memberIds[0])),
+        ]);
+        const targetRoomIds = new Set(targetRooms.map((row) => row.roomId));
+        const sharedRoomIds = actorRooms.map((row) => row.roomId).filter((roomId) => targetRoomIds.has(roomId));
+        if (sharedRoomIds.length) {
+          const [directRooms, memberCounts] = await Promise.all([
+            tx.select({ id: rooms.id, inviteCode: rooms.inviteCode }).from(rooms).where(and(inArray(rooms.id, sharedRoomIds), eq(rooms.kind, 'direct'))),
+            tx.select({ roomId: roomMembers.roomId, count: sql<number>`count(*)::int` }).from(roomMembers)
+              .where(inArray(roomMembers.roomId, sharedRoomIds)).groupBy(roomMembers.roomId),
+          ]);
+          const memberCountByRoom = new Map(memberCounts.map((row) => [row.roomId, row.count]));
+          const existing = directRooms.find((room) => memberCountByRoom.get(room.id) === 2);
+          if (existing) {
+            await tx.update(rooms).set({ allowGuests: false }).where(eq(rooms.id, existing.id));
+            return { roomId: existing.id, inviteCode: existing.inviteCode, outboxId: null, reused: true };
+          }
+        }
+      }
+      const kind = memberIds.length === 1 ? 'direct' : 'group';
+      const [room] = await tx.insert(rooms).values({ name, kind, createdBy: actor.id, inviteCode, allowGuests: kind === 'direct' ? false : body.allowGuests !== false, createdAt: now }).returning({ id: rooms.id });
       await tx.insert(roomMembers).values([
         { roomId: room.id, userId: actor.id, role: 'owner', joinedAt: now },
         ...memberIds.map((userId) => ({ roomId: room.id, userId, role: 'member' as const, joinedAt: now })),
       ]);
       const outboxId = await this.outbox.enqueue(tx, room.id, 'room.updated', { memberIds: [actor.id, ...memberIds] });
-      return { roomId: room.id, outboxId };
+      return { roomId: room.id, inviteCode, outboxId, reused: false };
     });
-    await this.outbox.deliverIds([created.outboxId]);
-    return { id: created.roomId, inviteCode };
+    if (created.outboxId) await this.outbox.deliverIds([created.outboxId]);
+    return { id: created.roomId, inviteCode: created.inviteCode, reused: created.reused };
   }
 
   async joinRoom(actor: Actor, inviteCodeInput: unknown) {
@@ -240,9 +309,15 @@ export class ChatService {
     if (!room) throw new NotFoundException('Không tìm thấy cuộc trò chuyện từ link mời.');
     const outboxId = await this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${room.id}, 0))`);
-      const [availableRoom] = await tx.select({ id: rooms.id }).from(rooms)
+      const [availableRoom] = await tx.select({ id: rooms.id, kind: rooms.kind }).from(rooms)
         .where(and(eq(rooms.id, room.id), eq(rooms.inviteCode, inviteCode))).limit(1);
       if (!availableRoom) throw new NotFoundException('Cuộc trò chuyện không còn tồn tại.');
+      if (availableRoom.kind === 'direct') {
+        const [existingMember] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers)
+          .where(and(eq(roomMembers.roomId, room.id), eq(roomMembers.userId, actor.id))).limit(1);
+        if (!existingMember) throw new NotFoundException('Không tìm thấy cuộc trò chuyện từ link mời.');
+        return null;
+      }
       await tx.insert(roomMembers).values({ roomId: room.id, userId: actor.id, role: 'member', joinedAt: Date.now() })
         .onConflictDoNothing({ target: [roomMembers.roomId, roomMembers.userId] });
       await tx.update(messages).set({ expiresAt: null }).where(and(
@@ -256,7 +331,7 @@ export class ChatService {
       ));
       return this.outbox.enqueue(tx, room.id, 'room.updated', { memberId: actor.id });
     });
-    await this.outbox.deliverIds([outboxId]);
+    if (outboxId) await this.outbox.deliverIds([outboxId]);
     return { roomId: room.id };
   }
 
@@ -460,30 +535,51 @@ export class ChatService {
     const now = Date.now();
     const expired = await this.db.select({ id: guestSessions.id }).from(guestSessions).where(lt(guestSessions.expiresAt, now)).limit(30);
     for (const guest of expired) await this.endGuestById(guest.id);
-    const emptyRoomCandidates = await this.db.select({ id: rooms.id, createdAt: rooms.createdAt }).from(rooms).where(and(
+    const abandonedRoomCandidates = await this.db.select({ id: rooms.id }).from(rooms).where(and(
       eq(rooms.kind, 'guest'),
       lt(rooms.createdAt, now - EMPTY_GUEST_ROOM_GRACE_MS),
       sql`not exists (select 1 from ${roomMembers} where ${roomMembers.roomId} = ${rooms.id})`,
       sql`not exists (select 1 from ${guestSessions} where ${guestSessions.roomId} = ${rooms.id})`,
-      sql`not exists (select 1 from ${messages} where ${messages.roomId} = ${rooms.id} and ${messages.type} <> 'system')`,
-      sql`not exists (select 1 from ${assets} where ${assets.roomId} = ${rooms.id})`,
-    )).orderBy(asc(rooms.createdAt)).limit(30);
-    for (const candidate of emptyRoomCandidates) {
-      await this.db.transaction(async (tx) => {
+    )).orderBy(asc(rooms.createdAt)).limit(ABANDONED_GUEST_ROOM_BATCH);
+    for (const candidate of abandonedRoomCandidates) {
+      const claimedAssets = await this.db.transaction(async (tx) => {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${candidate.id}, 0))`);
-        const [member, activeGuest, userMessage, remainingAsset, latestGuestEnd] = await Promise.all([
+        const [room, member, activeGuest, latestGuestEnd] = await Promise.all([
+          tx.select({ id: rooms.id, createdAt: rooms.createdAt }).from(rooms).where(and(
+            eq(rooms.id, candidate.id),
+            eq(rooms.kind, 'guest'),
+            lt(rooms.createdAt, now - EMPTY_GUEST_ROOM_GRACE_MS),
+          )).limit(1),
           tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.roomId, candidate.id)).limit(1),
           tx.select({ id: guestSessions.id }).from(guestSessions).where(eq(guestSessions.roomId, candidate.id)).limit(1),
-          tx.select({ id: messages.id }).from(messages).where(and(eq(messages.roomId, candidate.id), ne(messages.type, 'system'))).limit(1),
-          tx.select({ key: assets.key }).from(assets).where(eq(assets.roomId, candidate.id)).limit(1),
           tx.select({ createdAt: realtimeOutbox.createdAt }).from(realtimeOutbox).where(and(
             eq(realtimeOutbox.roomId, candidate.id),
             eq(realtimeOutbox.event, 'guest.ended'),
           )).orderBy(desc(realtimeOutbox.createdAt)).limit(1),
         ]);
-        const emptySince = latestGuestEnd[0]?.createdAt ?? candidate.createdAt;
-        if (emptySince < now - EMPTY_GUEST_ROOM_GRACE_MS && !member[0] && !activeGuest[0] && !userMessage[0] && !remainingAsset[0]) {
-          await tx.delete(rooms).where(eq(rooms.id, candidate.id));
+        const emptySince = latestGuestEnd[0]?.createdAt ?? room[0]?.createdAt;
+        if (!room[0] || member[0] || activeGuest[0] || !emptySince || emptySince >= now - EMPTY_GUEST_ROOM_GRACE_MS) return null;
+        const legacyAssets = await tx.select({ key: assets.key }).from(assets)
+          .where(eq(assets.roomId, candidate.id)).orderBy(asc(assets.createdAt)).limit(ABANDONED_GUEST_ASSET_BATCH);
+        if (legacyAssets.length) {
+          await tx.update(assets).set({ status: 'deleting' })
+            .where(inArray(assets.key, legacyAssets.map((asset) => asset.key)));
+        }
+        await tx.delete(messages).where(eq(messages.roomId, candidate.id));
+        return legacyAssets.map((asset) => asset.key);
+      });
+      if (!claimedAssets) continue;
+      await this.assetService.deleteKeys(claimedAssets);
+      await this.db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${candidate.id}, 0))`);
+        const [member, activeGuest, remainingMessage, remainingAsset] = await Promise.all([
+          tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.roomId, candidate.id)).limit(1),
+          tx.select({ id: guestSessions.id }).from(guestSessions).where(eq(guestSessions.roomId, candidate.id)).limit(1),
+          tx.select({ id: messages.id }).from(messages).where(eq(messages.roomId, candidate.id)).limit(1),
+          tx.select({ key: assets.key }).from(assets).where(eq(assets.roomId, candidate.id)).limit(1),
+        ]);
+        if (!member[0] && !activeGuest[0] && !remainingMessage[0] && !remainingAsset[0]) {
+          await tx.delete(rooms).where(and(eq(rooms.id, candidate.id), eq(rooms.kind, 'guest')));
         }
       });
     }
@@ -495,7 +591,7 @@ export class ChatService {
       const [existing] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.userId, actor.id)).limit(1);
       if (existing) return;
       const now = Date.now();
-      const [room] = await tx.insert(rooms).values({ name: 'Minh Anh', kind: 'direct', createdBy: actor.id, inviteCode: this.makeCode(), allowGuests: true, createdAt: now }).returning({ id: rooms.id });
+      const [room] = await tx.insert(rooms).values({ name: 'Minh Anh', kind: 'direct', createdBy: actor.id, inviteCode: this.makeCode(), allowGuests: false, createdAt: now }).returning({ id: rooms.id });
       await tx.insert(roomMembers).values({ roomId: room.id, userId: actor.id, role: 'owner', joinedAt: now });
       await tx.insert(messages).values([
         { roomId: room.id, senderName: 'Minh Anh', type: 'text', body: 'Chào mừng đến với Nét. Đây là nơi chữ và hình có thể tiếp tục câu chuyện cùng nhau.', createdAt: now + 1 },

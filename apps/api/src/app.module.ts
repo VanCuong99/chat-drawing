@@ -17,6 +17,7 @@ import { RealtimeController } from './realtime/realtime.controller';
 import { RealtimeGateway } from './realtime/realtime.gateway';
 import { RealtimeService } from './realtime/realtime.service';
 import { RealtimeOutboxService } from './realtime/realtime-outbox.service';
+import { RealtimeBrokerService } from './realtime/realtime-broker.service';
 import { RateLimitService } from './security/rate-limit.service';
 import { AbuseProtectionMiddleware } from './security/abuse-protection.middleware';
 import { RequestContextMiddleware } from './observability/request-context.middleware';
@@ -51,6 +52,7 @@ import { HttpLoggingInterceptor } from './observability/http-logging.interceptor
     StorageService,
     AssetsService,
     RealtimeService,
+    RealtimeBrokerService,
     RealtimeOutboxService,
     RealtimeGateway,
     ChatService,

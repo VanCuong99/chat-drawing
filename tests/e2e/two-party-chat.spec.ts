@@ -5,14 +5,14 @@ const API_URL = 'http://localhost:3001/api';
 
 async function startGuest(page: Page, name: string, inviteUrl = '/') {
   await page.goto(inviteUrl);
-  await page.getByRole('button', { name: 'Tiếp tục với tư cách khách' }).click();
+  if (inviteUrl === '/') await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
   await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(name);
   const created = page.waitForResponse((response) => response.url().endsWith('/api/guest') && response.request().method() === 'POST');
-  await page.getByRole('button', { name: 'Vào không gian Nét' }).click();
+  await page.getByRole('button', { name: /Tham gia|Vào Nét/ }).click();
   const response = await created;
   expect(response.status()).toBe(200);
   const body = await response.json() as { sessionId: string; roomId: string };
-  await expect(page.getByText('kết nối trực tiếp')).toBeVisible();
+  await expect(page.getByText('Đã đồng bộ')).toBeVisible();
   return body;
 }
 
@@ -78,7 +78,7 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     await expect(bobOnAlice.getByRole('button', { name: /❤️ 1/ })).toBeVisible();
 
     await contextB.setOffline(true);
-    await expect(pageB.getByText('đồng bộ dự phòng')).toBeVisible();
+    await expect(pageB.getByText('Đang kết nối lại')).toBeVisible();
     const missedWhileOffline = `Tin gửi lúc Bob offline ${stamp}`;
     await sendText(pageA, missedWhileOffline);
     const missedOnBob = pageB.getByRole('article').filter({ hasText: missedWhileOffline });
@@ -86,7 +86,7 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     await contextB.setOffline(false);
     await expect(missedOnBob).toBeVisible({ timeout: 15_000 });
     await expect(missedOnBob).toHaveCount(1);
-    await expect(pageB.getByText('kết nối trực tiếp')).toBeVisible({ timeout: 15_000 });
+    await expect(pageB.getByText('Đã đồng bộ')).toBeVisible({ timeout: 15_000 });
 
     const other = await request.post(`${API_URL}/guest`, { data: { displayName: `Phòng khác ${stamp}` } });
     expect(other.status()).toBe(200);

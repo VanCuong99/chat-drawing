@@ -22,8 +22,8 @@ async function createGuest(request: APIRequestContext, displayName: string) {
   return response.json() as Promise<{ sessionId: string; roomId: string }>;
 }
 
-async function connectGuest(request: APIRequestContext, sessionId: string) {
-  const tokenResponse = await request.post(`${apiOrigin}/api/realtime/token`, { headers: { 'x-net-guest-session': sessionId } });
+async function connectGuest(request: APIRequestContext, sessionId: string, roomId: string) {
+  const tokenResponse = await request.post(`${apiOrigin}/api/realtime/token`, { headers: { 'x-net-guest-session': sessionId }, data: { roomId } });
   expect(tokenResponse.ok()).toBe(true);
   const { token } = await tokenResponse.json() as { token: string };
   const socket = io(`${apiOrigin}/chat`, { path: '/socket.io', transports: ['websocket'], auth: { token }, forceNew: true, extraHeaders: { origin: 'http://localhost:3000' } });
@@ -45,8 +45,8 @@ test('WebSocket chỉ phát message vào đúng room đã được cấp quyền
   const guestA = await createGuest(request, `Realtime A ${Date.now()}`);
   const guestB = await createGuest(request, `Realtime B ${Date.now()}`);
   const [socketA, socketB] = await Promise.all([
-    connectGuest(request, guestA.sessionId),
-    connectGuest(request, guestB.sessionId),
+    connectGuest(request, guestA.sessionId, guestA.roomId),
+    connectGuest(request, guestB.sessionId, guestB.roomId),
   ]);
   const eventsA: Array<{ roomId: string; messageId: string }> = [];
   const eventsB: Array<{ roomId: string; messageId: string }> = [];
@@ -112,7 +112,7 @@ test('actor channel báo unread cho phòng nền nhưng không phát message.cre
     const backgroundRoomId = ((await created.json()) as { id: string }).id;
     roomIds.push(backgroundRoomId);
 
-    const tokenResponse = await request.post(`${apiOrigin}/api/realtime/token`, { headers: { authorization } });
+    const tokenResponse = await request.post(`${apiOrigin}/api/realtime/token`, { headers: { authorization }, data: { roomId: activeRoomId } });
     const { token } = await tokenResponse.json() as { token: string };
     socket = io(`${apiOrigin}/chat`, { path: '/socket.io', transports: ['websocket'], auth: { token }, forceNew: true, extraHeaders: { origin: 'http://localhost:3000' } });
     await new Promise<void>((resolve, reject) => {

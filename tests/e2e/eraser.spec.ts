@@ -38,10 +38,10 @@ async function readCanvasPixel(canvas: Locator, position: { x: number; y: number
 
 test('tẩy xóa sạch mọi nét bên dưới chỉ trong một lần @critical', async ({ page }) => {
   await page.goto('/');
-  await page.getByRole('button', { name: 'Tiếp tục với tư cách khách' }).click();
+  await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
   await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(`Guest Eraser ${Date.now()}`);
-  await page.getByRole('button', { name: 'Vào không gian Nét' }).click();
-  await expect(page.getByText('kết nối trực tiếp')).toBeVisible();
+  await page.getByRole('button', { name: 'Vào Nét' }).click();
+  await expect(page.getByText('Đã đồng bộ')).toBeVisible();
 
   await page.getByRole('button', { name: 'Mở canvas' }).click();
   const canvas = page.getByRole('dialog').getByLabel('Vùng vẽ nâng cao');

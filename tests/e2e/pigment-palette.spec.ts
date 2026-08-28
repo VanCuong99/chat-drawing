@@ -19,10 +19,10 @@ function userToken(userId: string) {
 test('pha từ nhiều sắc tố, lưu và nạp lại công thức trong palette guest @critical', async ({ page }) => {
   test.setTimeout(60_000);
   await page.goto('/');
-  await page.getByRole('button', { name: 'Tiếp tục với tư cách khách' }).click();
+  await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
   await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(`Pigment E2E ${Date.now()}`);
   const guestResponsePromise = page.waitForResponse((response) => response.url().endsWith('/api/guest') && response.request().method() === 'POST');
-  await page.getByRole('button', { name: 'Vào không gian Nét' }).click();
+  await page.getByRole('button', { name: 'Vào Nét' }).click();
   const guestSessionId = ((await (await guestResponsePromise).json()) as { sessionId: string }).sessionId;
   await page.getByRole('button', { name: 'Mở canvas' }).click();
 
@@ -57,7 +57,7 @@ test('pha từ nhiều sắc tố, lưu và nạp lại công thức trong palet
   await expect(components.getByRole('listitem')).toHaveCount(3);
   await expect(mixer.getByText('#705C71')).toBeVisible();
 
-  await mixer.getByRole('button', { name: 'Dùng màu đã pha' }).click();
+  await mixer.getByRole('button', { name: 'Dùng màu' }).click();
   await expect(page.getByText('#705C71').first()).toBeVisible();
   await mixer.getByRole('textbox', { name: 'Tên màu đã pha' }).fill('Nâu trung tính ba màu');
   await page.route('**/api/palette', async (route) => {
@@ -65,7 +65,7 @@ test('pha từ nhiều sắc tố, lưu và nạp lại công thức trong palet
     await route.continue();
   });
   const saveResponse = page.waitForResponse((response) => response.url().endsWith('/api/palette') && response.request().method() === 'POST');
-  await mixer.getByRole('button', { name: 'Lưu công thức vào bảng màu' }).click();
+  await mixer.getByRole('button', { name: 'Lưu trong phiên' }).click();
   await expect(page.getByRole('button', { name: 'Đóng Esc', exact: true })).toBeDisabled();
   await expect(page.locator('.studio-header .primary-button')).toBeDisabled();
   expect((await saveResponse).status()).toBe(200);
@@ -76,7 +76,7 @@ test('pha từ nhiều sắc tố, lưu và nạp lại công thức trong palet
   await mixer.getByRole('button', { name: 'Đóng pha màu nâng cao' }).click();
   await page.getByRole('button', { name: 'Đóng Esc', exact: true }).click();
   await page.reload();
-  await expect(page.getByText('kết nối trực tiếp')).toBeVisible();
+  await expect(page.getByText('Đã đồng bộ')).toBeVisible();
   await page.getByRole('button', { name: 'Mở canvas' }).click();
   await expect(page.getByRole('button', { name: 'Dùng màu Nâu trung tính ba màu' })).toBeVisible();
   await page.getByRole('button', { name: 'Nạp công thức Nâu trung tính ba màu' }).click();

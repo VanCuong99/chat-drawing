@@ -2,9 +2,9 @@ import { expect, test } from '@playwright/test';
 
 test('bộ chọn hình mở cạnh toolbar và vẽ được hình thang @critical', async ({ page }) => {
   await page.goto('/');
-  await page.getByRole('button', { name: 'Tiếp tục với tư cách khách' }).click();
+  await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
   await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(`Shape E2E ${Date.now()}`);
-  await page.getByRole('button', { name: 'Vào không gian Nét' }).click();
+  await page.getByRole('button', { name: 'Vào Nét' }).click();
   await page.getByRole('button', { name: 'Mở canvas' }).click();
 
   const shapeButton = page.getByRole('button', { name: /Hình dạng/ });

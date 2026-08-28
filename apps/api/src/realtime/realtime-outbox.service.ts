@@ -17,6 +17,7 @@ import {
 } from '@net/database';
 import { DATABASE } from '../database/database.module';
 import { RealtimeService, type RealtimeEvent } from './realtime.service';
+import { RealtimeBrokerService } from './realtime-broker.service';
 import { telemetry } from '../observability/telemetry';
 
 const BATCH_SIZE = 50;
@@ -32,6 +33,7 @@ export class RealtimeOutboxService {
   constructor(
     @Inject(DATABASE) private readonly db: NetDatabase,
     private readonly realtime: RealtimeService,
+    private readonly broker: RealtimeBrokerService,
   ) {
     telemetry.outboxPending.addCallback(async (result) => {
       const [row] = await this.db.select({
@@ -54,7 +56,7 @@ export class RealtimeOutboxService {
   }
 
   async deliverIds(ids: string[]) {
-    if (!ids.length || !this.realtime.isReady()) return;
+    if (!ids.length) return;
     let remaining = [...new Set(ids)];
     while (remaining.length) {
       const claimed = await this.claim(remaining);
@@ -80,10 +82,9 @@ export class RealtimeOutboxService {
   }
 
   async drain(maxBatches = BACKGROUND_MAX_BATCHES) {
-    if (!this.realtime.isReady()) return;
     if (this.drainPromise) return this.drainPromise;
     const run = (async () => {
-      for (let batch = 0; batch < maxBatches && this.realtime.isReady(); batch += 1) {
+      for (let batch = 0; batch < maxBatches; batch += 1) {
         const claimed = await this.claim();
         for (const event of claimed) await this.deliver(event);
         if (claimed.length < BATCH_SIZE) break;
@@ -135,6 +136,7 @@ export class RealtimeOutboxService {
         ...members.map((member) => `user:${member.userId}`),
         ...guests.map((guest) => `guest:${guest.id}`),
       ], event.event as RealtimeEvent, payload);
+      await this.broker.publish(event.roomId, event.event as RealtimeEvent, payload);
       await this.db.update(realtimeOutbox).set({
         publishedAt: Date.now(),
         lockedUntil: null,

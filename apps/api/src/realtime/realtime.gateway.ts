@@ -16,7 +16,7 @@ import { RealtimeService } from './realtime.service';
 import { telemetry } from '../observability/telemetry';
 import { configInteger } from '../config/runtime-config';
 
-type AuthenticatedSocket = Socket & { data: { actor?: Actor; activeRoomId?: string; tokenExpiresAt?: number; eventWindowStartedAt?: number; eventCount?: number } };
+type AuthenticatedSocket = Socket & { data: { actor?: Actor; authorizedRoomId?: string; activeRoomId?: string; tokenExpiresAt?: number; eventWindowStartedAt?: number; eventCount?: number } };
 
 @WebSocketGateway({ path: '/socket.io', namespace: '/chat', transports: ['websocket'] })
 export class RealtimeGateway implements OnGatewayInit {
@@ -42,6 +42,7 @@ export class RealtimeGateway implements OnGatewayInit {
         const actorSockets = await namespace.in(`actor:${actor.actorKey}`).fetchSockets();
         if (actorSockets.length >= maxSockets) throw new Error('Actor connection limit exceeded');
         client.data.actor = actor;
+        client.data.authorizedRoomId = claims.roomId;
         client.data.tokenExpiresAt = typeof claims.exp === 'number' ? claims.exp * 1000 : undefined;
         await client.join(`actor:${actor.actorKey}`);
         if (client.data.tokenExpiresAt) {
@@ -63,7 +64,7 @@ export class RealtimeGateway implements OnGatewayInit {
     const actor = client.data.actor;
     const roomId = body?.roomId;
     if (!this.consumeEvent(client)) return { ok: false, error: 'Bạn thao tác realtime quá nhanh.' };
-    if (!actor || typeof roomId !== 'string') return { ok: false, error: 'Phiên realtime không hợp lệ.' };
+    if (!actor || typeof roomId !== 'string' || roomId !== client.data.authorizedRoomId) return { ok: false, error: 'Phiên realtime không hợp lệ.' };
     try {
       await this.actors.assertRoomAccess(roomId, actor);
       for (const joined of client.rooms) if (joined.startsWith('room:')) await client.leave(joined);

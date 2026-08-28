@@ -1,7 +1,7 @@
 import { expect, test, type APIRequestContext } from '@playwright/test';
 import { createHmac, randomUUID } from 'node:crypto';
 import { io, type Socket } from 'socket.io-client';
-import { and, createDatabase, eq, guestSessions, inArray, messages, realtimeOutbox, roomMembers, rooms, sql, users } from '@net/database';
+import { and, assets, createDatabase, eq, guestSessions, inArray, messages, realtimeOutbox, roomMembers, rooms, sql, users } from '@net/database';
 
 const apiOrigin = 'http://localhost:3001';
 
@@ -22,8 +22,8 @@ async function createGuest(request: APIRequestContext, name: string, inviteCode?
   return response.json() as Promise<{ sessionId: string; roomId: string }>;
 }
 
-async function connectGuest(request: APIRequestContext, sessionId: string, includeOrigin = true) {
-  const tokenResponse = await request.post(`${apiOrigin}/api/realtime/token`, { headers: { 'x-net-guest-session': sessionId } });
+async function connectGuest(request: APIRequestContext, sessionId: string, roomId: string, includeOrigin = true) {
+  const tokenResponse = await request.post(`${apiOrigin}/api/realtime/token`, { headers: { 'x-net-guest-session': sessionId }, data: { roomId } });
   expect(tokenResponse.status()).toBe(200);
   const { token } = await tokenResponse.json() as { token: string };
   return io(`${apiOrigin}/chat`, {
@@ -54,7 +54,7 @@ test('retry đồng thời chỉ tạo một message và một realtime event @c
   const { db, pool } = createDatabase(databaseUrl, 1);
   const guest = await createGuest(request, `Idempotent ${Date.now()}`);
   const headers = { 'x-net-guest-session': guest.sessionId };
-  const socket = await connectGuest(request, guest.sessionId);
+  const socket = await connectGuest(request, guest.sessionId, guest.roomId);
   const events: Array<{ messageId: string; eventId: string }> = [];
 
   try {
@@ -199,6 +199,87 @@ test('join, guest send và end dùng cùng room lock, không để nội dung sh
   }
 });
 
+test('standalone guest kết thúc phiên không để lại nội dung vĩnh viễn không người sở hữu @critical', async ({ request }) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error('DATABASE_URL is required for standalone guest cleanup E2E');
+  const { db, pool } = createDatabase(databaseUrl, 1);
+  const guest = await createGuest(request, `Standalone cleanup ${Date.now()}`);
+  const headers = { 'x-net-guest-session': guest.sessionId };
+  try {
+    const sent = await request.post(`${apiOrigin}/api/rooms/${guest.roomId}/messages`, {
+      headers,
+      data: { type: 'text', text: 'Nội dung không được mồ côi', clientRequestId: randomUUID() },
+    });
+    expect(sent.ok()).toBe(true);
+    const messageId = ((await sent.json()) as { id: string }).id;
+
+    const ended = await request.delete(`${apiOrigin}/api/guest`, { headers });
+    expect(ended.ok()).toBe(true);
+    await expect(ended.json()).resolves.toMatchObject({ retained: false });
+    expect(await db.select({ id: messages.id }).from(messages).where(eq(messages.id, messageId))).toHaveLength(0);
+    expect(await db.select({ id: guestSessions.id }).from(guestSessions).where(eq(guestSessions.id, guest.sessionId))).toHaveLength(0);
+  } finally {
+    await db.delete(rooms).where(eq(rooms.id, guest.roomId));
+    await pool.end();
+  }
+});
+
+test('maintenance dọn dữ liệu guest-only bị phiên bản cũ giữ lại, gồm cả asset đã attach @critical', async ({ request }) => {
+  test.setTimeout(120_000);
+  const databaseUrl = process.env.DATABASE_URL;
+  const cronSecret = process.env.CRON_SECRET;
+  if (!databaseUrl || !cronSecret) throw new Error('DATABASE_URL and CRON_SECRET are required for legacy guest cleanup E2E');
+  const { db, pool } = createDatabase(databaseUrl, 1);
+  const guest = await createGuest(request, `Legacy cleanup ${Date.now()}`);
+  const headers = { 'x-net-guest-session': guest.sessionId };
+  let assetKey = '';
+  try {
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+Xw7zWQAAAABJRU5ErkJggg==', 'base64');
+    const uploaded = await request.post(`${apiOrigin}/api/assets?room=${guest.roomId}`, {
+      headers: { ...headers, 'content-type': 'image/png' },
+      data: png,
+    });
+    expect(uploaded.ok()).toBe(true);
+    assetKey = ((await uploaded.json()) as { key: string }).key;
+    const sent = await request.post(`${apiOrigin}/api/rooms/${guest.roomId}/messages`, {
+      headers,
+      data: { type: 'image', assetKey, text: 'Ảnh guest legacy' },
+    });
+    expect(sent.ok()).toBe(true);
+
+    await db.update(rooms).set({ createdAt: Date.now() - 10 * 60 * 1000 }).where(eq(rooms.id, guest.roomId));
+    await db.update(messages).set({ guestSessionId: null, expiresAt: null }).where(eq(messages.roomId, guest.roomId));
+    await db.update(assets).set({ guestSessionId: null, ownerKey: `retained-guest:${guest.sessionId}`, expiresAt: null }).where(eq(assets.key, assetKey));
+    await db.delete(guestSessions).where(eq(guestSessions.id, guest.sessionId));
+    const [recentEnd] = await db.insert(realtimeOutbox).values({
+      roomId: guest.roomId,
+      event: 'guest.ended',
+      payload: { guestSessionId: guest.sessionId, retained: false },
+      createdAt: Date.now(),
+      availableAt: Date.now(),
+    }).returning({ id: realtimeOutbox.id });
+
+    const graceMaintenance = await request.get(`${apiOrigin}/api/maintenance`, {
+      headers: { authorization: `Bearer ${cronSecret}` },
+    });
+    expect(graceMaintenance.ok()).toBe(true);
+    expect(await db.select({ id: rooms.id }).from(rooms).where(eq(rooms.id, guest.roomId))).toHaveLength(1);
+    expect(await db.select({ key: assets.key }).from(assets).where(eq(assets.key, assetKey))).toHaveLength(1);
+
+    await db.update(realtimeOutbox).set({ createdAt: Date.now() - 10 * 60 * 1000 }).where(eq(realtimeOutbox.id, recentEnd.id));
+    const maintenance = await request.get(`${apiOrigin}/api/maintenance`, {
+      headers: { authorization: `Bearer ${cronSecret}` },
+    });
+    expect(maintenance.ok()).toBe(true);
+    expect(await db.select({ id: rooms.id }).from(rooms).where(eq(rooms.id, guest.roomId))).toHaveLength(0);
+    expect(await db.select({ id: messages.id }).from(messages).where(eq(messages.roomId, guest.roomId))).toHaveLength(0);
+    expect(await db.select({ key: assets.key }).from(assets).where(eq(assets.key, assetKey))).toHaveLength(0);
+  } finally {
+    await db.delete(rooms).where(eq(rooms.id, guest.roomId));
+    await pool.end();
+  }
+});
+
 test('guest mới vẫn join được đúng phòng khi guest trước kết thúc đồng thời @critical', async ({ request }) => {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error('DATABASE_URL is required for guest cleanup lock E2E');
@@ -257,7 +338,7 @@ test('một drain phát hết backlog lớn hơn một batch và đánh dấu pu
   const { db, pool } = createDatabase(databaseUrl, 1);
   const guest = await createGuest(request, `Outbox ${Date.now()}`);
   const headers = { 'x-net-guest-session': guest.sessionId };
-  const socket = await connectGuest(request, guest.sessionId);
+  const socket = await connectGuest(request, guest.sessionId, guest.roomId);
   let outboxIds: string[] = [];
 
   try {
@@ -340,7 +421,7 @@ test('request ID được echo còn WebSocket thiếu Origin bị từ chối @c
 
   const guest = await createGuest(request, `Origin ${Date.now()}`);
   const headers = { 'x-net-guest-session': guest.sessionId };
-  const socket = await connectGuest(request, guest.sessionId, false);
+  const socket = await connectGuest(request, guest.sessionId, guest.roomId, false);
   try {
     const error = await new Promise<Error>((resolve, reject) => {
       socket.once('connect', () => reject(new Error('Socket without Origin unexpectedly connected')));

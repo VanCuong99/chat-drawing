@@ -31,7 +31,7 @@ export default defineConfig({
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'], channel: process.env.CI ? undefined : 'chrome' } }],
   webServer: [
     {
-      command: `pnpm build:packages && TRUST_PROXY_HOPS=1 E2E_RATE_LIMIT_SECRET=${e2eRateLimitSecret} API_REQUEST_BURST=1000 API_MAX_ACTIVE_PER_IP=200 pnpm dev:api`,
+      command: `pnpm build:packages && TRUST_PROXY_HOPS=1 E2E_RATE_LIMIT_SECRET=${e2eRateLimitSecret} API_REQUEST_BURST=1000 API_MAX_ACTIVE_PER_IP=200 DATABASE_CONNECTION_TIMEOUT_MS=30000 pnpm dev:api`,
       url: 'http://localhost:3001/api/health',
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
