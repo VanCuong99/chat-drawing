@@ -22,14 +22,15 @@ type Point = { x: number; y: number; pressure: number };
 type StrokeTool = 'pen' | 'marker' | 'eraser';
 type ClosedShapeTool = 'rectangle' | 'roundedRectangle' | 'ellipse' | 'triangle' | 'trapezoid' | 'diamond' | 'star' | 'bubble';
 type ShapeTool = 'line' | 'arrow' | ClosedShapeTool;
-type Tool = 'hand' | StrokeTool | ShapeTool | 'text';
-type SizedTool = Exclude<Tool, 'hand' | 'text'>;
+type Tool = 'hand' | StrokeTool | ShapeTool | 'fill' | 'text';
+type SizedTool = Exclude<Tool, 'hand' | 'fill' | 'text'>;
 type Paper = 'white' | 'cream' | 'grid' | 'dots';
 type StyledAction = { color: string; size: number; opacity: number };
 type StrokeAction = StyledAction & { kind: 'stroke'; tool: StrokeTool; points: Point[] };
 type ShapeAction = StyledAction & { kind: 'shape'; tool: ShapeTool; from: Point; to: Point; filled: boolean };
+type FillAction = Pick<StyledAction, 'color' | 'opacity'> & { kind: 'fill'; spans: Uint32Array };
 type TextAction = StyledAction & { kind: 'text'; id: string; point: Point; text: string };
-type DrawAction = StrokeAction | ShapeAction | TextAction;
+type DrawAction = StrokeAction | ShapeAction | FillAction | TextAction;
 type Scene = { actions: DrawAction[]; paper: Paper };
 type History = { past: Scene[]; present: Scene; future: Scene[] };
 type MixerPigment = PigmentComponent & { id: string };
@@ -63,6 +64,7 @@ const TOOLS: Array<{ id: Tool; label: string; key: string }> = [
   { id: 'pen', label: 'Bút chì', key: 'P' },
   { id: 'marker', label: 'Bút highlight', key: 'M' },
   { id: 'eraser', label: 'Tẩy', key: 'E' },
+  { id: 'fill', label: 'Tô màu', key: 'F' },
   { id: 'line', label: 'Đường thẳng', key: 'L' },
   { id: 'arrow', label: 'Mũi tên', key: 'A' },
   { id: 'rectangle', label: 'Chữ nhật', key: 'R' },
@@ -76,15 +78,15 @@ const TOOLS: Array<{ id: Tool; label: string; key: string }> = [
   { id: 'text', label: 'Chèn chữ', key: 'T' },
 ];
 
-const RAIL_TOOLS = TOOLS.filter((tool) => ['hand', 'pen', 'marker', 'eraser', 'line', 'arrow'].includes(tool.id));
-const MORE_TOOLS = RAIL_TOOLS.filter((tool) => ['marker', 'line', 'arrow'].includes(tool.id));
+const RAIL_TOOLS = TOOLS.filter((tool) => ['hand', 'pen', 'marker', 'eraser', 'fill', 'line', 'arrow'].includes(tool.id));
+const MORE_TOOLS = RAIL_TOOLS.filter((tool) => ['marker', 'fill', 'line', 'arrow'].includes(tool.id));
 const SHAPE_TOOLS = TOOLS.filter((tool): tool is { id: ClosedShapeTool; label: string; key: string } => ['rectangle', 'roundedRectangle', 'ellipse', 'triangle', 'trapezoid', 'diamond', 'star', 'bubble'].includes(tool.id));
 const TEXT_TOOL = TOOLS.find((tool) => tool.id === 'text')!;
 
 const TOOL_BY_KEY = new Map(TOOLS.map((tool) => [tool.key.toLocaleLowerCase(), tool.id]));
 
 function isSizedTool(tool: Tool): tool is SizedTool {
-  return tool !== 'hand' && tool !== 'text';
+  return tool !== 'hand' && tool !== 'fill' && tool !== 'text';
 }
 
 function isClosedShapeTool(tool: Tool): tool is ClosedShapeTool {
@@ -109,6 +111,9 @@ function ToolIcon({ tool }: { tool: Tool }) {
       break;
     case 'eraser':
       content = <><path d="m5 15 7.8-8a2 2 0 0 1 2.8 0l2.5 2.5a2 2 0 0 1 0 2.8L10.5 20H8l-3-3a1.4 1.4 0 0 1 0-2Z" /><path d="m10 10 6 6M10.5 20H21" /></>;
+      break;
+    case 'fill':
+      content = <><path d="m5.2 11.4 6.2-6.2 7.4 7.4-6.2 6.2a2.1 2.1 0 0 1-3 0l-4.4-4.4a2.1 2.1 0 0 1 0-3Z" /><path d="m8.1 8.5 7.4 7.4M4 20h11" /><path d="M19.3 15.5s2 2.3 2 3.5a2 2 0 0 1-4 0c0-1.2 2-3.5 2-3.5Z" className="tool-icon-fill-drop" /></>;
       break;
     case 'line':
       content = <><path d="M4 20 20 4" /><circle cx="4" cy="20" r="1.5" className="tool-icon-fill" /><circle cx="20" cy="4" r="1.5" className="tool-icon-fill" /></>;
@@ -394,9 +399,97 @@ function drawTextSelection(context: CanvasRenderingContext2D, action: TextAction
   context.restore();
 }
 
+function hexToRgb(hex: string) {
+  const normalized = hex.replace('#', '');
+  const value = Number.parseInt(normalized, 16);
+  return { red: value >> 16 & 255, green: value >> 8 & 255, blue: value & 255 };
+}
+
+function drawFill(context: CanvasRenderingContext2D, action: FillAction) {
+  context.save();
+  context.globalAlpha = action.opacity;
+  context.fillStyle = action.color;
+  context.beginPath();
+  for (let index = 0; index < action.spans.length; index += 3) {
+    const y = action.spans[index];
+    const startX = action.spans[index + 1];
+    const endX = action.spans[index + 2];
+    context.rect(startX, y, endX - startX + 1, 1);
+  }
+  context.fill();
+  context.restore();
+}
+
+function makeFillAction(image: ImageData, point: Point, color: string, opacity: number, tolerance: number): FillAction | null {
+  const width = image.width;
+  const height = image.height;
+  const startX = Math.max(0, Math.min(width - 1, Math.floor(point.x)));
+  const startY = Math.max(0, Math.min(height - 1, Math.floor(point.y)));
+  const startIndex = startY * width + startX;
+  const startOffset = startIndex * 4;
+  const target = [image.data[startOffset], image.data[startOffset + 1], image.data[startOffset + 2], image.data[startOffset + 3]];
+  const fill = hexToRgb(color);
+  if (target[3] === 255 && Math.max(Math.abs(target[0] - fill.red), Math.abs(target[1] - fill.green), Math.abs(target[2] - fill.blue)) <= 1) return null;
+
+  const visited = new Uint8Array(width * height);
+  const queue = new Int32Array(width * height);
+  let head = 0;
+  let tail = 1;
+  let minX = startX;
+  let maxX = startX;
+  let minY = startY;
+  let maxY = startY;
+  queue[0] = startIndex;
+  visited[startIndex] = 2;
+
+  const enqueue = (index: number) => {
+    if (visited[index]) return;
+    const offset = index * 4;
+    const difference = Math.max(
+      Math.abs(image.data[offset] - target[0]),
+      Math.abs(image.data[offset + 1] - target[1]),
+      Math.abs(image.data[offset + 2] - target[2]),
+      Math.abs(image.data[offset + 3] - target[3]),
+    );
+    if (difference <= tolerance) {
+      visited[index] = 2;
+      queue[tail++] = index;
+    } else visited[index] = 1;
+  };
+
+  while (head < tail) {
+    const index = queue[head++];
+    const x = index % width;
+    const y = Math.floor(index / width);
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+    if (x > 0) enqueue(index - 1);
+    if (x + 1 < width) enqueue(index + 1);
+    if (y > 0) enqueue(index - width);
+    if (y + 1 < height) enqueue(index + width);
+  }
+
+  const spans: number[] = [];
+  for (let y = minY; y <= maxY; y += 1) {
+    let x = minX;
+    while (x <= maxX) {
+      while (x <= maxX && visited[y * width + x] !== 2) x += 1;
+      if (x > maxX) break;
+      const start = x;
+      while (x + 1 <= maxX && visited[y * width + x + 1] === 2) x += 1;
+      spans.push(y, start, x);
+      x += 1;
+    }
+  }
+  return { kind: 'fill', spans: Uint32Array.from(spans), color, opacity };
+}
+
 function drawAction(context: CanvasRenderingContext2D, action: DrawAction) {
   if (action.kind === 'stroke') drawSmoothStroke(context, action);
   else if (action.kind === 'shape') drawShape(context, action);
+  else if (action.kind === 'fill') drawFill(context, action);
   else {
     context.save();
     context.globalAlpha = action.opacity;
@@ -436,6 +529,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const dialogRef = useRef<HTMLElement>(null);
   const shapeButtonRef = useRef<HTMLButtonElement>(null);
   const moreToolsButtonRef = useRef<HTMLButtonElement>(null);
+  const moreToolsSheetRef = useRef<HTMLElement>(null);
   const mixerToggleRef = useRef<HTMLButtonElement>(null);
   const mixerIdRef = useRef(4);
   const committedLayerRef = useRef<HTMLCanvasElement | null>(null);
@@ -469,6 +563,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const [textValue, setTextValue] = useState('');
   const [selectedTextId, setSelectedTextId] = useState<string | null>(null);
   const [filled, setFilled] = useState(false);
+  const [fillTolerance, setFillTolerance] = useState(24);
   const [zoom, setZoom] = useState(100);
   const [caption, setCaption] = useState('');
   const [sending, setSending] = useState(false);
@@ -676,6 +771,23 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
       return;
     }
     const point = getPoint(event);
+    if (tool === 'fill') {
+      const context = event.currentTarget.getContext('2d', { willReadFrequently: true });
+      if (!context) return;
+      paintPreview(null, paper, null);
+      try {
+        const action = makeFillAction(context.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT), point, color, opacity, fillTolerance);
+        if (!action) {
+          setHint('Vùng này đã có màu đang chọn');
+          return;
+        }
+        commit(action);
+        setHint(`Đã tô vùng · độ lan ${fillTolerance} · ⌘Z để hoàn tác`);
+      } catch {
+        setHint('Không thể đọc vùng ảnh này để tô. Hãy thử lại với bản vẽ mới.');
+      }
+      return;
+    }
     if (tool === 'text') {
       const textContext = event.currentTarget.getContext('2d');
       if (!textContext) return;
@@ -962,6 +1074,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
 
   const selectTool = (nextTool: Tool) => {
     const restoreShapeFocus = shapeMenuOpen;
+    const moveFocusToCanvas = moreToolsOpen;
     setShapeMenuOpen(false);
     setMoreToolsOpen(false);
     setTool(nextTool);
@@ -970,7 +1083,19 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
       selectedTextIdRef.current = null;
       setSelectedTextId(null);
     }
+    if (nextTool === 'fill') setHint('Chạm vào vùng kín trên giấy để tô màu');
     if (restoreShapeFocus) requestAnimationFrame(() => shapeButtonRef.current?.focus());
+    else if (moveFocusToCanvas) requestAnimationFrame(() => canvasRef.current?.focus());
+  };
+
+  const toggleMoreTools = () => {
+    setShapeMenuOpen(false);
+    if (moreToolsOpen) {
+      setMoreToolsOpen(false);
+      return;
+    }
+    setMoreToolsOpen(true);
+    requestAnimationFrame(() => moreToolsSheetRef.current?.querySelector<HTMLButtonElement>('[data-more-tool]')?.focus());
   };
 
   const positionShapeMenu = useCallback(() => {
@@ -1024,7 +1149,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
     if (event.key === 'Tab') {
       const dialog = dialogRef.current;
       if (!dialog) return;
-      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), canvas[tabindex="0"], [tabindex]:not([tabindex="-1"])')).filter((element) => element.getClientRects().length > 0);
+      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>('button:not(:disabled):not([tabindex="-1"]), input:not(:disabled), textarea:not(:disabled), canvas[tabindex="0"], [tabindex]:not([tabindex="-1"])')).filter((element) => element.getClientRects().length > 0);
       if (!focusable.length) return;
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
@@ -1095,15 +1220,15 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
               {RAIL_TOOLS.map((item) => <button key={item.id} className={`${tool === item.id ? 'tool-button active' : 'tool-button'} ${MORE_TOOLS.some((moreTool) => moreTool.id === item.id) ? 'secondary-tool' : ''}`} data-tool-id={item.id} onClick={() => selectTool(item.id)} title={`${item.label} — phím ${item.key}`} aria-label={`${item.label} (${item.key})`} aria-pressed={tool === item.id}><b><ToolIcon tool={item.id} /></b><span className="desktop-tool-label">{item.label}</span><span className="mobile-tool-label">{item.id === 'hand' ? 'Di chuyển' : item.id === 'pen' ? 'Bút' : item.id === 'eraser' ? 'Tẩy' : item.label}</span></button>)}
               <button ref={shapeButtonRef} className={closedShapeTool ? 'tool-button active' : 'tool-button'} data-tool-id="shape" onClick={toggleShapeMenu} title={`Chọn hình dạng — đang dùng ${activeShape.label}`} aria-label={`Hình dạng (${activeShape.label})`} aria-pressed={closedShapeTool} aria-haspopup="dialog" aria-expanded={shapeMenuOpen} aria-controls="shape-picker"><b><ToolIcon tool={selectedShape} /></b><span className="desktop-tool-label">Hình dạng</span><span className="mobile-tool-label">Hình</span></button>
               <button className={tool === 'text' ? 'tool-button active' : 'tool-button'} data-tool-id="text" onClick={() => selectTool('text')} title={`${TEXT_TOOL.label} — phím ${TEXT_TOOL.key}`} aria-label={`${TEXT_TOOL.label} (${TEXT_TOOL.key})`} aria-pressed={tool === 'text'}><b><ToolIcon tool="text" /></b><span className="desktop-tool-label">{TEXT_TOOL.label}</span><span className="mobile-tool-label">Chữ</span></button>
-              <button ref={moreToolsButtonRef} type="button" className={MORE_TOOLS.some((item) => item.id === tool) ? 'tool-button more-tools-button active' : 'tool-button more-tools-button'} onClick={() => { setShapeMenuOpen(false); setMoreToolsOpen((open) => !open); }} aria-label="Công cụ khác" aria-haspopup="dialog" aria-expanded={moreToolsOpen} aria-controls="more-tools-sheet"><b><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true"><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></svg></b><span className="mobile-tool-label">Thêm</span></button>
+              <button ref={moreToolsButtonRef} type="button" className={MORE_TOOLS.some((item) => item.id === tool) ? 'tool-button more-tools-button active' : 'tool-button more-tools-button'} onClick={toggleMoreTools} aria-label="Công cụ khác" aria-haspopup="dialog" aria-expanded={moreToolsOpen} aria-controls="more-tools-sheet"><b><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true"><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></svg></b><span className="mobile-tool-label">Thêm</span></button>
             </aside>
           </div>
 
           {moreToolsOpen ? <>
-            <button type="button" className="more-tools-dismiss" onClick={() => { setMoreToolsOpen(false); moreToolsButtonRef.current?.focus(); }} aria-label="Đóng công cụ khác" />
-            <section id="more-tools-sheet" className="more-tools-sheet" role="dialog" aria-modal="false" aria-labelledby="more-tools-title">
+            <div className="more-tools-dismiss" aria-hidden="true" onPointerDown={() => { setMoreToolsOpen(false); moreToolsButtonRef.current?.focus(); }} />
+            <section ref={moreToolsSheetRef} id="more-tools-sheet" className="more-tools-sheet" role="dialog" aria-modal="false" aria-labelledby="more-tools-title">
               <header><div><small>Studio Nét</small><strong id="more-tools-title">Công cụ khác</strong></div><button type="button" onClick={() => { setMoreToolsOpen(false); moreToolsButtonRef.current?.focus(); }} aria-label="Đóng công cụ khác">×</button></header>
-              <div>{MORE_TOOLS.map((item) => <button key={item.id} type="button" className={tool === item.id ? 'active' : ''} onClick={() => selectTool(item.id)} aria-label={`${item.label} (${item.key})`} aria-pressed={tool === item.id}><ToolIcon tool={item.id} /><span><strong>{item.label}</strong><small>Phím {item.key}</small></span></button>)}</div>
+              <div>{MORE_TOOLS.map((item) => <button key={item.id} type="button" data-more-tool className={tool === item.id ? 'active' : ''} onClick={() => selectTool(item.id)} aria-label={`${item.label} (${item.key})`} aria-pressed={tool === item.id}><ToolIcon tool={item.id} /><span><strong>{item.label}</strong><small>Phím {item.key}</small></span></button>)}</div>
             </section>
           </> : null}
 
@@ -1179,7 +1304,8 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
                   {!mixerOpen && paletteError ? <p className="palette-error" role="alert">{paletteError}</p> : null}
                 </section>
               ) : null}
-              <section><label className="inspector-title" htmlFor="stroke-size"><span>{tool === 'text' ? 'Cỡ chữ' : tool === 'eraser' ? 'Kích thước tẩy' : 'Độ dày'}</span><output>{size}px</output></label><input id="stroke-size" name="stroke-size" type="range" min={sizeLimits.min} max={sizeLimits.max} value={size} style={rangeStyle(size, sizeLimits.min, sizeLimits.max)} onChange={(event) => { const nextSize = Number(event.target.value); if (tool === 'text') setFontSize(nextSize); else if (isSizedTool(tool)) setToolSizes((current) => ({ ...current, [tool]: nextSize })); }} /></section>
+              {tool !== 'fill' ? <section><label className="inspector-title" htmlFor="stroke-size"><span>{tool === 'text' ? 'Cỡ chữ' : tool === 'eraser' ? 'Kích thước tẩy' : 'Độ dày'}</span><output>{size}px</output></label><input id="stroke-size" name="stroke-size" type="range" min={sizeLimits.min} max={sizeLimits.max} value={size} style={rangeStyle(size, sizeLimits.min, sizeLimits.max)} onChange={(event) => { const nextSize = Number(event.target.value); if (tool === 'text') setFontSize(nextSize); else if (isSizedTool(tool)) setToolSizes((current) => ({ ...current, [tool]: nextSize })); }} /></section> : null}
+              {tool === 'fill' ? <section className="fill-tool-settings"><div className="fill-tool-intro"><ToolIcon tool="fill" /><span><strong>Chạm vùng kín để tô</strong><small>Màu chỉ lan qua các điểm có sắc độ gần nhau.</small></span></div><label className="inspector-title" htmlFor="fill-tolerance"><span>Độ lan màu</span><output>{fillTolerance}</output></label><input id="fill-tolerance" name="fill-tolerance" type="range" min="0" max="72" value={fillTolerance} style={rangeStyle(fillTolerance, 0, 72)} onChange={(event) => setFillTolerance(Number(event.target.value))} /><p>Tăng độ lan khi nền có nhiều sắc độ hoặc ảnh đã bị nén.</p></section> : null}
               {tool !== 'eraser' ? <section><label className="inspector-title" htmlFor="stroke-opacity"><span>{tool === 'marker' ? 'Độ phủ highlighter' : 'Độ trong suốt'}</span><output>{Math.round(opacity * (tool === 'marker' ? 34 : 100))}%</output></label><input id="stroke-opacity" name="stroke-opacity" type="range" min="10" max="100" value={Math.round(opacity * 100)} style={rangeStyle(Math.round(opacity * 100), 10, 100)} onChange={(event) => setOpacity(Number(event.target.value) / 100)} /></section> : null}
               {tool === 'text' ? <section><label className="text-tool-label" htmlFor="canvas-text">Nội dung chữ</label><textarea id="canvas-text" name="canvas-text" autoComplete="off" value={textValue} onChange={(event) => setTextValue(event.target.value)} placeholder="Nhập chữ rồi kéo lên giấy…" maxLength={160} /><p className="text-tool-help">Nhấn–kéo để đặt chữ. Click hoặc kéo lại chữ có khung tím để chỉnh vị trí.</p>{selectedTextId ? <button className="text-delete-button" onClick={deleteSelectedText}><span>⌫</span> Xóa chữ đã chọn <kbd>Delete</kbd></button> : null}</section> : null}
               {closedShapeTool ? <section><label className="fill-toggle"><input type="checkbox" name="shape-fill" checked={filled} onChange={(event) => setFilled(event.target.checked)} /><span><strong>Tô nền nhạt</strong><small>Giữ viền rõ, nền 16%</small></span></label></section> : null}

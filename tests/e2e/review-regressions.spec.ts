@@ -387,7 +387,8 @@ test('ảnh trong message mở viewer, zoom bằng nút và tải file thật tr
   expect(desktopImageBox.width).toBeLessThanOrEqual(800);
   expect(desktopImageBox.width).toBeLessThanOrEqual(1440 * 0.58);
   expect(desktopImageBox.height).toBeLessThanOrEqual(520);
-  await page.keyboard.press('Escape');
+  await viewer.locator('.media-viewer-viewport').click({ position: { x: 3, y: 30 } });
+  await expect(viewer).toHaveCount(0);
 });
 });
 

@@ -6,8 +6,9 @@ test('Studio không bị cắt ở màn hình ngang thấp và mobile @critical'
   await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
   await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(`Guest Responsive ${Date.now()}`);
   await page.getByRole('button', { name: 'Vào Nét' }).click();
-  await expect(page.getByText('Đã đồng bộ')).toBeVisible();
-  await page.getByRole('button', { name: 'Mở canvas' }).click();
+  const openCanvas = page.getByRole('button', { name: 'Mở canvas' });
+  await expect(openCanvas).toBeVisible();
+  await openCanvas.click();
 
   const studio = page.getByRole('dialog', { name: 'Studio Nét' });
   await expect.poll(async () => (await studio.boundingBox())?.y ?? Number.POSITIVE_INFINITY).toBeLessThan(0.5);

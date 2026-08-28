@@ -1,6 +1,6 @@
 'use client';
 
-import { type CSSProperties, type KeyboardEvent, useEffect, useState } from 'react';
+import { type CSSProperties, type KeyboardEvent, type MouseEvent as ReactMouseEvent, useEffect, useState } from 'react';
 import AppDialog from '@/src/shared/app-dialog';
 import type { MessageView } from '@/src/shared/chat.types';
 
@@ -61,6 +61,9 @@ export default function MediaViewer({
     '--media-desktop-zoom': viewportSize.width > 0 ? `${desktopWidth}px` : `min(${zoom * 0.56}%, ${zoom * 8}px)`,
   } as CSSProperties;
   const changeZoom = (next: number) => setZoom(Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, next)));
+  const dismissFromDarkArea = (event: ReactMouseEvent<HTMLElement>) => {
+    if (event.target === event.currentTarget) onClose();
+  };
   const handleKeyboard = (event: KeyboardEvent<HTMLElement>) => {
     if (event.ctrlKey || event.metaKey || event.altKey) return;
     if (event.key === '+' || event.key === '=') {
@@ -92,8 +95,8 @@ export default function MediaViewer({
             <button type="button" className="media-close-button" onClick={onClose} aria-label="Đóng trình xem ảnh" data-tooltip="Đóng" data-tooltip-placement="below"><MediaIcon name="close" /></button>
           </div>
         </header>
-        <div className="media-viewer-viewport">
-          <div className="media-viewer-stage" style={stageStyle} onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+        <div className="media-viewer-viewport" onClick={dismissFromDarkArea}>
+          <div className="media-viewer-stage" style={stageStyle} onClick={dismissFromDarkArea}>
             <button type="button" className={zoom === 100 ? 'media-viewer-image-button' : 'media-viewer-image-button zoomed'} onClick={() => changeZoom(zoom === 100 ? 200 : 100)} aria-label={zoom === 100 ? 'Phóng to ảnh lên 200%' : 'Đặt ảnh về 100%'}>
               {/* Signed asset URLs are intentionally rendered as plain images. */}
               {/* eslint-disable-next-line @next/next/no-img-element */}
