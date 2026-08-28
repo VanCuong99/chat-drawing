@@ -86,6 +86,30 @@ async function countFillEdgeGaps(canvas: Locator, bounds: { left: number; top: n
   }, bounds);
 }
 
+async function readCanvasRegionSignature(canvas: Locator, bounds: { left: number; top: number; width: number; height: number }) {
+  return canvas.evaluate((element, area) => {
+    const context = (element as HTMLCanvasElement).getContext('2d');
+    if (!context) throw new Error('Không thể đọc canvas 2D');
+    const data = context.getImageData(area.left, area.top, area.width, area.height).data;
+    const colors = new Set<string>();
+    let minimumLightness = 255;
+    let maximumLightness = 0;
+    let hash = 2166136261;
+    for (let offset = 0; offset < data.length; offset += 4) {
+      const red = data[offset];
+      const green = data[offset + 1];
+      const blue = data[offset + 2];
+      colors.add(`${red},${green},${blue}`);
+      const lightness = Math.round((red + green + blue) / 3);
+      minimumLightness = Math.min(minimumLightness, lightness);
+      maximumLightness = Math.max(maximumLightness, lightness);
+      hash ^= red | green << 8 | blue << 16;
+      hash = Math.imul(hash, 16777619);
+    }
+    return { uniqueColors: colors.size, lightnessRange: maximumLightness - minimumLightness, hash: hash >>> 0 };
+  }, bounds);
+}
+
 async function drawRectangle(page: Page, canvas: Locator) {
   const box = await canvas.boundingBox();
   expect(box).not.toBeNull();
@@ -235,4 +259,104 @@ test('paint bucket phủ kín mép anti-alias của nét vẽ tự do mà không
     width: radius * 2 + 32,
     height: radius * 2 + 32,
   }), { message: 'Không được còn pixel sáng nằm kẹp giữa màu tô và nét vẽ' }).toBe(0);
+});
+
+test('màu nước tạo granulation ổn định, đọng viền và vẫn hoàn tác được @critical', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
+  await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(`Guest Watercolor ${Date.now()}`);
+  await page.getByRole('button', { name: 'Vào Nét' }).click();
+  await page.getByRole('button', { name: 'Mở canvas' }).click();
+
+  const studio = page.getByRole('dialog', { name: 'Studio Nét' });
+  const canvas = studio.getByLabel('Vùng vẽ nâng cao');
+  await page.getByRole('button', { name: /Hình dạng/ }).click();
+  await page.getByRole('dialog', { name: 'Chọn hình dạng' }).getByRole('button', { name: 'Chữ nhật', exact: true }).click();
+  const center = await drawRectangle(page, canvas);
+  await studio.getByRole('button', { name: 'Chọn màu #d34d8b' }).click();
+  await studio.locator('.tool-rail [data-tool-id="fill"]').click();
+
+  const materialGroup = studio.getByRole('group', { name: 'Chất liệu tô' });
+  const watercolor = materialGroup.getByRole('button', { name: /Màu nước/ });
+  await expect(watercolor).toBeVisible();
+  const watercolorBox = await watercolor.boundingBox();
+  expect(watercolorBox?.height).toBeGreaterThanOrEqual(44);
+  await watercolor.click();
+  await expect(watercolor).toHaveAttribute('aria-pressed', 'true');
+  await expect(studio.getByLabel('Độ chất liệu')).toHaveValue('60');
+
+  const box = await canvas.boundingBox();
+  expect(box).not.toBeNull();
+  await canvas.click({ position: { x: center.x / CANVAS_WIDTH * box!.width, y: center.y / CANVAS_HEIGHT * box!.height } });
+  await expect(studio.getByText('2 thao tác')).toBeVisible();
+  const sample = { left: center.x - 50, top: center.y - 40, width: 100, height: 80 };
+  await expect.poll(async () => {
+    const signature = await readCanvasRegionSignature(canvas, sample);
+    return signature.uniqueColors > 12 && signature.lightnessRange > 8;
+  }).toBe(true);
+  const paintedSignature = await readCanvasRegionSignature(canvas, sample);
+  expect(paintedSignature.uniqueColors).toBeGreaterThan(12);
+  expect(paintedSignature.lightnessRange).toBeGreaterThan(8);
+  await expect.poll(async () => readCanvasPixel(canvas, { x: 60, y: 60 })).toEqual([255, 254, 251, 255]);
+
+  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
+  await expect.poll(async () => readCanvasPixel(canvas, center)).toEqual([255, 254, 251, 255]);
+  await studio.getByRole('button', { name: 'Làm lại' }).click();
+  await expect.poll(async () => readCanvasRegionSignature(canvas, sample)).toEqual(paintedSignature);
+
+  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
+  const pencil = materialGroup.getByRole('button', { name: /Chì màu/ });
+  await pencil.click();
+  await canvas.click({ position: { x: center.x / CANVAS_WIDTH * box!.width, y: center.y / CANVAS_HEIGHT * box!.height } });
+  const pencilSignature = await readCanvasRegionSignature(canvas, sample);
+  expect(pencilSignature.uniqueColors).toBeGreaterThan(20);
+  expect(pencilSignature.lightnessRange).toBeGreaterThan(20);
+  expect(pencilSignature.hash).not.toBe(paintedSignature.hash);
+  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
+  await studio.getByRole('button', { name: 'Làm lại' }).click();
+  await expect.poll(async () => readCanvasRegionSignature(canvas, sample)).toEqual(pencilSignature);
+
+  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
+  const marker = materialGroup.getByRole('button', { name: /Marker/ });
+  await marker.click();
+  await canvas.click({ position: { x: center.x / CANVAS_WIDTH * box!.width, y: center.y / CANVAS_HEIGHT * box!.height } });
+  const markerSignature = await readCanvasRegionSignature(canvas, sample);
+  expect(markerSignature.uniqueColors).toBeGreaterThan(10);
+  expect(markerSignature.lightnessRange).toBeGreaterThan(8);
+  expect(markerSignature.hash).not.toBe(paintedSignature.hash);
+  expect(markerSignature.hash).not.toBe(pencilSignature.hash);
+  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
+  await studio.getByRole('button', { name: 'Làm lại' }).click();
+  await expect.poll(async () => readCanvasRegionSignature(canvas, sample)).toEqual(markerSignature);
+
+  // A material is a glaze, so applying it over a solid fill of the same RGB
+  // must still create a new visual action rather than being treated as a no-op.
+  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
+  const solid = materialGroup.getByRole('button', { name: /Phẳng/ });
+  await solid.click();
+  await canvas.click({ position: { x: center.x / CANVAS_WIDTH * box!.width, y: center.y / CANVAS_HEIGHT * box!.height } });
+  const solidSignature = await readCanvasRegionSignature(canvas, sample);
+  await watercolor.click();
+  await canvas.click({ position: { x: center.x / CANVAS_WIDTH * box!.width, y: center.y / CANVAS_HEIGHT * box!.height } });
+  await expect(studio.getByText('3 thao tác')).toBeVisible();
+  const glazedSignature = await readCanvasRegionSignature(canvas, sample);
+  expect(glazedSignature.hash).not.toBe(solidSignature.hash);
+  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
+  await expect.poll(async () => readCanvasRegionSignature(canvas, sample)).toEqual(solidSignature);
+  await studio.getByRole('button', { name: 'Làm lại' }).click();
+  await expect.poll(async () => readCanvasRegionSignature(canvas, sample)).toEqual(glazedSignature);
+
+  for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }]) {
+    await page.setViewportSize(viewport);
+    for (const material of await materialGroup.getByRole('button').all()) {
+      const materialBox = await material.boundingBox();
+      expect(materialBox?.height).toBeGreaterThanOrEqual(44);
+    }
+    for (const sliderName of ['Độ chất liệu', 'Độ lan màu']) {
+      const sliderBox = await studio.getByLabel(sliderName).boundingBox();
+      expect(sliderBox?.height).toBeGreaterThanOrEqual(44);
+    }
+    const widths = await page.locator('body').evaluate((body) => ({ client: body.clientWidth, scroll: body.scrollWidth }));
+    expect(widths.scroll).toBe(widths.client);
+  }
 });

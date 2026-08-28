@@ -4,6 +4,8 @@ Messenger chia sẻ chữ, ảnh và canvas có lịch sử phiên bản. Dự �
 
 Studio Nét có bộ pha nhiều sắc tố gần đúng theo Kubelka–Munk với 2–12 màu thành phần. Người dùng nhập phần pha cho từng màu, xem nồng độ đầu vào đã chuẩn hóa, lưu cả công thức và nạp lại để chỉnh tiếp; bảng màu riêng lưu tối đa 24 công thức. Model `spectral-kubelka-munk-rgb` v2 đảo đúng phép biến đổi factor/luminance của spectral.js để tỷ lệ UI đi vào phép trộn đồng thời như nồng độ đã khai báo. Đây vẫn là mô phỏng sRGB/D65; công thức vật liệu thật cần phổ K/S đo cho từng pigment, binder và substrate.
 
+Công cụ tô giữ chế độ phẳng và có thêm Marker, Chì màu, Màu nước. Các chất liệu dùng texture có seed ổn định, blend kiểu pigment, vân giấy/granulation và đọng màu ở biên; vì vậy undo, redo và export luôn tái tạo cùng một kết quả. Đây là mô phỏng tương tác tối ưu cho canvas web, không phải mô phỏng động lực học chất lỏng hay dữ liệu vật liệu phòng thí nghiệm.
+
 ## Kiến trúc
 
 ```text

@@ -25,10 +25,11 @@ type ShapeTool = 'line' | 'arrow' | ClosedShapeTool;
 type Tool = 'hand' | StrokeTool | ShapeTool | 'fill' | 'text';
 type SizedTool = Exclude<Tool, 'hand' | 'fill' | 'text'>;
 type Paper = 'white' | 'cream' | 'grid' | 'dots';
+type FillMaterial = 'solid' | 'marker' | 'pencil' | 'watercolor';
 type StyledAction = { color: string; size: number; opacity: number };
 type StrokeAction = StyledAction & { kind: 'stroke'; tool: StrokeTool; points: Point[] };
 type ShapeAction = StyledAction & { kind: 'shape'; tool: ShapeTool; from: Point; to: Point; filled: boolean };
-type FillAction = Pick<StyledAction, 'color' | 'opacity'> & { kind: 'fill'; spans: Uint32Array };
+type FillAction = Pick<StyledAction, 'color' | 'opacity'> & { kind: 'fill'; spans: Uint32Array; edgeSpans: Uint32Array; material: FillMaterial; texture: number; seed: number };
 type TextAction = StyledAction & { kind: 'text'; id: string; point: Point; text: string };
 type DrawAction = StrokeAction | ShapeAction | FillAction | TextAction;
 type Scene = { actions: DrawAction[]; paper: Paper };
@@ -42,6 +43,12 @@ const INITIAL_MIXER_COMPONENTS: MixerPigment[] = [
   { id: 'pigment-3', color: '#3375DA', weight: 1 },
 ];
 const ADDED_PIGMENT_COLORS = ['#FCD200', '#002185', '#EF7668', '#3AA694', '#D34D8B', '#E19A3F'];
+const FILL_MATERIALS: Array<{ id: FillMaterial; label: string; description: string }> = [
+  { id: 'solid', label: 'Phẳng', description: 'Màu đều, sạch' },
+  { id: 'marker', label: 'Marker', description: 'Mực chồng lớp' },
+  { id: 'pencil', label: 'Chì màu', description: 'Bám vân giấy' },
+  { id: 'watercolor', label: 'Màu nước', description: 'Loang & đọng viền' },
+];
 const INITIAL_TOOL_SIZES: Record<SizedTool, number> = { pen: 7, marker: 18, eraser: 32, line: 5, arrow: 5, rectangle: 5, roundedRectangle: 5, ellipse: 5, triangle: 5, trapezoid: 5, diamond: 5, star: 5, bubble: 5 };
 const TOOL_SIZE_LIMITS: Record<SizedTool, { min: number; max: number }> = {
   pen: { min: 2, max: 40 },
@@ -405,22 +412,121 @@ function hexToRgb(hex: string) {
   return { red: value >> 16 & 255, green: value >> 8 & 255, blue: value & 255 };
 }
 
-function drawFill(context: CanvasRenderingContext2D, action: FillAction) {
-  context.save();
-  context.globalAlpha = action.opacity;
-  context.fillStyle = action.color;
-  context.beginPath();
-  for (let index = 0; index < action.spans.length; index += 3) {
-    const y = action.spans[index];
-    const startX = action.spans[index + 1];
-    const endX = action.spans[index + 2];
+const MATERIAL_TILE_SIZE = 192;
+const materialTileCache = new Map<string, HTMLCanvasElement>();
+
+function textureNoise(x: number, y: number, seed: number) {
+  let value = Math.imul(x + 1, 374761393) ^ Math.imul(y + 1, 668265263) ^ seed;
+  value = Math.imul(value ^ value >>> 13, 1274126177);
+  return ((value ^ value >>> 16) >>> 0) / 4294967295;
+}
+
+function seamlessNoise(x: number, y: number, seed: number, cells: number) {
+  const cellSize = MATERIAL_TILE_SIZE / cells;
+  const cellX = Math.floor(x / cellSize);
+  const cellY = Math.floor(y / cellSize);
+  const localX = (x - cellX * cellSize) / cellSize;
+  const localY = (y - cellY * cellSize) / cellSize;
+  const smoothX = localX * localX * (3 - 2 * localX);
+  const smoothY = localY * localY * (3 - 2 * localY);
+  const wrap = (value: number) => (value + cells) % cells;
+  const topLeft = textureNoise(wrap(cellX), wrap(cellY), seed);
+  const topRight = textureNoise(wrap(cellX + 1), wrap(cellY), seed);
+  const bottomLeft = textureNoise(wrap(cellX), wrap(cellY + 1), seed);
+  const bottomRight = textureNoise(wrap(cellX + 1), wrap(cellY + 1), seed);
+  const top = topLeft + (topRight - topLeft) * smoothX;
+  const bottom = bottomLeft + (bottomRight - bottomLeft) * smoothX;
+  return top + (bottom - top) * smoothY;
+}
+
+function materialTile(action: FillAction) {
+  const cacheKey = `${action.material}:${action.color}:${action.texture}:${action.seed}`;
+  const cached = materialTileCache.get(cacheKey);
+  if (cached) return cached;
+  const tile = document.createElement('canvas');
+  tile.width = MATERIAL_TILE_SIZE;
+  tile.height = MATERIAL_TILE_SIZE;
+  const context = tile.getContext('2d');
+  if (!context) return tile;
+  const image = context.createImageData(MATERIAL_TILE_SIZE, MATERIAL_TILE_SIZE);
+  const { red, green, blue } = hexToRgb(action.color);
+  const strength = action.texture / 100;
+  const phase = action.seed % MATERIAL_TILE_SIZE;
+  for (let y = 0; y < MATERIAL_TILE_SIZE; y += 1) {
+    for (let x = 0; x < MATERIAL_TILE_SIZE; x += 1) {
+      const grain = textureNoise(x, y, action.seed);
+      let alpha = 255;
+      if (action.material === 'marker') {
+        const band = (Math.sin((x + y * 2 + phase) * Math.PI / 16) + 1) / 2;
+        alpha = 176 + (band - 0.5) * 70 * strength + (grain - 0.5) * 24 * strength;
+      } else if (action.material === 'pencil') {
+        const stroke = (Math.sin((x * 3 + y + phase) * Math.PI / 8) + 1) / 2;
+        const tooth = Math.pow(grain, 0.72 + strength * 0.8);
+        alpha = 38 + stroke * 72 + tooth * (86 + strength * 46);
+      } else if (action.material === 'watercolor') {
+        const broadWash = seamlessNoise(x, y, action.seed, 6);
+        const blooms = seamlessNoise(x, y, action.seed ^ 0x85ebca6b, 12);
+        alpha = 132 + broadWash * 72 + blooms * 26 - grain * 28 * strength;
+      }
+      const offset = (y * MATERIAL_TILE_SIZE + x) * 4;
+      image.data[offset] = red;
+      image.data[offset + 1] = green;
+      image.data[offset + 2] = blue;
+      image.data[offset + 3] = Math.max(18, Math.min(255, Math.round(alpha)));
+    }
+  }
+  context.putImageData(image, 0, 0);
+  materialTileCache.set(cacheKey, tile);
+  if (materialTileCache.size > 48) {
+    const oldest = materialTileCache.keys().next().value;
+    if (oldest) materialTileCache.delete(oldest);
+  }
+  return tile;
+}
+
+function appendFillSpans(context: CanvasRenderingContext2D, spans: Uint32Array) {
+  for (let index = 0; index < spans.length; index += 3) {
+    const y = spans[index];
+    const startX = spans[index + 1];
+    const endX = spans[index + 2];
     context.rect(startX, y, endX - startX + 1, 1);
   }
+}
+
+function drawWatercolorEdge(context: CanvasRenderingContext2D, action: FillAction) {
+  if (!action.edgeSpans.length) return;
+  context.save();
+  context.globalCompositeOperation = 'multiply';
+  context.globalAlpha = action.opacity * (0.14 + action.texture / 100 * 0.16);
+  context.fillStyle = action.color;
+  context.beginPath();
+  appendFillSpans(context, action.edgeSpans);
   context.fill();
   context.restore();
 }
 
-function makeFillAction(image: ImageData, point: Point, color: string, opacity: number, tolerance: number): FillAction | null {
+function drawFill(context: CanvasRenderingContext2D, action: FillAction) {
+  context.save();
+  context.globalAlpha = action.opacity;
+  context.beginPath();
+  appendFillSpans(context, action.spans);
+  if (action.material === 'solid') {
+    context.fillStyle = action.color;
+    context.fill();
+  } else {
+    context.clip();
+    context.globalCompositeOperation = 'multiply';
+    const pattern = context.createPattern(materialTile(action), 'repeat');
+    if (pattern) {
+      context.fillStyle = pattern;
+      context.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    }
+  }
+  context.restore();
+  if (action.material === 'watercolor') drawWatercolorEdge(context, action);
+}
+
+function makeFillAction(image: ImageData, point: Point, color: string, opacity: number, tolerance: number, material: FillMaterial, texture: number, seed: number): FillAction | null {
   const width = image.width;
   const height = image.height;
   const startX = Math.max(0, Math.min(width - 1, Math.floor(point.x)));
@@ -429,7 +535,7 @@ function makeFillAction(image: ImageData, point: Point, color: string, opacity: 
   const startOffset = startIndex * 4;
   const target = [image.data[startOffset], image.data[startOffset + 1], image.data[startOffset + 2], image.data[startOffset + 3]];
   const fill = hexToRgb(color);
-  if (target[3] === 255 && Math.max(Math.abs(target[0] - fill.red), Math.abs(target[1] - fill.green), Math.abs(target[2] - fill.blue)) <= 1) return null;
+  if (material === 'solid' && target[3] === 255 && Math.max(Math.abs(target[0] - fill.red), Math.abs(target[1] - fill.green), Math.abs(target[2] - fill.blue)) <= 1) return null;
 
   const visited = new Uint8Array(width * height);
   const queue = new Int32Array(width * height);
@@ -501,6 +607,15 @@ function makeFillAction(image: ImageData, point: Point, color: string, opacity: 
   }
 
   const spans: number[] = [];
+  const edgeSpans: number[] = [];
+  const isFillEdge = (x: number, y: number) => {
+    const index = y * width + x;
+    return visited[index] >= 2 && (
+      x === 0 || y === 0 || x + 1 === width || y + 1 === height
+      || visited[index - 1] < 2 || visited[index + 1] < 2
+      || visited[index - width] < 2 || visited[index + width] < 2
+    );
+  };
   for (let y = edgeMinY; y <= edgeMaxY; y += 1) {
     let x = edgeMinX;
     while (x <= edgeMaxX) {
@@ -511,8 +626,16 @@ function makeFillAction(image: ImageData, point: Point, color: string, opacity: 
       spans.push(y, start, x);
       x += 1;
     }
+    x = edgeMinX;
+    while (x <= edgeMaxX) {
+      if (!isFillEdge(x, y)) { x += 1; continue; }
+      const start = x;
+      while (x + 1 <= edgeMaxX && isFillEdge(x + 1, y)) x += 1;
+      edgeSpans.push(y, start, x);
+      x += 1;
+    }
   }
-  return { kind: 'fill', spans: Uint32Array.from(spans), color, opacity };
+  return { kind: 'fill', spans: Uint32Array.from(spans), edgeSpans: Uint32Array.from(edgeSpans), color, opacity, material, texture, seed };
 }
 
 function drawAction(context: CanvasRenderingContext2D, action: DrawAction) {
@@ -561,6 +684,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const moreToolsSheetRef = useRef<HTMLElement>(null);
   const mixerToggleRef = useRef<HTMLButtonElement>(null);
   const mixerIdRef = useRef(4);
+  const fillSeedRef = useRef(1);
   const committedLayerRef = useRef<HTMLCanvasElement | null>(null);
   const previewLayerRef = useRef<HTMLCanvasElement | null>(null);
   const textDragFrameRef = useRef<number | null>(null);
@@ -593,6 +717,8 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const [selectedTextId, setSelectedTextId] = useState<string | null>(null);
   const [filled, setFilled] = useState(false);
   const [fillTolerance, setFillTolerance] = useState(24);
+  const [fillMaterial, setFillMaterial] = useState<FillMaterial>('solid');
+  const [fillTexture, setFillTexture] = useState(60);
   const [zoom, setZoom] = useState(100);
   const [caption, setCaption] = useState('');
   const [sending, setSending] = useState(false);
@@ -609,6 +735,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const pigmentFormula = useMemo(() => mixerComponents.map(({ color: componentColor, weight }) => ({ color: componentColor, weight })), [mixerComponents]);
   const mixedColor = useMemo(() => mixPigmentHex(pigmentFormula), [pigmentFormula]);
   const mixerPercentages = useMemo(() => pigmentPercentages(pigmentFormula), [pigmentFormula]);
+  const activeFillMaterial = FILL_MATERIALS.find((item) => item.id === fillMaterial) ?? FILL_MATERIALS[0];
 
   useEffect(() => { actionsRef.current = actions; }, [actions]);
 
@@ -805,13 +932,16 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
       if (!context) return;
       paintPreview(null, paper, null);
       try {
-        const action = makeFillAction(context.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT), point, color, opacity, fillTolerance);
+        const seed = (Math.imul(fillSeedRef.current++, 2654435761)
+          ^ Math.imul(Math.floor(point.x), 374761393)
+          ^ Math.imul(Math.floor(point.y), 668265263)) >>> 0;
+        const action = makeFillAction(context.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT), point, color, opacity, fillTolerance, fillMaterial, fillTexture, seed);
         if (!action) {
           setHint('Vùng này đã có màu đang chọn');
           return;
         }
         commit(action);
-        setHint(`Đã tô vùng · độ lan ${fillTolerance} · ⌘Z để hoàn tác`);
+        setHint(`Đã tô ${activeFillMaterial.label.toLocaleLowerCase('vi')} · độ lan ${fillTolerance} · ⌘Z để hoàn tác`);
       } catch {
         setHint('Không thể đọc vùng ảnh này để tô. Hãy thử lại với bản vẽ mới.');
       }
@@ -1334,7 +1464,16 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
                 </section>
               ) : null}
               {tool !== 'fill' ? <section><label className="inspector-title" htmlFor="stroke-size"><span>{tool === 'text' ? 'Cỡ chữ' : tool === 'eraser' ? 'Kích thước tẩy' : 'Độ dày'}</span><output>{size}px</output></label><input id="stroke-size" name="stroke-size" type="range" min={sizeLimits.min} max={sizeLimits.max} value={size} style={rangeStyle(size, sizeLimits.min, sizeLimits.max)} onChange={(event) => { const nextSize = Number(event.target.value); if (tool === 'text') setFontSize(nextSize); else if (isSizedTool(tool)) setToolSizes((current) => ({ ...current, [tool]: nextSize })); }} /></section> : null}
-              {tool === 'fill' ? <section className="fill-tool-settings"><div className="fill-tool-intro"><ToolIcon tool="fill" /><span><strong>Chạm vùng kín để tô</strong><small>Màu chỉ lan qua các điểm có sắc độ gần nhau.</small></span></div><label className="inspector-title" htmlFor="fill-tolerance"><span>Độ lan màu</span><output>{fillTolerance}</output></label><input id="fill-tolerance" name="fill-tolerance" type="range" min="0" max="72" value={fillTolerance} style={rangeStyle(fillTolerance, 0, 72)} onChange={(event) => setFillTolerance(Number(event.target.value))} /><p>Tăng độ lan khi nền có nhiều sắc độ hoặc ảnh đã bị nén.</p></section> : null}
+              {tool === 'fill' ? <section className="fill-tool-settings">
+                <div className="fill-tool-intro"><ToolIcon tool="fill" /><span><strong>{fillMaterial === 'solid' ? 'Chạm vùng kín để tô' : `Chạm vùng kín để tô ${activeFillMaterial.label.toLocaleLowerCase('vi')}`}</strong><small>{fillMaterial === 'solid' ? 'Màu chỉ lan qua các điểm có sắc độ gần nhau.' : activeFillMaterial.description}</small></span></div>
+                <div className="inspector-title"><span>Chất liệu tô</span><output>{activeFillMaterial.label}</output></div>
+                <div className="fill-material-options" role="group" aria-label="Chất liệu tô" style={{ '--fill-preview-color': color } as CSSProperties}>
+                  {FILL_MATERIALS.map((material) => <button key={material.id} type="button" className={fillMaterial === material.id ? `fill-material-${material.id} active` : `fill-material-${material.id}`} onClick={() => setFillMaterial(material.id)} aria-pressed={fillMaterial === material.id}><i aria-hidden="true" /><span><strong>{material.label}</strong><small>{material.description}</small></span></button>)}
+                </div>
+                {fillMaterial !== 'solid' ? <><label className="inspector-title fill-texture-title" htmlFor="fill-texture"><span>Độ chất liệu</span><output>{fillTexture}%</output></label><input id="fill-texture" name="fill-texture" type="range" min="10" max="100" value={fillTexture} style={rangeStyle(fillTexture, 10, 100)} onChange={(event) => setFillTexture(Number(event.target.value))} /></> : null}
+                <label className="inspector-title fill-tolerance-title" htmlFor="fill-tolerance"><span>Độ lan màu</span><output>{fillTolerance}</output></label><input id="fill-tolerance" name="fill-tolerance" type="range" min="0" max="72" value={fillTolerance} style={rangeStyle(fillTolerance, 0, 72)} onChange={(event) => setFillTolerance(Number(event.target.value))} />
+                <p>Tăng độ lan khi nền có nhiều sắc độ hoặc ảnh đã bị nén.</p>
+              </section> : null}
               {tool !== 'eraser' ? <section><label className="inspector-title" htmlFor="stroke-opacity"><span>{tool === 'marker' ? 'Độ phủ highlighter' : 'Độ trong suốt'}</span><output>{Math.round(opacity * (tool === 'marker' ? 34 : 100))}%</output></label><input id="stroke-opacity" name="stroke-opacity" type="range" min="10" max="100" value={Math.round(opacity * 100)} style={rangeStyle(Math.round(opacity * 100), 10, 100)} onChange={(event) => setOpacity(Number(event.target.value) / 100)} /></section> : null}
               {tool === 'text' ? <section><label className="text-tool-label" htmlFor="canvas-text">Nội dung chữ</label><textarea id="canvas-text" name="canvas-text" autoComplete="off" value={textValue} onChange={(event) => setTextValue(event.target.value)} placeholder="Nhập chữ rồi kéo lên giấy…" maxLength={160} /><p className="text-tool-help">Nhấn–kéo để đặt chữ. Click hoặc kéo lại chữ có khung tím để chỉnh vị trí.</p>{selectedTextId ? <button className="text-delete-button" onClick={deleteSelectedText}><span>⌫</span> Xóa chữ đã chọn <kbd>Delete</kbd></button> : null}</section> : null}
               {closedShapeTool ? <section><label className="fill-toggle"><input type="checkbox" name="shape-fill" checked={filled} onChange={(event) => setFilled(event.target.checked)} /><span><strong>Tô nền nhạt</strong><small>Giữ viền rõ, nền 16%</small></span></label></section> : null}

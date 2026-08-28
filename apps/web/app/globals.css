@@ -426,6 +426,19 @@ dialog.modal-backdrop::backdrop { background:transparent; }
 .fill-tool-intro span,.fill-tool-intro strong,.fill-tool-intro small { display:block; }
 .fill-tool-intro strong { font-size:12px; } .fill-tool-intro small { margin-top:2px; color:#7e728c; font-size:11px; line-height:1.35; }
 .fill-tool-settings>p { margin:7px 0 0; color:#8d8491; font-size:11px; line-height:1.4; }
+.fill-material-options { display:grid; grid-template-columns:1fr 1fr; gap:7px; }
+.fill-material-options button { display:flex; align-items:center; gap:8px; min-height:52px; border:1px solid #ded8e1; border-radius:10px; padding:7px 8px; background:#fff; color:#625a68; text-align:left; cursor:pointer; }
+.fill-material-options button:hover { border-color:#b9abe8; background:#fbf9ff; }
+.fill-material-options button:focus-visible { outline:3px solid rgba(111,78,232,.24); outline-offset:2px; }
+.fill-material-options button.active { border-color:#927be5; background:#f4f0ff; color:#553bad; box-shadow:inset 0 0 0 1px rgba(111,78,232,.08); }
+.fill-material-options button>i { display:block; width:28px; height:28px; flex:0 0 auto; border:1px solid rgba(65,54,74,.14); border-radius:8px; background:var(--fill-preview-color); box-shadow:inset 0 0 0 1px rgba(255,255,255,.24); }
+.fill-material-options button>span,.fill-material-options button strong,.fill-material-options button small { display:block; min-width:0; }
+.fill-material-options button strong { font-size:11px; line-height:1.2; }
+.fill-material-options button small { margin-top:2px; color:#675f6b; font-size:11px; line-height:1.25; }
+.fill-material-options .fill-material-marker>i { background:repeating-linear-gradient(165deg,color-mix(in srgb,var(--fill-preview-color) 88%,transparent) 0 7px,color-mix(in srgb,var(--fill-preview-color) 68%,transparent) 7px 10px),#fff; }
+.fill-material-options .fill-material-pencil>i { background:repeating-linear-gradient(16deg,color-mix(in srgb,var(--fill-preview-color) 84%,transparent) 0 1px,transparent 1px 3px),radial-gradient(circle at 35% 30%,var(--fill-preview-color) 0 1px,transparent 1.5px),#fffefb; background-size:auto,5px 5px,auto; }
+.fill-material-options .fill-material-watercolor>i { background:radial-gradient(circle at 72% 28%,color-mix(in srgb,var(--fill-preview-color) 58%,transparent),transparent 45%),radial-gradient(circle at 32% 68%,color-mix(in srgb,var(--fill-preview-color) 82%,transparent),transparent 58%),color-mix(in srgb,var(--fill-preview-color) 36%,white); box-shadow:inset 0 0 0 2px color-mix(in srgb,var(--fill-preview-color) 48%,transparent); }
+.fill-texture-title,.fill-tolerance-title { margin-top:14px; }
 .hand-tool-help strong { color:#504858; font-size:12px; } .hand-tool-help p { margin:6px 0 0; color:#817985; font-size:12px; line-height:1.55; }
 .paper-options { display:grid; grid-template-columns:1fr 1fr; gap:7px; } .paper-options button { display:flex; align-items:center; gap:7px; min-height:38px; border:1px solid #dfd9e1; border-radius:9px; padding:7px; background:#fff; color:#6c6470; font-size:12px; }
 .paper-options button i { display:block; width:16px; height:16px; border:1px solid #e3dfe5; border-radius:4px; background:#fff; } .paper-options .paper-cream i { background:#fff8e9; } .paper-options .paper-grid i { background-color:#fff; background-image:linear-gradient(#ddd 1px,transparent 1px),linear-gradient(90deg,#ddd 1px,transparent 1px); background-size:5px 5px; } .paper-options .paper-dots i { background-color:#fff; background-image:radial-gradient(#aaa 1px,transparent 1px); background-size:5px 5px; }
@@ -494,7 +507,7 @@ dialog.modal-backdrop::backdrop { background:transparent; }
   .canvas-panel { grid-template-rows:39px minmax(0,1fr) 25px; } .canvas-commandbar { grid-template-columns:auto 1fr auto; padding-inline:6px; } .canvas-commandbar>span { overflow:hidden; text-align:center; text-overflow:ellipsis; white-space:nowrap; } .canvas-viewport { padding:15px; } .canvas-board { min-width:310px; } .canvas-status span:last-child { display:none; }
   .tool-inspector { display:grid; grid-template-columns:1fr 1fr; gap:0 14px; overflow:auto; border-top:1px solid #d8d3ce; border-left:0; padding:0 12px 12px; } .tool-inspector section { padding:10px 0; } .advanced-color-row { gap:5px; } .color,.custom-color { width:30px; height:30px; }
   .tool-inspector input[type="range"] { height:44px; } .tool-inspector input[type="range"]::-webkit-slider-thumb { width:22px; height:22px; margin-top:-9px; } .tool-inspector input[type="range"]::-moz-range-thumb { width:20px; height:20px; }
-  .tool-inspector .pigment-mixer,.tool-inspector .palette-library { grid-column:1/-1; }
+  .tool-inspector .pigment-mixer,.tool-inspector .palette-library,.tool-inspector .fill-tool-settings { grid-column:1/-1; }
   .mixer-sheet-dismiss { position:fixed; z-index:29; inset:0; display:block; border:0; background:rgba(29,24,35,.42); backdrop-filter:blur(3px); }
   .tool-inspector .pigment-mixer { position:fixed; z-index:30; inset:0; display:block; overflow:auto; border:0!important; padding:16px 14px calc(110px + env(safe-area-inset-bottom)); background:#faf8f5; overscroll-behavior:contain; }
   .pigment-mixer .mixer-heading { position:sticky; z-index:4; top:-16px; margin:0 -14px 12px; border-bottom:1px solid #e2dce4; padding:12px 14px; background:rgba(250,248,245,.97); backdrop-filter:blur(14px); } .pigment-mixer .mixer-heading button { width:44px; height:44px; }
@@ -517,6 +530,9 @@ dialog.modal-backdrop::backdrop { background:transparent; }
   .advanced-studio .tool-button span { display:none; }
   .advanced-studio .tool-inspector { display:block; overflow:auto; border-top:0; border-left:1px solid #d8d3ce; padding:0 10px 10px; }
   .advanced-studio .tool-inspector section { padding:9px 0; }
+  .advanced-studio .tool-inspector input[type="range"] { height:44px; }
+  .advanced-studio .tool-inspector input[type="range"]::-webkit-slider-thumb { width:22px; height:22px; margin-top:-9px; }
+  .advanced-studio .tool-inspector input[type="range"]::-moz-range-thumb { width:20px; height:20px; }
   .advanced-studio .studio-footer { padding-block:6px; }
   .advanced-studio .studio-footer label span { display:none; }
 }
