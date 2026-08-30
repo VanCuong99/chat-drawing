@@ -296,6 +296,36 @@ test('maintenance preserves retained guest-only messages and attached assets aft
   }
 });
 
+test('maintenance removes an abandoned guest room that contains only its system notice @critical', async ({ request }) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  const cronSecret = process.env.CRON_SECRET;
+  if (!databaseUrl || !cronSecret) throw new Error('DATABASE_URL and CRON_SECRET are required for empty guest cleanup E2E');
+  const { db, pool } = createDatabase(databaseUrl, 1);
+  const guest = await createGuest(request, `Empty cleanup ${Date.now()}`);
+  const headers = { 'x-net-guest-session': guest.sessionId };
+
+  try {
+    const ended = await request.delete(`${apiOrigin}/api/guest`, { headers });
+    expect(ended.ok()).toBe(true);
+    const oldTimestamp = 1;
+    await db.update(rooms).set({ createdAt: oldTimestamp }).where(eq(rooms.id, guest.roomId));
+    await db.update(realtimeOutbox).set({ createdAt: oldTimestamp }).where(and(
+      eq(realtimeOutbox.roomId, guest.roomId),
+      eq(realtimeOutbox.event, 'guest.ended'),
+    ));
+
+    expect(await db.select({ id: messages.id }).from(messages).where(eq(messages.roomId, guest.roomId))).toHaveLength(1);
+    const maintenance = await request.get(`${apiOrigin}/api/maintenance`, {
+      headers: { authorization: `Bearer ${cronSecret}` },
+    });
+    expect(maintenance.ok()).toBe(true);
+    expect(await db.select({ id: rooms.id }).from(rooms).where(eq(rooms.id, guest.roomId))).toHaveLength(0);
+  } finally {
+    await db.delete(rooms).where(eq(rooms.id, guest.roomId));
+    await pool.end();
+  }
+});
+
 test('guest mới vẫn join được đúng phòng khi guest trước kết thúc đồng thời @critical', async ({ request }) => {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error('DATABASE_URL is required for guest cleanup lock E2E');

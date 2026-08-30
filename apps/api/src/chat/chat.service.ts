@@ -532,7 +532,7 @@ export class ChatService {
       lt(rooms.createdAt, now - EMPTY_GUEST_ROOM_GRACE_MS),
       sql`not exists (select 1 from ${roomMembers} where ${roomMembers.roomId} = ${rooms.id})`,
       sql`not exists (select 1 from ${guestSessions} where ${guestSessions.roomId} = ${rooms.id})`,
-      sql`not exists (select 1 from ${messages} where ${messages.roomId} = ${rooms.id})`,
+      sql`not exists (select 1 from ${messages} where ${messages.roomId} = ${rooms.id} and ${messages.type} <> 'system')`,
       sql`not exists (select 1 from ${assets} where ${assets.roomId} = ${rooms.id})`,
     )).orderBy(asc(rooms.createdAt)).limit(ABANDONED_GUEST_ROOM_BATCH);
     for (const candidate of abandonedRoomCandidates) {
@@ -546,7 +546,7 @@ export class ChatService {
           )).limit(1),
           tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.roomId, candidate.id)).limit(1),
           tx.select({ id: guestSessions.id }).from(guestSessions).where(eq(guestSessions.roomId, candidate.id)).limit(1),
-          tx.select({ id: messages.id }).from(messages).where(eq(messages.roomId, candidate.id)).limit(1),
+          tx.select({ id: messages.id }).from(messages).where(and(eq(messages.roomId, candidate.id), ne(messages.type, 'system'))).limit(1),
           tx.select({ key: assets.key }).from(assets).where(eq(assets.roomId, candidate.id)).limit(1),
           tx.select({ createdAt: realtimeOutbox.createdAt }).from(realtimeOutbox).where(and(
             eq(realtimeOutbox.roomId, candidate.id),
