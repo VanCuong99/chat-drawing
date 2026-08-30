@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "nest build",
+    "build": "pnpm --filter @net/database build && pnpm --filter @net/pigment build && nest build",
     "dev": "nest start --watch",
     "start": "node dist/main.js",
     "lint": "eslint \"src/**/*.ts\""
