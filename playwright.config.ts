@@ -85,7 +85,7 @@ export default defineConfig({
       timeout: 120_000,
     },
     {
-      command: `NEXT_PUBLIC_API_URL=${apiOrigin} NEXT_PUBLIC_REALTIME_URL=${apiOrigin}/chat pnpm --filter @net/web exec next dev --hostname 127.0.0.1 --port ${webPort}`,
+      command: `NEXT_PUBLIC_API_URL=${apiOrigin} NEXT_PUBLIC_API_REQUEST_URL=${apiOrigin} NEXT_PUBLIC_REALTIME_URL=${apiOrigin}/chat pnpm --filter @net/web exec next dev --webpack --hostname 127.0.0.1 --port ${webPort}`,
       url: webOrigin,
       reuseExistingServer: false,
       timeout: 120_000,

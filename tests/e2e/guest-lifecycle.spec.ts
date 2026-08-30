@@ -31,8 +31,11 @@ test('guest kết thúc phiên thì mất quyền truy cập nhưng tin nhắn v
   const firstMessage = page.getByRole('article').filter({ hasText: 'Tin nhắn tạm thời' });
   await expect(firstMessage).toBeVisible();
 
+  await firstMessage.locator('.message-content').hover();
+  await expect(firstMessage.locator('.message-tools')).toHaveCSS('pointer-events', 'auto');
   await firstMessage.getByRole('button', { name: 'Thả cảm xúc ❤️' }).click();
   await expect(firstMessage.getByRole('button', { name: 'Gỡ cảm xúc ❤️' })).toContainText('1');
+  await firstMessage.locator('.message-content').hover();
   await firstMessage.getByRole('button', { name: /Trả lời/ }).click();
   await composer.fill('Nội dung trả lời');
   await page.getByRole('button', { name: 'Gửi tin nhắn' }).click();

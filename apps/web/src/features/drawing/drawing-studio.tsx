@@ -104,7 +104,7 @@ const TOOLS: Array<{ id: Tool; label: string; key: string }> = [
 
 const RAIL_TOOLS = TOOLS.filter((tool) => ['hand', 'pen', 'marker', 'eraser', 'fill', 'line', 'arrow'].includes(tool.id));
 const MORE_TOOLS = RAIL_TOOLS.filter((tool) => ['marker', 'fill', 'line', 'arrow'].includes(tool.id));
-const MOBILE_MORE_TOOLS = RAIL_TOOLS.filter((tool) => ['hand', 'marker', 'fill', 'line', 'arrow'].includes(tool.id));
+const MOBILE_MORE_TOOLS = RAIL_TOOLS.filter((tool) => ['hand', 'marker', 'eraser', 'fill', 'line', 'arrow'].includes(tool.id));
 const SHAPE_TOOLS = TOOLS.filter((tool): tool is { id: ClosedShapeTool; label: string; key: string } => ['rectangle', 'roundedRectangle', 'ellipse', 'triangle', 'trapezoid', 'diamond', 'star', 'bubble'].includes(tool.id));
 const TEXT_TOOL = TOOLS.find((tool) => tool.id === 'text')!;
 
@@ -783,8 +783,11 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
   const viewportRef = useRef<HTMLDivElement>(null);
   const dialogRef = useRef<HTMLElement>(null);
   const shapeButtonRef = useRef<HTMLButtonElement>(null);
+  const addToolsButtonRef = useRef<HTMLButtonElement>(null);
+  const addToolsSheetRef = useRef<HTMLElement>(null);
   const moreToolsButtonRef = useRef<HTMLButtonElement>(null);
   const moreToolsSheetRef = useRef<HTMLElement>(null);
+  const captionInputRef = useRef<HTMLInputElement>(null);
   const mobileInspectorTriggerRef = useRef<HTMLButtonElement | null>(null);
   const mixerToggleRef = useRef<HTMLButtonElement>(null);
   const mixerIdRef = useRef(4);
@@ -812,8 +815,10 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
   const [tool, setTool] = useState<Tool>('pen');
   const [selectedShape, setSelectedShape] = useState<ClosedShapeTool>('rectangle');
   const [shapeMenuOpen, setShapeMenuOpen] = useState(false);
+  const [addToolsOpen, setAddToolsOpen] = useState(false);
   const [moreToolsOpen, setMoreToolsOpen] = useState(false);
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
+  const [captionOpen, setCaptionOpen] = useState(false);
   const [shapeMenuPosition, setShapeMenuPosition] = useState({ left: 0, top: 0 });
   const [color, setColor] = useState('#6f4ee8');
   const [toolSizes, setToolSizes] = useState<Record<SizedTool, number>>(INITIAL_TOOL_SIZES);
@@ -868,6 +873,7 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
         if (cancelled || !draft || !Array.isArray(draft.scene?.actions)) return;
         setHistory({ past: [], present: draft.scene, future: [] });
         setCaption(draft.caption);
+        if (draft.caption) setCaptionOpen(true);
         setDraftStatus('restored');
         setHint(t('Draft restored'));
       })
@@ -1524,20 +1530,22 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
   };
 
   const shapeTrigger = useCallback(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 720px)').matches
-    ? moreToolsButtonRef.current
+    ? addToolsButtonRef.current
     : shapeButtonRef.current, []);
 
   const focusShapeTrigger = useCallback(() => shapeTrigger()?.focus(), [shapeTrigger]);
 
   const selectTool = (nextTool: Tool) => {
     const restoreShapeFocus = shapeMenuOpen;
-    const moveFocusToCanvas = moreToolsOpen;
-    const openMobileProperties = moreToolsOpen
+    const mobileToolSheetOpen = moreToolsOpen || addToolsOpen;
+    const moveFocusToCanvas = mobileToolSheetOpen;
+    const openMobileProperties = mobileToolSheetOpen
       && typeof window !== 'undefined'
       && window.matchMedia('(max-width: 720px)').matches
       && nextTool !== 'hand';
-    if (openMobileProperties) mobileInspectorTriggerRef.current = moreToolsButtonRef.current;
+    if (openMobileProperties) mobileInspectorTriggerRef.current = addToolsOpen ? addToolsButtonRef.current : moreToolsButtonRef.current;
     setShapeMenuOpen(false);
+    setAddToolsOpen(false);
     setMoreToolsOpen(false);
     setMobileInspectorOpen(openMobileProperties);
     setTool(nextTool);
@@ -1568,6 +1576,7 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
 
   const toggleMoreTools = () => {
     setShapeMenuOpen(false);
+    setAddToolsOpen(false);
     if (moreToolsOpen) {
       setMoreToolsOpen(false);
       return;
@@ -1575,11 +1584,27 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
     setMoreToolsOpen(true);
   };
 
+  const toggleAddTools = () => {
+    setShapeMenuOpen(false);
+    setMoreToolsOpen(false);
+    if (addToolsOpen) {
+      setAddToolsOpen(false);
+      return;
+    }
+    setAddToolsOpen(true);
+  };
+
   useEffect(() => {
     if (!moreToolsOpen) return;
     const frame = requestAnimationFrame(() => moreToolsSheetRef.current?.querySelector<HTMLButtonElement>('[data-more-tool]')?.focus());
     return () => cancelAnimationFrame(frame);
   }, [moreToolsOpen]);
+
+  useEffect(() => {
+    if (!addToolsOpen) return;
+    const frame = requestAnimationFrame(() => addToolsSheetRef.current?.querySelector<HTMLButtonElement>('[data-add-tool]')?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [addToolsOpen]);
 
   useEffect(() => {
     if (!mobileInspectorOpen) return;
@@ -1590,7 +1615,11 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
   useEffect(() => {
     const desktop = window.matchMedia('(min-width: 721px)');
     const leaveMobileSheetMode = () => {
-      if (desktop.matches) setMobileInspectorOpen(false);
+      if (desktop.matches) {
+        setAddToolsOpen(false);
+        setMoreToolsOpen(false);
+        setMobileInspectorOpen(false);
+      }
     };
     leaveMobileSheetMode();
     desktop.addEventListener('change', leaveMobileSheetMode);
@@ -1670,6 +1699,12 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
       return;
     }
+    if (event.key === 'Escape' && addToolsOpen) {
+      event.preventDefault();
+      setAddToolsOpen(false);
+      addToolsButtonRef.current?.focus();
+      return;
+    }
     if (event.key === 'Escape' && moreToolsOpen) {
       event.preventDefault();
       setMoreToolsOpen(false);
@@ -1685,6 +1720,12 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
       event.preventDefault();
       setShapeMenuOpen(false);
       focusShapeTrigger();
+      return;
+    }
+    if (event.key === 'Escape' && captionOpen && typeof window !== 'undefined' && window.matchMedia('(max-width: 720px)').matches) {
+      event.preventDefault();
+      setCaptionOpen(false);
+      addToolsButtonRef.current?.focus();
       return;
     }
     if (event.key === 'Escape') { requestClose(); return; }
@@ -1728,8 +1769,8 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
       <section ref={dialogRef} className="studio advanced-studio" role="dialog" aria-modal="true" aria-labelledby="studio-title" onKeyDown={onKeyDown} tabIndex={-1}>
         <header className="studio-header advanced-studio-header" inert={mobileInspectorOpen ? true : undefined}>
           <button type="button" className="plain-button" onClick={requestClose} disabled={paletteMutating} data-studio-initial-focus>{t('Close')} <kbd>Esc</kbd></button>
-          <div><small className={sourceUrl ? 'studio-source-label' : ''}>{sourceIsDraft ? t('Starting from your first mark') : sourceUrl ? t('Continuing version {version}', { version: version ?? 1 }) : 'Canvas 1200 × 720'}</small><h2 id="studio-title">Nét Studio</h2></div>
-          <button type="button" className="primary-button studio-header-send" onClick={() => void send()} disabled={!canSendCanvas || paletteMutating || sending || sourceLoading || sourceError} title={!canSendCanvas ? t('Draw at least one mark or choose a paper before sending') : undefined}>{sendLabel}</button>
+          <div><small className={sourceUrl ? 'studio-source-label' : ''}>{sourceIsDraft ? t('Starting from your first mark') : sourceUrl ? t('Continuing version {version}', { version: version ?? 1 }) : 'Canvas 1200 × 720'}</small><h2 id="studio-title">Nét Studio{sourceUrl ? <span className="mobile-version-label"> · V{version ?? 1}</span> : null}</h2></div>
+          <button type="button" className="primary-button studio-header-send" onClick={() => void send()} disabled={!canSendCanvas || paletteMutating || sending || sourceLoading || sourceError} title={!canSendCanvas ? t('Draw at least one mark or choose a paper before sending') : undefined}><span className="desktop-send-label">{sendLabel}</span><span className="mobile-send-label">{sending ? t('Sending…') : t('Send')}</span></button>
         </header>
 
         <div className="studio-workspace">
@@ -1740,15 +1781,28 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
               <button type="button" className={tool === 'text' ? 'tool-button active' : 'tool-button'} data-tool-id="text" onClick={() => selectTool('text')} title={t('{tool} — key {key}', { tool: t(TEXT_TOOL.label), key: TEXT_TOOL.key })} aria-label={`${t(TEXT_TOOL.label)} (${TEXT_TOOL.key})`} aria-pressed={tool === 'text'}><b><ToolIcon tool="text" /></b><span className="desktop-tool-label">{t(TEXT_TOOL.label)}</span><span className="mobile-tool-label">{t('Text')}</span></button>
               <button type="button" className="tool-button mobile-color-tool" onClick={(event) => { if (mobileInspectorOpen) closeMobileInspector(); else { mobileInspectorTriggerRef.current = event.currentTarget; setMobileInspectorOpen(true); } }} aria-label={t('Color and tool settings')} aria-expanded={mobileInspectorOpen} aria-controls="tool-properties"><b><i style={{ background: color }} /></b><span className="mobile-tool-label">{t('Color')}</span></button>
               <button type="button" className="tool-button mobile-undo-tool" onClick={undo} disabled={!history.past.length} aria-label={t('Undo')}><b>↶</b><span className="mobile-tool-label">{t('Undo')}</span></button>
-              <button type="button" ref={moreToolsButtonRef} className={MORE_TOOLS.some((item) => item.id === tool) ? 'tool-button more-tools-button active' : 'tool-button more-tools-button'} onClick={toggleMoreTools} aria-label={t('More tools')} aria-haspopup="dialog" aria-expanded={moreToolsOpen} aria-controls="more-tools-sheet"><b><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true"><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></svg></b><span className="mobile-tool-label">{t('More')}</span></button>
+              <button type="button" ref={addToolsButtonRef} className={addToolsOpen || closedShapeTool || tool === 'text' ? 'tool-button add-tools-button active' : 'tool-button add-tools-button'} onClick={toggleAddTools} aria-label={t('Add to canvas')} aria-haspopup="dialog" aria-expanded={addToolsOpen} aria-controls="add-tools-sheet"><b><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg></b><span className="mobile-tool-label">{t('Add')}</span></button>
+              <button type="button" ref={moreToolsButtonRef} className={MOBILE_MORE_TOOLS.some((item) => item.id === tool) ? 'tool-button more-tools-button active' : 'tool-button more-tools-button'} onClick={toggleMoreTools} aria-label={t('More tools')} aria-haspopup="dialog" aria-expanded={moreToolsOpen} aria-controls="more-tools-sheet"><b><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true"><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></svg></b><span className="mobile-tool-label">{t('More')}</span></button>
             </aside>
           </div>
+
+          {addToolsOpen ? <>
+            <div className="more-tools-dismiss" aria-hidden="true" onPointerDown={() => { setAddToolsOpen(false); addToolsButtonRef.current?.focus(); }} />
+            <section ref={addToolsSheetRef} id="add-tools-sheet" className="more-tools-sheet add-tools-sheet" role="dialog" aria-modal="false" aria-labelledby="add-tools-title">
+              <header><div><small>Nét Studio</small><strong id="add-tools-title">{t('Add to Canvas')}</strong></div><button type="button" onClick={() => { setAddToolsOpen(false); addToolsButtonRef.current?.focus(); }} aria-label={t('Close add menu')}>×</button></header>
+              <div>
+                <button type="button" data-add-tool className={closedShapeTool ? 'active' : ''} onClick={() => { setAddToolsOpen(false); requestAnimationFrame(toggleShapeMenu); }} aria-label={t('Choose a Shape')}><ToolIcon tool={selectedShape} /><span><strong>{t('Shapes')}</strong><small>{t(activeShape.label)}</small></span></button>
+                <button type="button" data-add-tool className={tool === 'text' ? 'active' : ''} onClick={() => selectTool('text')} aria-label={t('Text')}><ToolIcon tool="text" /><span><strong>{t('Text')}</strong><small>{t('Place movable text')}</small></span></button>
+                <button type="button" data-add-tool className={captionOpen ? 'active' : ''} onClick={() => { setAddToolsOpen(false); setCaptionOpen(true); requestAnimationFrame(() => captionInputRef.current?.focus()); }} aria-label={t('Add a message')}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" /></svg><span><strong>{t('Message')}</strong><small>{t('Add context before sending')}</small></span></button>
+              </div>
+            </section>
+          </> : null}
 
           {moreToolsOpen ? <>
             <div className="more-tools-dismiss" aria-hidden="true" onPointerDown={() => { setMoreToolsOpen(false); moreToolsButtonRef.current?.focus(); }} />
             <section ref={moreToolsSheetRef} id="more-tools-sheet" className="more-tools-sheet" role="dialog" aria-modal="false" aria-labelledby="more-tools-title">
               <header><div><small>Nét Studio</small><strong id="more-tools-title">{t('More Tools')}</strong></div><button type="button" onClick={() => { setMoreToolsOpen(false); moreToolsButtonRef.current?.focus(); }} aria-label={t('Close more tools')}>×</button></header>
-              <div>{MOBILE_MORE_TOOLS.map((item) => <button type="button" key={item.id} data-more-tool className={tool === item.id ? 'active' : ''} onClick={() => selectTool(item.id)} aria-label={`${t(item.label)} (${item.key})`} aria-pressed={tool === item.id}><ToolIcon tool={item.id} /><span><strong>{t(item.label)}</strong><small>{t('Key {key}', { key: item.key })}</small></span></button>)}<button type="button" data-more-tool className={closedShapeTool ? 'active' : ''} onClick={() => { setMoreToolsOpen(false); requestAnimationFrame(toggleShapeMenu); }} aria-label={t('Choose a Shape')}><ToolIcon tool={selectedShape} /><span><strong>{t('Shapes')}</strong><small>{t(activeShape.label)}</small></span></button><button type="button" data-more-tool className={tool === 'text' ? 'active' : ''} onClick={() => selectTool('text')} aria-label={t('Text')}><ToolIcon tool="text" /><span><strong>{t('Text')}</strong><small>{t('Place movable text')}</small></span></button></div>
+              <div>{MOBILE_MORE_TOOLS.map((item) => <button type="button" key={item.id} data-more-tool className={tool === item.id ? 'active' : ''} onClick={() => selectTool(item.id)} aria-label={`${t(item.label)} (${item.key})`} aria-pressed={tool === item.id}><ToolIcon tool={item.id} /><span><strong>{t(item.label)}</strong><small>{t('Key {key}', { key: item.key })}</small></span></button>)}<button type="button" data-more-tool onClick={() => { redo(); setMoreToolsOpen(false); requestAnimationFrame(() => canvasRef.current?.focus()); }} disabled={!history.future.length} aria-label={t('Redo')}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M20 7v6h-6" /><path d="M20 13a8 8 0 1 0-2.3 5.7" /></svg><span><strong>{t('Redo')}</strong><small>Shift⌘Z</small></span></button><button type="button" data-more-tool onClick={() => { clear(); setMoreToolsOpen(false); requestAnimationFrame(() => canvasRef.current?.focus()); }} disabled={!actions.length} aria-label={t('Clear new marks')}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13" /></svg><span><strong>{t('Clear')}</strong><small>{t('New marks only')}</small></span></button></div>
             </section>
           </> : null}
 
@@ -1769,13 +1823,14 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
             </div>
             <div ref={viewportRef} className="canvas-viewport" style={zoomStyle}>
               <div className="canvas-board">
-                <canvas ref={canvasRef} width={CANVAS_WIDTH} height={CANVAS_HEIGHT} onPointerDown={begin} onPointerEnter={updateEraserCursor} onPointerMove={move} onPointerLeave={hideEraserCursor} onPointerUp={finish} onPointerCancel={cancelStroke} aria-label={t('Advanced drawing area')} aria-disabled={sending || sourceLoading || sourceError} data-tool={tool} data-text-selected={Boolean(selectedTextId)} data-sending={sending} tabIndex={0}>{t('Canvas supports mouse, stylus, and touch input.')}</canvas>
+                <canvas ref={canvasRef} width={CANVAS_WIDTH} height={CANVAS_HEIGHT} onPointerDown={begin} onPointerEnter={updateEraserCursor} onPointerMove={move} onPointerLeave={hideEraserCursor} onPointerUp={finish} onPointerCancel={cancelStroke} aria-label={t('Advanced drawing area')} aria-describedby="canvas-gesture-description" aria-disabled={sending || sourceLoading || sourceError} data-tool={tool} data-text-selected={Boolean(selectedTextId)} data-sending={sending} tabIndex={0}>{t('Canvas supports mouse, stylus, and touch input.')}</canvas>
+                <span id="canvas-gesture-description" className="sr-only">{t('One finger draws · two fingers zoom and pan')}</span>
                 <span ref={eraserCursorRef} className="eraser-size-cursor" data-visible="false" aria-hidden="true" />
                 {sourceLoading ? <span className="canvas-loading">{t('Loading the original to continue drawing…')}</span> : null}
                 {sourceError ? <span className="canvas-loading canvas-error">{t('The original could not be loaded. Close Studio and try again.')}</span> : null}
               </div>
             </div>
-            <div className="canvas-status"><span role="status" aria-live="polite"><i /> {hint}{draftStatus !== 'idle' ? <b className="draft-status"> · {draftStatus === 'saving' ? t('Saving draft…') : draftStatus === 'restored' ? t('Draft restored') : t('Draft saved')}</b> : null}</span><span className="canvas-shortcuts">⌘Z {t('undo')} · Shift⌘Z {t('redo')}</span><span className="canvas-gesture-help">{t('One finger draws · two fingers zoom and pan')}</span></div>
+            <div className="canvas-status"><span role="status" aria-live="polite"><i /> {draftStatus !== 'idle' ? <b className="draft-status">{draftStatus === 'saving' ? t('Saving draft…') : draftStatus === 'restored' ? t('Draft restored') : t('Saved on this device')}</b> : hint}</span><span className="canvas-shortcuts">⌘Z {t('undo')} · Shift⌘Z {t('redo')}</span><span className="canvas-gesture-help">{t('One finger draws · two fingers zoom and pan')}</span></div>
           </div>
 
           {mobileInspectorOpen && <button type="button" tabIndex={-1} className="mobile-inspector-dismiss" onClick={closeMobileInspector} aria-label={t('Close tool settings')} />}
@@ -1847,7 +1902,7 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
           </aside>
         </div>
 
-        <footer className="studio-footer" inert={mobileInspectorOpen ? true : undefined}><label><span>{t('Message')}</span><input name="drawing-caption" autoComplete="off" value={caption} onChange={(event) => setCaption(event.target.value)} placeholder={t('Add context for this drawing…')} maxLength={2000} aria-label={t('Drawing message')} /></label><div><span>{sourceUrl && !sourceIsDraft ? `${t('Original remains unchanged')} · ` : ''}PNG 1200 × 720</span><button type="button" className="primary-button" onClick={() => void send()} disabled={!canSendCanvas || paletteMutating || sending || sourceLoading || sourceError} title={!canSendCanvas ? t('Draw at least one mark or choose a paper before sending') : undefined}>{sendLabel}</button>{!canSendCanvas ? <small className="studio-send-help">{t('Draw or add text to enable Send')}</small> : null}</div></footer>
+        <footer className={captionOpen ? 'studio-footer mobile-open' : 'studio-footer'} inert={mobileInspectorOpen ? true : undefined}><label><span>{t('Message')}</span><input ref={captionInputRef} name="drawing-caption" autoComplete="off" value={caption} onChange={(event) => setCaption(event.target.value)} placeholder={t('Add context for this drawing…')} maxLength={2000} aria-label={t('Drawing message')} /></label><button type="button" className="mobile-caption-close" onClick={() => { setCaptionOpen(false); addToolsButtonRef.current?.focus(); }} aria-label={t('Close message composer')}>×</button><div><span>{sourceUrl && !sourceIsDraft ? `${t('Original remains unchanged')} · ` : ''}PNG 1200 × 720</span><button type="button" className="primary-button" onClick={() => void send()} disabled={!canSendCanvas || paletteMutating || sending || sourceLoading || sourceError} title={!canSendCanvas ? t('Draw at least one mark or choose a paper before sending') : undefined}>{sendLabel}</button>{!canSendCanvas ? <small className="studio-send-help">{t('Draw or add text to enable Send')}</small> : null}</div></footer>
       </section>
       <AppDialog open={Boolean(paletteDeleteTarget)} onClose={() => setPaletteDeleteTarget(null)} labelledBy="delete-palette-title" describedBy="delete-palette-description" className="confirmation-backdrop">
         <section className="dialog-card confirmation-dialog">

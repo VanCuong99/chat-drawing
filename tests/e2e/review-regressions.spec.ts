@@ -116,6 +116,100 @@ test('lỗi bootstrap tạm thời giữ nguyên guest credential và cho phép 
   }
 });
 
+test('tạo guest thành công nhưng bootstrap lỗi vẫn giữ modal và nét vẽ để thử lại @critical', async ({ page, request }) => {
+  const firstMark = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+Av7rWQAAAABJRU5ErkJggg==';
+  await page.addInitScript((mark) => sessionStorage.setItem('net_pending_landing_sketch', mark), firstMark);
+
+  let guestCreates = 0;
+  let bootstrapRequests = 0;
+  let sessionId: string | null = null;
+  page.on('request', (pageRequest) => {
+    if (pageRequest.method() === 'POST' && new URL(pageRequest.url()).pathname === '/api/guest') guestCreates += 1;
+  });
+  await page.route('**/api/bootstrap', async (route) => {
+    bootstrapRequests += 1;
+    if (bootstrapRequests === 1) {
+      await route.continue();
+      return;
+    }
+    if (bootstrapRequests === 2) {
+      await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Bảo trì ngắn' }) });
+      return;
+    }
+    await route.continue();
+  });
+
+  try {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Bạn muốn được gọi là gì?' });
+    await expect(dialog).toBeVisible();
+    await expect(dialog.locator('.guest-mark-preview')).toBeVisible();
+    await dialog.getByRole('textbox', { name: 'Tên hiển thị' }).fill('Nét đầu tiên');
+    await dialog.getByRole('button', { name: 'Vào Nét' }).click();
+
+    await expect(dialog).toBeVisible();
+    await expect(dialog.locator('.guest-recovery')).toBeVisible();
+    sessionId = await page.evaluate(() => sessionStorage.getItem('net_guest_session'));
+    expect(sessionId).toBeTruthy();
+    await expect(page.evaluate(() => sessionStorage.getItem('net_pending_landing_sketch'))).resolves.toBe(firstMark);
+
+    await dialog.getByRole('button', { name: 'Thử lại' }).click();
+    await expect(page.getByRole('dialog', { name: 'Nét Studio' })).toBeVisible();
+    expect(guestCreates).toBe(1);
+    await expect(page.evaluate(() => sessionStorage.getItem('net_pending_landing_sketch'))).resolves.toBeNull();
+  } finally {
+    if (sessionId) await request.delete(`${API_URL}/guest`, { headers: { 'x-net-guest-session': sessionId } });
+  }
+});
+
+test('bootstrap 401 loại session hết hạn rồi tạo guest mới mà không mất nét đầu tiên @critical', async ({ page, request }) => {
+  const firstMark = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+Av7rWQAAAABJRU5ErkJggg==';
+  await page.addInitScript((mark) => sessionStorage.setItem('net_pending_landing_sketch', mark), firstMark);
+
+  const createdSessionIds: string[] = [];
+  let bootstrapRequests = 0;
+  await page.route('**/api/guest', async (route) => {
+    if (route.request().method() !== 'POST' || new URL(route.request().url()).pathname !== '/api/guest') {
+      await route.continue();
+      return;
+    }
+    const response = await route.fetch();
+    const body = await response.json() as { sessionId: string };
+    createdSessionIds.push(body.sessionId);
+    await route.fulfill({ response });
+  });
+  await page.route('**/api/bootstrap', async (route) => {
+    bootstrapRequests += 1;
+    if (bootstrapRequests === 2) {
+      await route.fulfill({ status: 401, contentType: 'application/json', body: JSON.stringify({ error: 'Guest session expired' }) });
+      return;
+    }
+    await route.continue();
+  });
+
+  try {
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Bạn muốn được gọi là gì?' });
+    await dialog.getByRole('textbox', { name: 'Tên hiển thị' }).fill('Nét hồi phục');
+    await dialog.getByRole('button', { name: 'Vào Nét' }).click();
+
+    await expect(dialog.locator('.guest-recovery')).toContainText('nét vẽ đầu tiên của bạn vẫn còn đây');
+    await expect(page.evaluate(() => sessionStorage.getItem('net_guest_session'))).resolves.toBeNull();
+    await expect(page.evaluate(() => sessionStorage.getItem('net_pending_landing_sketch'))).resolves.toBe(firstMark);
+    expect(createdSessionIds).toHaveLength(1);
+
+    await dialog.getByRole('button', { name: 'Thử lại' }).click();
+    await expect(page.getByRole('dialog', { name: 'Nét Studio' })).toBeVisible();
+    expect(createdSessionIds).toHaveLength(2);
+    expect(createdSessionIds[1]).not.toBe(createdSessionIds[0]);
+    await expect(page.evaluate(() => sessionStorage.getItem('net_pending_landing_sketch'))).resolves.toBeNull();
+  } finally {
+    await Promise.all(createdSessionIds.map((sessionId) => request.delete(`${API_URL}/guest`, { headers: { 'x-net-guest-session': sessionId } })));
+  }
+});
+
 test('link đăng nhập giữ nguyên mã mời trong returnTo @critical', async ({ page }) => {
   const inviteCode = 'reviewInvite2026';
   await page.route(`**/api/invites/${inviteCode}`, (route) => route.fulfill({ json: { valid: true, guestAllowed: true } }));
@@ -369,12 +463,25 @@ test('Studio mobile ưu tiên canvas và chỉ giữ dock năm công cụ chính
   const studio = page.getByRole('dialog', { name: 'Nét Studio' });
   await expect(studio).toBeVisible();
   await expect(studio.locator('.tool-rail button:visible')).toHaveCount(5);
+  for (const name of ['Bút chì (P)', 'Màu và cài đặt công cụ', 'Hoàn tác', 'Thêm vào canvas', 'Công cụ khác']) {
+    await expect(studio.locator('.tool-rail').getByRole('button', { name, exact: true })).toBeVisible();
+  }
+  await expect(studio.locator('.studio-header').getByRole('button', { name: 'Gửi', exact: true })).toBeVisible();
   const workspaceBox = await studio.locator('.studio-workspace').boundingBox();
   const canvasBox = await studio.locator('.canvas-panel').boundingBox();
   const drawableBox = await studio.getByLabel('Vùng vẽ nâng cao').boundingBox();
-  expect(workspaceBox && canvasBox ? canvasBox.height / workspaceBox.height : 0).toBeGreaterThan(0.78);
+  const headerBox = await studio.locator('.studio-header').boundingBox();
+  const dockBox = await studio.locator('.tool-rail').boundingBox();
+  expect(workspaceBox && canvasBox ? canvasBox.height / workspaceBox.height : 0).toBeGreaterThan(0.84);
   expect(canvasBox && drawableBox ? drawableBox.width / canvasBox.width : 0).toBeGreaterThan(0.9);
   expect(workspaceBox && drawableBox ? drawableBox.height / workspaceBox.height : 0).toBeGreaterThan(0.25);
+  expect(headerBox && canvasBox ? canvasBox.y >= headerBox.y + headerBox.height : false).toBe(true);
+  await expect.poll(async () => {
+    const settledCanvasBox = await studio.locator('.canvas-panel').boundingBox();
+    const settledDockBox = await studio.locator('.tool-rail').boundingBox();
+    return settledCanvasBox && settledDockBox ? settledCanvasBox.y + settledCanvasBox.height <= settledDockBox.y : false;
+  }).toBe(true);
+  expect(await studio.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
   await expect(studio.locator('.tool-inspector')).not.toBeVisible();
   await studio.getByRole('button', { name: 'Màu và cài đặt công cụ' }).click();
   const toolDialog = studio.getByRole('dialog', { name: 'Cài đặt công cụ' });
@@ -396,15 +503,15 @@ test('Studio mobile ưu tiên canvas và chỉ giữ dock năm công cụ chính
   await page.mouse.down();
   await page.mouse.move(drawingBox.x + 150, drawingBox.y + 120, { steps: 8 });
   await page.mouse.up();
-  await expect(studio.getByText('1 thao tác')).toBeVisible();
-  await expect(studio.getByText(/Đã lưu bản nháp/)).toBeVisible();
+  await expect(studio.getByText(/Đã lưu trên thiết bị này/)).toBeVisible();
   page.once('dialog', (dialog) => dialog.accept());
   await studio.locator('.studio-header').getByRole('button', { name: /Đóng/ }).click();
   await expect(studio).toBeHidden();
   await page.locator('.composer-modes').getByRole('button', { name: 'Vẽ' }).click();
   const restoredStudio = page.getByRole('dialog', { name: 'Nét Studio' });
   await expect(restoredStudio.getByText(/Đã khôi phục bản nháp/)).toBeVisible();
-  await expect(restoredStudio.getByText('1 thao tác')).toBeVisible();
+  await restoredStudio.getByRole('button', { name: 'Công cụ khác' }).click();
+  await expect(restoredStudio.getByRole('dialog', { name: 'Công cụ khác' }).getByRole('button', { name: 'Xoá các nét mới' })).toBeEnabled();
 });
 
 test('Studio pinch-to-zoom và pan hai ngón không tạo nét ngoài ý muốn @critical', async ({ page, context }) => {
@@ -422,7 +529,8 @@ test('Studio pinch-to-zoom và pan hai ngón không tạo nét ngoài ý muốn 
   const studio = page.getByRole('dialog', { name: 'Nét Studio' });
   const canvas = studio.getByLabel('Vùng vẽ nâng cao');
   const viewport = studio.locator('.canvas-viewport');
-  await expect(studio.getByText('Một ngón vẽ · hai ngón thu phóng và di chuyển')).toBeVisible();
+  await expect(canvas).toHaveAttribute('aria-describedby', 'canvas-gesture-description');
+  await expect(studio.locator('#canvas-gesture-description')).toContainText('Một ngón vẽ · hai ngón thu phóng và di chuyển');
   const viewportBox = await viewport.boundingBox();
   if (!viewportBox) throw new Error('Không đo được viewport canvas cho gesture.');
   const center = { x: viewportBox.x + viewportBox.width / 2, y: viewportBox.y + viewportBox.height / 2 };
@@ -446,7 +554,7 @@ test('Studio pinch-to-zoom và pan hai ngón không tạo nét ngoài ý muốn 
   await dispatchTouch('touchEnd', []);
 
   await expect(studio.getByLabel('Mức phóng đại')).toHaveText('175%');
-  await expect(studio.getByText('0 thao tác')).toBeVisible();
+  await expect(studio.getByRole('button', { name: 'Hoàn tác' })).toBeDisabled();
   const scrollAfterZoom = await viewport.evaluate((element) => element.scrollLeft);
   expect(scrollAfterZoom).toBeGreaterThan(0);
 
@@ -460,7 +568,7 @@ test('Studio pinch-to-zoom và pan hai ngón không tạo nét ngoài ý muốn 
   ]);
   await dispatchTouch('touchEnd', []);
   await expect.poll(() => viewport.evaluate((element) => element.scrollLeft)).toBeGreaterThan(scrollAfterZoom + 20);
-  await expect(studio.getByText('0 thao tác')).toBeVisible();
+  await expect(studio.getByRole('button', { name: 'Hoàn tác' })).toBeDisabled();
 
   const visibleCanvasBox = await canvas.boundingBox();
   if (!visibleCanvasBox) throw new Error('Không đo được canvas sau gesture.');
@@ -471,7 +579,7 @@ test('Studio pinch-to-zoom và pan hai ngón không tạo nét ngoài ý muốn 
   await dispatchTouch('touchStart', [{ id: 5, ...strokeStart }]);
   await dispatchTouch('touchMove', [{ id: 5, x: strokeStart.x + 45, y: strokeStart.y + 28 }]);
   await dispatchTouch('touchEnd', []);
-  await expect(studio.getByText('1 thao tác')).toBeVisible();
+  await expect(studio.getByRole('button', { name: 'Hoàn tác' })).toBeEnabled();
   await client.detach();
 });
 
@@ -572,8 +680,7 @@ test('lịch sử bản vẽ cho phép so sánh và tiếp tục từ bất kỳ
   await expect(dialog.getByRole('combobox', { name: 'Bản so sánh B' })).toHaveValue('canvas-v1');
   await expect(dialog.getByRole('button', { name: /Vẽ tiếp từ phiên bản 1/ })).toBeVisible();
   await dialog.getByRole('button', { name: /Vẽ tiếp từ phiên bản 1/ }).click();
-  await expect(page.getByRole('dialog', { name: 'Nét Studio' })).toBeVisible();
-  await expect(page.getByText('Tiếp nối phiên bản 1')).toBeVisible();
+  await expect(page.getByRole('dialog', { name: /Nét Studio · V1/ })).toBeVisible();
 });
 
 test.describe('tải ảnh theo múi giờ của người dùng', () => {

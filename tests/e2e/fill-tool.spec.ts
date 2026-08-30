@@ -206,13 +206,12 @@ test('paint bucket fills a closed region in one tap, supports undo, and remains 
     mobileCanvasBox!.x + center.x / CANVAS_WIDTH * mobileCanvasBox!.width,
     mobileCanvasBox!.y + center.y / CANVAS_HEIGHT * mobileCanvasBox!.height,
   );
-  await expect(studio.getByText('2 actions')).toBeVisible();
+  await expect(studio.getByRole('button', { name: 'Undo' })).toBeEnabled();
   await expect.poll(async () => {
     const [red, green, blue, alpha] = await readCanvasPixel(canvas, center);
     return { red, green, blue, alpha };
   }).toEqual({ red: 183, green: 166, blue: 241, alpha: 255 });
   await expect.poll(async () => readCanvasPixel(canvas, { x: 60, y: 60 })).toEqual([255, 254, 251, 255]);
-  await expect(studio.getByText(/tolerance 36/)).toBeVisible();
 
 });
 

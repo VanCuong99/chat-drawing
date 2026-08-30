@@ -72,6 +72,8 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     expect((await bobReadReceipt).status()).toBe(200);
     await expect(aliceArticle).toContainText('Đã đọc');
 
+    await aliceOnBob.locator('.message-content').hover();
+    await expect(aliceOnBob.locator('.message-tools')).toHaveCSS('pointer-events', 'auto');
     await aliceOnBob.getByRole('button', { name: /Trả lời/ }).click();
     const fromBob = `Bob trả lời Alice ${stamp}`;
     const bobArticle = await sendText(pageB, fromBob);
@@ -79,6 +81,8 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     const bobOnAlice = pageA.getByRole('article').filter({ hasText: fromBob });
     await expect(bobOnAlice).toBeVisible();
     await expect(bobArticle).toContainText('Đã đọc');
+    await bobOnAlice.locator('.message-content').hover();
+    await expect(bobOnAlice.locator('.message-tools')).toHaveCSS('pointer-events', 'auto');
     await bobOnAlice.getByRole('button', { name: 'Thả cảm xúc ❤️' }).click();
     await expect(bobArticle.locator('.reaction-list').getByRole('button', { name: /❤️.*1/ })).toBeVisible();
     await expect(bobOnAlice.locator('.reaction-list').getByRole('button', { name: /❤️.*1/ })).toBeVisible();

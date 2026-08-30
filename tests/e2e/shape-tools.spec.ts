@@ -66,9 +66,9 @@ test('bộ chọn hình mở cạnh toolbar và vẽ được hình thang @criti
   await expect(page.getByText('Hình thang').first()).toBeVisible();
 
   await page.setViewportSize({ width: 390, height: 844 });
-  const moreToolsButton = page.getByRole('button', { name: 'Công cụ khác' });
-  await moreToolsButton.click();
-  await page.getByRole('dialog', { name: 'Công cụ khác' }).getByRole('button', { name: 'Chọn hình dạng' }).click();
+  const addToolsButton = page.getByRole('button', { name: 'Thêm vào canvas' });
+  await addToolsButton.click();
+  await page.getByRole('dialog', { name: 'Thêm vào Canvas' }).getByRole('button', { name: 'Chọn hình dạng' }).click();
   const mobilePickerBounds = await picker.boundingBox();
   expect(mobilePickerBounds).not.toBeNull();
   expect(mobilePickerBounds!.x).toBeGreaterThanOrEqual(8);
@@ -77,11 +77,11 @@ test('bộ chọn hình mở cạnh toolbar và vẽ được hình thang @criti
   expect(mobilePickerBounds!.y + mobilePickerBounds!.height).toBeLessThanOrEqual(836);
   await page.keyboard.press('Escape');
   await expect(picker).toBeHidden();
-  await expect(moreToolsButton).toBeFocused();
+  await expect(addToolsButton).toBeFocused();
 
   await page.setViewportSize({ width: 667, height: 375 });
-  await moreToolsButton.click();
-  await page.getByRole('dialog', { name: 'Công cụ khác' }).getByRole('button', { name: 'Chọn hình dạng' }).click();
+  await addToolsButton.click();
+  await page.getByRole('dialog', { name: 'Thêm vào Canvas' }).getByRole('button', { name: 'Chọn hình dạng' }).click();
   const landscapePickerBounds = await picker.boundingBox();
   expect(landscapePickerBounds).not.toBeNull();
   expect(landscapePickerBounds!.x).toBeGreaterThanOrEqual(8);

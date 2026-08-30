@@ -12,6 +12,7 @@ import {
   useRef,
   useState,
 } from 'react';
+import Image from 'next/image';
 import type { ActorView, CanvasLineageItem, MessageView, PaletteColorView, RoomView, UserSummary } from '@/src/shared/chat.types';
 import { io, type Socket } from 'socket.io-client';
 import AppDialog from '@/src/shared/app-dialog';
@@ -39,8 +40,18 @@ type InvitePreview = {
 type InstallPromptEvent = Event & { prompt: () => Promise<void>; userChoice: Promise<{ outcome: string }> };
 
 class ApiRequestError extends Error {
-  constructor(public status: number, message: string) { super(message); }
+  constructor(public status: number, message: string, public requestId: string | null = null) {
+    super(message);
+    this.name = 'ApiRequestError';
+  }
 }
+
+type GuestRecovery = {
+  message: string;
+  requestId: string | null;
+};
+
+const API_REQUEST_ORIGIN = (process.env.NEXT_PUBLIC_API_REQUEST_URL ?? '').replace(/\/$/, '');
 
 const EMOJIS = ['❤️', '👍', '✨', '😂', '👀'];
 
@@ -168,6 +179,38 @@ function InviteContext({ preview }: { preview: InvitePreview | null }) {
   );
 }
 
+function GuestRecoveryPanel({ recovery, hasDrawing, onKeepDrawing }: {
+  recovery: GuestRecovery;
+  hasDrawing: boolean;
+  onKeepDrawing?: () => void;
+}) {
+  const { t } = useLanguage();
+  const [copied, setCopied] = useState(false);
+
+  const copySupportCode = async () => {
+    if (!recovery.requestId) return;
+    try {
+      await navigator.clipboard.writeText(recovery.requestId);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <section className="guest-recovery" aria-labelledby="guest-recovery-title">
+      <div>
+        <strong id="guest-recovery-title" role="alert">{recovery.message}</strong>
+        <p>{hasDrawing
+          ? t('Your name and first mark are still here. Nothing has been discarded.')
+          : t('Your name and invitation are still here. Nothing has been discarded.')}</p>
+      </div>
+      {recovery.requestId ? <div className="support-code"><span>{t('Support Code')}</span><code>{recovery.requestId}</code><button type="button" onClick={() => void copySupportCode()}>{copied ? t('Copied') : t('Copy')}</button></div> : null}
+      {hasDrawing && onKeepDrawing ? <button type="button" className="keep-drawing-button" onClick={onKeepDrawing}>{t('Keep Drawing')}</button> : null}
+    </section>
+  );
+}
+
 export default function NetApp({ initialUser, initialApiToken, signInPath, signOutPath }: { initialUser: InitialUser; initialApiToken: string | null; signInPath: string; signOutPath: string }) {
   const { locale, t } = useLanguage();
   const [phase, setPhase] = useState<Phase>('loading');
@@ -190,6 +233,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const [guestName, setGuestName] = useState('');
   const [guestFormError, setGuestFormError] = useState('');
   const [guestErrorField, setGuestErrorField] = useState<'name' | 'form' | null>(null);
+  const [guestRecovery, setGuestRecovery] = useState<GuestRecovery | null>(null);
   const [inviteCode, setInviteCode] = useState(() => typeof window === 'undefined' ? '' : new URLSearchParams(window.location.search).get('room') ?? '');
   const [inviteStatus, setInviteStatus] = useState<InviteStatus>(() => typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('room') ? 'checking' : 'none');
   const [invitePreview, setInvitePreview] = useState<InvitePreview | null>(null);
@@ -204,7 +248,14 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const [infoOpen, setInfoOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [studio, setStudio] = useState<{ sourceUrl?: string | null; parentId?: string | null; version?: number | null; draftSource?: boolean } | null>(null);
-  const [pendingLandingSketch, setPendingLandingSketch] = useState<string | null>(null);
+  const [pendingLandingSketch, setPendingLandingSketch] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    try {
+      return sessionStorage.getItem('net_pending_landing_sketch');
+    } catch {
+      return null;
+    }
+  });
   const [viewingMedia, setViewingMedia] = useState<MessageView | null>(null);
   const [lineageViewer, setLineageViewer] = useState<{ messageId: string; lineage: CanvasLineageItem[]; loading: boolean; error: string; truncated: boolean } | null>(null);
   const [downloadingAssetKey, setDownloadingAssetKey] = useState<string | null>(null);
@@ -247,32 +298,35 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const automaticAssetRefreshAttempts = useRef(new Map<string, number>());
   const lineageRequestGeneration = useRef(0);
   const continuationGeneration = useRef(0);
+  const guestBootstrapSessionRef = useRef<string | null>(null);
+  const pendingLandingSketchRef = useRef(pendingLandingSketch);
 
   const activeRoom = rooms.find((room) => room.id === activeRoomId) ?? null;
   const actorId = actor?.id ?? null;
   const normalizedMessageQuery = messageQuery.trim().toLocaleLowerCase(localeTag(locale));
 
   const api = useCallback(async <T,>(path: string, init: RequestInit = {}, sessionOverride?: string | null): Promise<T> => {
+    const requestUrl = API_REQUEST_ORIGIN ? `${API_REQUEST_ORIGIN}${path}` : path;
     const session = sessionOverride === undefined ? guestSession : sessionOverride;
     const headers = new Headers(init.headers);
     headers.set('accept-language', localeTag(locale));
     if (session) headers.set('x-net-guest-session', session);
     else if (apiToken) headers.set('authorization', `Bearer ${apiToken}`);
     if (init.body && typeof init.body === 'string' && !headers.has('content-type')) headers.set('content-type', 'application/json');
-    let response = await fetch(path, { ...init, headers });
+    let response = await fetch(requestUrl, { ...init, headers });
     if (response.status === 401 && !session && initialUser) {
       const refreshed = await fetch('/auth/api-token', { method: 'POST' });
       if (refreshed.ok) {
         const credentials = await refreshed.json() as { token: string };
         setApiToken(credentials.token);
         headers.set('authorization', `Bearer ${credentials.token}`);
-        response = await fetch(path, { ...init, headers });
+        response = await fetch(requestUrl, { ...init, headers });
       }
     }
-    const data = await response.json().catch(() => ({})) as T & { error?: string };
+    const data = await response.json().catch(() => ({})) as T & { error?: string; requestId?: string };
     if (!response.ok) {
       const message = data.error ?? 'We could not complete that request. Please try again.';
-      throw new ApiRequestError(response.status, translateApiMessage(locale, message));
+      throw new ApiRequestError(response.status, translateApiMessage(locale, message), data.requestId ?? response.headers.get('x-request-id'));
     }
     return data;
   }, [apiToken, guestSession, initialUser, locale]);
@@ -346,6 +400,16 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   }, [api]);
 
   useEffect(() => {
+    pendingLandingSketchRef.current = pendingLandingSketch;
+    try {
+      if (pendingLandingSketch) sessionStorage.setItem('net_pending_landing_sketch', pendingLandingSketch);
+      else sessionStorage.removeItem('net_pending_landing_sketch');
+    } catch {
+      // The in-memory draft still survives while this tab remains open.
+    }
+  }, [pendingLandingSketch]);
+
+  useEffect(() => {
     const queryInvite = inviteCode;
     const savedGuest = guestSession;
     const boot = window.setTimeout(() => {
@@ -392,7 +456,13 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           }
           setPhase('landing');
         }
+        if (savedGuest && data.actor?.kind === 'guest' && pendingLandingSketchRef.current) {
+          setStudio({ sourceUrl: pendingLandingSketchRef.current, draftSource: true });
+          pendingLandingSketchRef.current = null;
+          setPendingLandingSketch(null);
+        }
       }).catch((bootstrapError) => {
+        if (endingGuestRef.current) return;
         if (bootstrapError instanceof ApiRequestError && bootstrapError.status === 401 && savedGuest) {
           clearGuestSession(t('Your guest session expired. You no longer have access; messages and attached images remain in the room.'));
           return;
@@ -452,6 +522,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       if (now - lastTouch < 5 * 60 * 1000) return;
       lastTouch = now;
       void api('/api/guest/activity', { method: 'POST' }).catch((activityError) => {
+        if (endingGuestRef.current) return;
         if (activityError instanceof ApiRequestError && activityError.status === 401 && sessionStorage.getItem('net_guest_session')) {
           clearGuestSession(t('Your guest session expired. You no longer have access; messages and attached images remain in the room.'));
         }
@@ -507,6 +578,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
         setConversationAtBottom(atBottom);
       });
     } catch (loadError) {
+      if (endingGuestRef.current) return;
       if (loadError instanceof ApiRequestError && loadError.status === 401 && guestSession) {
         clearGuestSession(t('Your guest session expired. You no longer have access; messages and attached images remain in the room.'));
         return;
@@ -561,6 +633,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       .then(() => setRooms((current) => current.map((room) => room.id === activeRoomId ? { ...room, unreadCount: 0 } : room)))
       .catch((readError) => {
         readMarkers.current.delete(activeRoomId);
+        if (endingGuestRef.current) return;
         if (readError instanceof ApiRequestError && readError.status === 401 && guestSession) {
           clearGuestSession(t('Your guest session expired. You no longer have access; messages and attached images remain in the room.'));
         }
@@ -916,22 +989,48 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       guestNameRef.current?.focus();
       return;
     }
-    setBusy(true); setGuestFormError(''); setGuestErrorField(null);
+    setBusy(true); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null);
+    let sessionId = guestBootstrapSessionRef.current;
     try {
-      const normalizedInviteCode = extractInviteCode(inviteCode);
-      const data = await api<{ sessionId: string }>('/api/guest', { method: 'POST', body: JSON.stringify({ displayName, inviteCode: normalizedInviteCode || undefined }) }, null);
-      sessionStorage.setItem('net_guest_session', data.sessionId);
-      endingGuestRef.current = false;
-      setGuestSession(data.sessionId);
+      if (!sessionId) {
+        const normalizedInviteCode = extractInviteCode(inviteCode);
+        const data = await api<{ sessionId: string }>('/api/guest', { method: 'POST', body: JSON.stringify({ displayName, inviteCode: normalizedInviteCode || undefined }) }, null);
+        sessionId = data.sessionId;
+        guestBootstrapSessionRef.current = sessionId;
+        sessionStorage.setItem('net_guest_session', sessionId);
+        endingGuestRef.current = false;
+      }
+      await loadBootstrap(sessionId);
+      guestBootstrapSessionRef.current = null;
+      setGuestSession(sessionId);
       setGuestModal(false);
-      await loadBootstrap(data.sessionId);
       consumeInvite();
       if (pendingLandingSketch) {
         setStudio({ sourceUrl: pendingLandingSketch, draftSource: true });
+        pendingLandingSketchRef.current = null;
         setPendingLandingSketch(null);
       }
     } catch (startError) {
-      setGuestFormError(startError instanceof Error ? startError.message : t('The guest session could not be started. Try again.'));
+      const offline = !navigator.onLine;
+      const requestError = startError instanceof ApiRequestError ? startError : null;
+      const bootstrapSessionExpired = Boolean(sessionId && requestError?.status === 401);
+      if (bootstrapSessionExpired) {
+        guestBootstrapSessionRef.current = null;
+        sessionStorage.removeItem('net_guest_session');
+        setGuestSession(null);
+      }
+      const message = bootstrapSessionExpired
+        ? t('That guest session expired before Nét finished connecting. Try again; your first mark is still here.')
+        : sessionId
+        ? offline
+          ? t('You are offline. Your session is safe and will recover when the connection returns.')
+          : t('Nét cannot connect right now. Your session is safe; try again in a moment.')
+        : offline
+          ? t('You are offline, so we could not create your guest session.')
+        : requestError && requestError.status < 500
+          ? requestError.message
+          : t('We could not create your guest session.');
+      setGuestRecovery({ message, requestId: requestError?.requestId ?? null });
       setGuestErrorField('form');
     }
     setBusy(false);
@@ -951,7 +1050,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     } catch (endError) {
       if (endError instanceof ApiRequestError && endError.status === 401) {
         clearGuestSession('');
-        setNotice(t('Your guest session expired. You no longer have access; messages and attached images remain in the room.'));
+        setNotice(t('Your guest session ended. You no longer have access; content you sent remains in the room.'));
       } else {
         endingGuestRef.current = false;
         setError(endError instanceof Error ? endError.message : t('The session could not be ended. Try again.'));
@@ -1106,7 +1205,9 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
         return data.assetUrl;
       })
       .catch((assetError) => {
-        setError(assetError instanceof Error ? assetError.message : t('Image access could not be refreshed. Try again.'));
+        if (!endingGuestRef.current) {
+          setError(assetError instanceof Error ? assetError.message : t('Image access could not be refreshed. Try again.'));
+        }
         return null;
       })
       .finally(() => { assetRefreshes.current.delete(assetKey); });
@@ -1283,7 +1384,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     return (
       <><a className="skip-link" href="#main-content">{t('Skip to main content')}</a><main id="main-content" className="landing-page">
         <nav className="landing-nav"><Logo /><div><a href="#how">{t('How It Works')}</a><LanguageSwitcher compact /><a href={inviteStatus === 'invalid' ? homeSignInPath : inviteSignInPath} className="nav-signin">{t('Sign In')}</a></div></nav>
-        <section className="hero">
+        <section className={inviteStatus === 'none' ? 'hero first-mark-hero' : 'hero'}>
           <div className="hero-copy">
             <span className="eyebrow">{inviteReady ? t('Your Invite Is Ready') : inviteStatus === 'auth-only' ? t('Members-Only Invite') : inviteStatus === 'invalid' ? t('Invite Unavailable') : inviteStatus === 'unavailable' ? t('Connection Interrupted') : t('Message with words. Continue with a line.')}</span>
             <h1>{inviteReady ? <><span>{t('Enter the room,')}</span>{' '}<em>{t('just choose a name.')}</em></> : inviteStatus === 'auth-only' ? <><span>{t('Sign in,')}</span>{' '}<em>{t('then join instantly.')}</em></> : inviteStatus === 'invalid' ? <><span>{t('This invite link')}</span>{' '}<em>{t('is no longer active.')}</em></> : inviteStatus === 'unavailable' ? <><span>{t('We cannot check')}</span>{' '}<em>{t('your invite yet.')}</em></> : <><span>{t('Some things are')}</span>{' '}<em>{t('easier to draw than say.')}</em></>}</h1>
@@ -1292,10 +1393,11 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
               <InviteContext preview={invitePreview} />
               <div className="invite-join-status"><span><UiIcon name="check" /></span><div><strong id="invite-join-title">{t('Join the creative thread')}</strong><small>{t('Your invite link has been verified.')}</small></div></div>
               <form className="invite-join-form" onSubmit={startGuest} noValidate>
-                <label>{t('Display Name')}<input ref={guestNameRef} name="guest-invite-name" autoComplete="nickname" value={guestName} onChange={(event) => { setGuestName(event.target.value); setGuestFormError(''); setGuestErrorField(null); }} placeholder={t('For example, Alex…')} maxLength={60} aria-invalid={guestErrorField === 'name'} aria-describedby={guestFormError ? 'guest-form-error' : undefined} /></label>
-                <button type="submit" className="hero-primary" disabled={busy}>{busy ? t('Joining…') : <>{t('Join Room')} <UiIcon name="arrow" size={18} /></>}</button>
+                <label>{t('Display Name')}<input ref={guestNameRef} name="guest-invite-name" autoComplete="nickname" value={guestName} onChange={(event) => { setGuestName(event.target.value); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null); }} placeholder={t('For example, Alex…')} maxLength={60} aria-invalid={guestErrorField === 'name'} aria-describedby={guestFormError ? 'guest-form-error' : undefined} /></label>
+                <button type="submit" className="hero-primary" disabled={busy}>{busy ? t('Joining…') : <>{guestRecovery ? t('Try Again') : t('Join Room')} <UiIcon name="arrow" size={18} /></>}</button>
               </form>
               {guestFormError && <p id="guest-form-error" className="form-error" role="alert" aria-live="polite">{guestFormError}</p>}
+              {guestRecovery ? <GuestRecoveryPanel recovery={guestRecovery} hasDrawing={false} /> : null}
               <div className="invite-join-alternatives"><a href={inviteSignInPath}>{t('Sign In to Join')}</a><button type="button" onClick={() => { consumeInvite(); setGuestFormError(''); setGuestErrorField(null); }}>{t('Back Home')}</button></div>
               <small>{t('Guests lose access when their session ends. Messages and attached images remain in the room.')}</small>
             </section> : inviteStatus === 'auth-only' ? <section className="invite-join-panel invite-state-panel" aria-labelledby="invite-auth-title">
@@ -1311,11 +1413,11 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
               <button type="button" className="hero-primary" onClick={() => setBootstrapRetry((current) => current + 1)}>{t('Check Again')}</button>
               <button type="button" onClick={consumeInvite}>{t('Back Home')}</button>
             </section> : <>
-              <div className="hero-actions"><button type="button" className="hero-primary" onClick={() => document.getElementById('landing-doodle')?.focus()}>{t('Try Drawing')} <UiIcon name="draw" size={18} /></button><button type="button" onClick={() => { setError(''); setGuestFormError(''); setGuestErrorField(null); setGuestModal(true); }}>{t('Try as a Guest')}</button><a href={signInPath}>{t('Sign In')}</a></div>
+              <div className="hero-actions"><button type="button" className="hero-primary" onClick={() => document.getElementById('landing-doodle')?.focus()}>{t('Try Drawing')} <UiIcon name="draw" size={18} /></button><button type="button" onClick={() => { setError(''); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null); setGuestModal(true); }}>{t('Try as a Guest')}</button><a className="hero-signin" href={signInPath}>{t('Sign In')}</a></div>
               <small>{t('Draw first · choose a name only when you are ready to send')}</small>
             </>}
           </div>
-          {inviteStatus === 'none' ? <LandingDoodle onUse={(dataUrl) => { setPendingLandingSketch(dataUrl); setError(''); setGuestFormError(''); setGuestErrorField(null); setGuestModal(true); }} /> : <div className="hero-demo" aria-label={t('Example conversation with messages and drawings')}>
+          {inviteStatus === 'none' ? <LandingDoodle onUse={(dataUrl) => { setPendingLandingSketch(dataUrl); setError(''); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null); setGuestModal(true); }} /> : <div className="hero-demo" aria-label={t('Example conversation with messages and drawings')}>
             <div className="demo-top"><span className="avatar" style={avatarStyle('minh')}>M</span><div><strong>Minh Anh</strong><small><i /> {t('drawing with you')}</small></div><b>•••</b></div>
             <div className="demo-canvas"><span className="demo-sun" /><span className="demo-line line-a" /><span className="demo-line line-b" /><strong>{t('Could we add')}<br />{t('a tree here?')}</strong><i>↙</i></div>
             <div className="demo-message">{t('I’ll continue this idea')} ✨</div>
@@ -1327,15 +1429,17 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           <article><b>02</b><span>{t('Continue, Never Overwrite')}</span><p>{t('Every edit creates a clearly tracked version.')}</p></article>
           <article><b>03</b><span>{t('Privacy That Fits')}</span><p>{t('Accounts keep content long term; guest access ends with the session.')}</p></article>
         </section>
-        <AppDialog open={guestModal} onClose={() => { setGuestModal(false); setPendingLandingSketch(null); setGuestFormError(''); setGuestErrorField(null); }} labelledBy="guest-dialog-title" describedBy="guest-dialog-description">
+        <AppDialog open={guestModal} onClose={() => { setGuestModal(false); if (!guestRecovery) setPendingLandingSketch(null); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null); }} labelledBy="guest-dialog-title" describedBy="guest-dialog-description">
             <form className="dialog-card guest-dialog" onSubmit={startGuest} noValidate>
-              <button type="button" className="dialog-close" onClick={() => { setGuestModal(false); setPendingLandingSketch(null); setGuestFormError(''); setGuestErrorField(null); }} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below">×</button>
+              <button type="button" className="dialog-close" onClick={() => { setGuestModal(false); if (!guestRecovery) setPendingLandingSketch(null); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null); }} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below">×</button>
               <span className="eyebrow">{t('Guest Session')}</span><h2 id="guest-dialog-title">{t('What Should We Call You?')}</h2>
               <p id="guest-dialog-description">{t('Choose a name so people can recognize you in the conversation.')}</p>
-              <label>{t('Display Name')}<input ref={guestNameRef} name="guest-name" autoComplete="nickname" value={guestName} onChange={(event) => { setGuestName(event.target.value); setGuestFormError(''); setGuestErrorField(null); }} placeholder={t('For example, Alex…')} maxLength={60} aria-invalid={guestErrorField === 'name'} aria-describedby={guestErrorField === 'name' ? 'guest-form-error' : undefined} /></label>
+              {pendingLandingSketch ? <figure className="guest-mark-preview"><Image src={pendingLandingSketch} width={900} height={540} unoptimized alt={t('Preview of your first mark')} /><figcaption><UiIcon name="draw" size={16} /><span><strong>{t('Your first mark is ready')}</strong><small>{t('Choose a name, then continue it in Studio.')}</small></span></figcaption></figure> : null}
+              <label>{t('Display Name')}<input ref={guestNameRef} name="guest-name" autoComplete="nickname" value={guestName} onChange={(event) => { setGuestName(event.target.value); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null); }} placeholder={t('For example, Alex…')} maxLength={60} aria-invalid={guestErrorField === 'name'} aria-describedby={guestErrorField === 'name' ? 'guest-form-error' : undefined} /></label>
               {guestFormError && <p id="guest-form-error" className="form-error" role="alert" aria-live="polite">{guestFormError}</p>}
+              {guestRecovery ? <GuestRecoveryPanel recovery={guestRecovery} hasDrawing={Boolean(pendingLandingSketch)} onKeepDrawing={() => { setGuestModal(false); setGuestRecovery(null); setGuestErrorField(null); requestAnimationFrame(() => document.getElementById('landing-doodle')?.focus()); }} /> : null}
               <div className="guest-session-note"><UiIcon name="info" size={17} /><span>{t('The session expires after 2 inactive hours. Content you send remains in the room.')}</span></div>
-              <button type="submit" className="primary-button wide" disabled={busy}>{busy ? t('Opening Nét…') : t('Enter Nét')}</button>
+              <button type="submit" className="primary-button wide" disabled={busy}>{busy ? t('Opening Nét…') : guestRecovery ? t('Try Again') : t('Enter Nét')}</button>
             </form>
         </AppDialog>
         {(error || notice) && <div className={error ? 'toast error' : 'toast'} role="status" aria-live="polite"><span>{error || notice}</span>{error && <button type="button" onClick={() => setError('')} aria-label={t('Dismiss notification')} data-tooltip={t('Dismiss notification')} data-tooltip-placement="above">×</button>}</div>}

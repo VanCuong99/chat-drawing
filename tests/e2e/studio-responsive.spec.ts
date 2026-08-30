@@ -30,25 +30,39 @@ test('Studio không bị cắt ở màn hình ngang thấp và mobile @critical'
   expect(mobileBox!.x).toBe(0);
   expect(mobileBox!.y).toBeGreaterThanOrEqual(0);
   expect(mobileBox!.y + mobileBox!.height).toBeLessThanOrEqual(844);
-  const mobileSend = page.locator('.studio-footer').getByRole('button', { name: 'Vẽ trước khi gửi', exact: true });
+  const mobileSend = studio.locator('.studio-header').getByRole('button', { name: 'Gửi', exact: true });
   await expect(mobileSend).toBeInViewport();
   await expect(mobileSend).toBeDisabled();
-  await expect(page.locator('.studio-header-send')).toBeHidden();
-  await expect(page.getByRole('textbox', { name: 'Lời nhắn cho bản vẽ' })).toBeInViewport();
-  for (const name of [/Bút chì/, /Tẩy/, 'Màu và cài đặt công cụ', 'Hoàn tác', 'Công cụ khác']) {
+  await expect(page.getByRole('textbox', { name: 'Lời nhắn cho bản vẽ' })).toBeHidden();
+  for (const name of [/Bút chì/, 'Màu và cài đặt công cụ', 'Hoàn tác', 'Thêm vào canvas', 'Công cụ khác']) {
     await expect(studio.locator('.tool-rail').getByRole('button', { name })).toBeInViewport();
   }
   await expect(page.getByRole('button', { name: /Bút highlight/ })).toBeHidden();
+  await expect(page.getByRole('button', { name: /Tẩy/ })).toBeHidden();
   await expect(page.getByRole('button', { name: /Hình dạng/ })).toBeHidden();
   await expect(page.getByRole('button', { name: /Chèn chữ/ })).toBeHidden();
+
+  await page.getByRole('button', { name: 'Thêm vào canvas' }).click();
+  const addTools = page.getByRole('dialog', { name: 'Thêm vào Canvas' });
+  await expect(addTools.getByRole('button', { name: 'Chọn hình dạng' })).toBeVisible();
+  await expect(addTools.getByRole('button', { name: 'Chèn chữ' })).toBeVisible();
+  await expect(addTools.getByRole('button', { name: 'Thêm lời nhắn' })).toBeVisible();
+  await addTools.getByRole('button', { name: 'Thêm lời nhắn' }).click();
+  const caption = page.getByRole('textbox', { name: 'Lời nhắn cho bản vẽ' });
+  await expect(caption).toBeInViewport();
+  const captionBox = await caption.boundingBox();
+  const dockBox = await studio.locator('.tool-rail').boundingBox();
+  expect(captionBox && dockBox ? captionBox.y + captionBox.height <= dockBox.y : false).toBe(true);
+  await page.getByRole('button', { name: 'Đóng ô lời nhắn' }).click();
+  await expect(caption).toBeHidden();
+
   await page.getByRole('button', { name: 'Công cụ khác' }).click();
   const moreTools = page.getByRole('dialog', { name: 'Công cụ khác' });
   await expect(moreTools).toBeVisible();
   await expect(moreTools.getByRole('button', { name: /Bút highlight/ })).toBeVisible();
+  await expect(moreTools.getByRole('button', { name: /Tẩy/ })).toBeVisible();
   await expect(moreTools.getByRole('button', { name: /Đường thẳng/ })).toBeVisible();
   await expect(moreTools.getByRole('button', { name: /Mũi tên/ })).toBeVisible();
-  await expect(moreTools.getByRole('button', { name: 'Chọn hình dạng' })).toBeVisible();
-  await expect(moreTools.getByRole('button', { name: 'Chèn chữ' })).toBeVisible();
   await moreTools.getByRole('button', { name: 'Đóng công cụ khác' }).click();
   await page.getByRole('button', { name: 'Màu và cài đặt công cụ' }).click();
   await expect(page.locator('.tool-inspector')).toBeVisible();

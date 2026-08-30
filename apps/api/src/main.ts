@@ -57,7 +57,13 @@ async function bootstrap() {
     origin: allowedOrigins,
     credentials: false,
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['authorization', 'content-type', 'x-net-guest-session', 'x-request-id'],
+    allowedHeaders: [
+      'authorization',
+      'content-type',
+      'x-net-guest-session',
+      'x-request-id',
+      ...(process.env.NODE_ENV === 'test' ? ['x-forwarded-for', 'x-net-e2e-rate-key'] : []),
+    ],
     exposedHeaders: ['x-request-id', 'retry-after'],
     maxAge: 600,
   });
