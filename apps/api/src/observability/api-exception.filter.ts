@@ -15,7 +15,7 @@ export class ApiExceptionFilter implements ExceptionFilter {
       ? payload
       : payload && typeof payload === 'object' && 'message' in payload
         ? Array.isArray(payload.message) ? payload.message[0] : String(payload.message)
-        : 'Có lỗi xảy ra. Vui lòng thử lại.';
+        : 'Something went wrong. Try again.';
     if (status >= 500) {
       this.logger.error({
         event: 'http.exception',

@@ -54,7 +54,7 @@ export class RealtimeGateway implements OnGatewayInit {
       } catch (error) {
         telemetry.socketRejected.add(1, { reason: 'handshake' });
         this.logger.warn(`Rejected socket ${client.id}: ${error instanceof Error ? error.message : 'invalid token'}`);
-        next(new Error('Phiên realtime không hợp lệ.'));
+        next(new Error('The realtime session is invalid.'));
       }
     });
   }
@@ -63,8 +63,8 @@ export class RealtimeGateway implements OnGatewayInit {
   async subscribe(@ConnectedSocket() client: AuthenticatedSocket, @MessageBody() body: { roomId?: string }) {
     const actor = client.data.actor;
     const roomId = body?.roomId;
-    if (!this.consumeEvent(client)) return { ok: false, error: 'Bạn thao tác realtime quá nhanh.' };
-    if (!actor || typeof roomId !== 'string' || roomId !== client.data.authorizedRoomId) return { ok: false, error: 'Phiên realtime không hợp lệ.' };
+    if (!this.consumeEvent(client)) return { ok: false, error: 'Realtime actions are being sent too quickly.' };
+    if (!actor || typeof roomId !== 'string' || roomId !== client.data.authorizedRoomId) return { ok: false, error: 'The realtime session is invalid.' };
     try {
       await this.actors.assertRoomAccess(roomId, actor);
       for (const joined of client.rooms) if (joined.startsWith('room:')) await client.leave(joined);
@@ -72,13 +72,13 @@ export class RealtimeGateway implements OnGatewayInit {
       client.data.activeRoomId = roomId;
       return { ok: true, roomId };
     } catch {
-      return { ok: false, error: 'Bạn không có quyền theo dõi phòng này.' };
+      return { ok: false, error: 'You do not have permission to follow this room.' };
     }
   }
 
   @SubscribeMessage('room.unsubscribe')
   async unsubscribe(@ConnectedSocket() client: AuthenticatedSocket) {
-    if (!this.consumeEvent(client)) return { ok: false, error: 'Bạn thao tác realtime quá nhanh.' };
+    if (!this.consumeEvent(client)) return { ok: false, error: 'Realtime actions are being sent too quickly.' };
     for (const joined of client.rooms) if (joined.startsWith('room:')) await client.leave(joined);
     client.data.activeRoomId = undefined;
     return { ok: true };

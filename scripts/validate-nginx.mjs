@@ -16,7 +16,7 @@ try {
   process.stdout.write(result.stdout);
   process.stderr.write(result.stderr);
   if (result.error?.code === 'ENOENT') {
-    console.error('Không tìm thấy nginx trong PATH; cài nginx để kiểm tra cú pháp ingress.');
+    console.error('nginx was not found in PATH; install nginx to validate the ingress syntax.');
     process.exitCode = 1;
   } else if (result.status !== 0) {
     process.exitCode = result.status ?? 1;

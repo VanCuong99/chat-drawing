@@ -1,31 +1,31 @@
 # Nét
 
-Messenger chia sẻ chữ, ảnh và canvas có lịch sử phiên bản. Dự án dùng pnpm workspace với frontend Next.js, backend NestJS, PostgreSQL/Drizzle ORM và Socket.IO.
+Nét is a messenger for sharing text, images, and versioned drawings. The repository is a pnpm workspace with a Next.js frontend, a NestJS backend, PostgreSQL through Drizzle ORM, and Socket.IO realtime messaging.
 
-Studio Nét có bộ pha nhiều sắc tố gần đúng theo Kubelka–Munk với 2–12 màu thành phần. Người dùng nhập phần pha cho từng màu, xem nồng độ đầu vào đã chuẩn hóa, lưu cả công thức và nạp lại để chỉnh tiếp; bảng màu riêng lưu tối đa 24 công thức. Model `spectral-kubelka-munk-rgb` v2 đảo đúng phép biến đổi factor/luminance của spectral.js để tỷ lệ UI đi vào phép trộn đồng thời như nồng độ đã khai báo. Đây vẫn là mô phỏng sRGB/D65; công thức vật liệu thật cần phổ K/S đo cho từng pigment, binder và substrate.
+Nét Studio includes an approximate Kubelka–Munk pigment mixer for 2–12 component colors. A person assigns parts to each color, sees normalized proportions, saves the complete formula, and can reload it for further editing. Each personal palette stores up to 24 formulas. The `spectral-kubelka-munk-rgb` v2 model reverses the factor/luminance transform used by spectral.js so the UI ratios enter the simultaneous mixture as the declared concentrations. It remains an sRGB/D65 approximation; a physical paint recipe requires measured K/S spectra for each pigment, binder, substrate, and lighting condition.
 
-Công cụ tô giữ chế độ phẳng và có thêm Marker, Chì màu, Màu nước. Các chất liệu dùng texture có seed ổn định, blend kiểu pigment, vân giấy/granulation và đọng màu ở biên; vì vậy undo, redo và export luôn tái tạo cùng một kết quả. Đây là mô phỏng tương tác tối ưu cho canvas web, không phải mô phỏng động lực học chất lỏng hay dữ liệu vật liệu phòng thí nghiệm.
+The fill tool offers Solid, Marker, Colored Pencil, Watercolor, and Gouache materials. Natural materials use deterministic texture seeds, paper grain, granulation, material-specific coverage, water dilution, and watercolor edge pooling. Undo, redo, and export therefore reproduce the same result. This is an interaction-focused web-canvas model, not a laboratory material model or a fluid-dynamics simulation.
 
-## Kiến trúc
+## Architecture
 
 ```text
 apps/web/                    Next.js App Router web client + Neon Auth
 apps/api/                    NestJS REST API + Socket.IO gateway
-packages/database/           Drizzle schema, client và migration PostgreSQL
-packages/pigment/            mô hình pha nhiều sắc tố dùng chung
-tests/e2e/                   kiểm thử luồng trình duyệt và realtime
-infra/nginx/                 reverse proxy, rate/connection limit
-infra/otel/                  OpenTelemetry Collector mẫu cho local
-scripts/                     lệnh bảo trì workspace có phạm vi rõ ràng
+packages/database/           Drizzle schema, client, and PostgreSQL migrations
+packages/pigment/            shared multi-pigment mixing model
+tests/e2e/                   browser-flow and realtime tests
+infra/nginx/                 reverse proxy and rate/connection limits
+infra/otel/                  sample local OpenTelemetry Collector
+scripts/                     scoped workspace maintenance commands
 ```
 
-Mỗi thư mục trên có đúng một trách nhiệm; frontend không còn nằm lẫn ở root và migration chỉ còn một nguồn tại `packages/database/drizzle/`. Chạy `pnpm clean` để xóa riêng build output/test artifact có thể tạo lại, không chạm vào upload local.
+Each directory has one responsibility. The frontend no longer lives at the repository root, and `packages/database/drizzle/` is the only migration source. `pnpm clean` removes only reproducible build/test output and does not touch local uploads.
 
-PostgreSQL là nguồn dữ liệu nghiệp vụ, rate-limit dùng chung và transactional realtime outbox. File ảnh local nằm trong volume API; production bắt buộc `STORAGE_DRIVER=blob` với Vercel Blob private. Metadata và quyền sở hữu luôn nằm trong PostgreSQL, còn URL đọc ảnh được ký ngắn hạn theo actor + room. Redis adapter đồng bộ Socket.IO giữa nhiều NestJS instance; API production từ chối khởi động nếu thiếu `REDIS_URL`.
+PostgreSQL is the source of truth for product data, distributed rate limits, and the transactional realtime outbox. Local image files live in the API volume; production requires `STORAGE_DRIVER=blob` with a private Vercel Blob store. PostgreSQL retains metadata and ownership while the API issues short-lived, actor-and-room-scoped read URLs. The Redis adapter synchronizes Socket.IO across NestJS instances, and the production API refuses to start without `REDIS_URL`.
 
-## Chạy local
+## Local development
 
-Yêu cầu Node.js 22+, pnpm 10 và PostgreSQL. Cách nhanh nhất khi Docker đang chạy:
+Requires Node.js 22+, pnpm 10, and PostgreSQL. When Docker is available, the quickest setup is:
 
 ```bash
 cp .env.example .env.local
@@ -36,32 +36,31 @@ pnpm db:migrate
 pnpm dev
 ```
 
-Điền `NEON_AUTH_BASE_URL` và một `NEON_AUTH_COOKIE_SECRET` riêng trong `apps/web/.env.local`; giữ `AUTH_JWT_SECRET` giống API. API đọc `.env.local` ở root, còn Next.js đọc file trong `apps/web`.
+Set `NEON_AUTH_BASE_URL` and a unique `NEON_AUTH_COOKIE_SECRET` in `apps/web/.env.local`, and keep `AUTH_JWT_SECRET` identical in the web and API environments. The API reads the repository-root `.env.local`; Next.js reads `apps/web/.env.local`.
 
 - Web: `http://localhost:3000`
 - API health: `http://localhost:3001/api/health`
 
-Nếu chỉ muốn chạy hạ tầng và ứng dụng production bằng container:
+To run the production-shaped application and infrastructure in containers:
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
 
-Trước khi chạy Compose, điền `AUTH_JWT_SECRET`, `NEON_AUTH_BASE_URL` và `NEON_AUTH_COOKIE_SECRET` trong `.env`.
+Before starting Compose, set `AUTH_JWT_SECRET`, `NEON_AUTH_BASE_URL`, and `NEON_AUTH_COOKIE_SECRET` in `.env`. Nginx serves the application at `http://localhost:8080`.
 
-Ứng dụng được phục vụ tại `http://localhost:8080` qua Nginx.
-
-## Build
+## Build and validation
 
 ```bash
 pnpm build
 pnpm lint
+pnpm check:i18n
 pnpm check:infra
 pnpm security:audit
 ```
 
-Lệnh này lần lượt build package database, NestJS API và frontend. Các lệnh database:
+The workspace build compiles the database and pigment packages, the NestJS API, and the Next.js frontend. Database commands are:
 
 ```bash
 pnpm db:generate
@@ -69,41 +68,41 @@ pnpm db:migrate
 pnpm db:studio
 ```
 
-## Bảo đảm realtime không nhận sai phòng
+## Realtime room isolation
 
-1. HTTP cấp token Socket.IO ngắn hạn từ actor đã xác thực.
-2. Socket không tự join phòng; client phải gửi `room.subscribe`.
-3. Gateway kiểm tra membership hoặc guest session trước khi join `room:{roomId}`.
-4. Mỗi lần subscribe, gateway rời toàn bộ room chat cũ trước khi join room mới.
-5. Mọi event đều mang `roomId`; client bỏ qua event không khớp `activeRoomRef`.
-6. Redis adapter phân phối event đúng room khi chạy nhiều API instance.
-7. Socket còn join `actor:{id}`; event `room.activity` chỉ đi tới socket không ở room đang mở để cập nhật unread/preview mà không phát `message.created` sai phòng.
-8. Token realtime hết hạn chủ động ngắt socket; client đổi token, subscribe lại và tải bù bootstrap/messages.
-9. Polling chỉ là fallback khi WebSocket mất kết nối.
-10. Mọi thay đổi realtime được ghi vào transactional outbox cùng transaction nghiệp vụ; request tạo event chờ phát event của chính nó, còn maintenance drain backlog theo batch với lease + `FOR UPDATE SKIP LOCKED`. Client coi event là at-least-once và đồng bộ lại state qua HTTP.
+1. HTTP issues a short-lived Socket.IO token for the verified actor.
+2. A socket never joins a chat room automatically; the client must emit `room.subscribe`.
+3. The gateway verifies membership or an active guest session before joining `room:{roomId}`.
+4. Each subscription leaves every previous chat room before joining the requested room.
+5. Every event carries `roomId`; the client rejects events that do not match `activeRoomRef`.
+6. The Redis adapter routes events to the correct room across multiple API instances.
+7. A socket also joins `actor:{id}`. `room.activity` updates unread state for background rooms without leaking `message.created` into the open room.
+8. Realtime-token expiry disconnects the socket; the client refreshes the token, subscribes again, and catches up through HTTP.
+9. Bounded HTTP reconciliation runs every four seconds while connected and every three seconds while disconnected, so a transient or replayed event cannot leave message, reaction, or read state stale.
+10. Each realtime change is written to the transactional outbox with its product transaction. Delivery is at least once, so the client de-duplicates events and reconciles state through HTTP.
 
-`tests/e2e/realtime-isolation.spec.ts` tạo hai guest ở hai phòng, thử subscribe trái phép, xác nhận event phòng A không xuất hiện trên socket phòng B, và kiểm tra actor channel chỉ báo hoạt động cho phòng nền.
+`tests/e2e/realtime-isolation.spec.ts` creates guests in separate rooms, attempts an unauthorized subscription, verifies that room A events never arrive on room B's socket, and confirms that actor-channel notifications only signal background-room activity.
 
-Message có `sequence` tăng đơn điệu do PostgreSQL cấp; phân trang và read status dùng sequence thay cho timestamp/UUID nên không bị sai thứ tự khi nhiều tin được tạo cùng mili-giây. `clientRequestId` UUID làm idempotency key để retry không tạo tin trùng. Guest create, room create, message, reaction và upload đều qua rate-limit atomic trong PostgreSQL; migration được chạy bởi service `migrate` riêng trước API, không chạy lặp trong mọi replica. Reverse proxy chặn burst và giới hạn bốn kết nối upload đồng thời theo IP trước khi body ảnh được buffer; mỗi owner còn bị giới hạn 500 asset, ba upload pending và 256 MB.
+PostgreSQL assigns a monotonically increasing `sequence` to every message. Pagination and read state use that sequence instead of timestamps or UUIDs. A UUID `clientRequestId` is the idempotency key that prevents retry duplicates. Guest creation, room creation, messages, reactions, and uploads use atomic PostgreSQL-backed rate limits. A dedicated migration service runs before the API rather than once per replica. The reverse proxy blocks bursts and limits each IP to four concurrent uploads before buffering the body; each owner is also limited to 500 assets, three pending uploads, and 256 MB.
 
-Asset URL mặc định sống 10 phút (`ASSET_URL_TTL`) và chỉ mang quyền actor + room + asset. Client tự xin URL mới khi ảnh hết hạn và luôn refresh ngay trước luồng **Vẽ tiếp**, nên TTL ngắn không làm hỏng một phiên guest còn hiệu lực.
+Asset URLs live for 10 minutes by default (`ASSET_URL_TTL`) and are scoped to an actor, room, and asset. The client refreshes expired URLs and requests a fresh URL immediately before **Continue Drawing**, so a short URL lifetime does not break a valid guest session.
 
-## Authentication
+## Authentication and retention
 
-Authenticated mode dùng Neon Auth ở Next.js. Route server của web đọc session đã ký, sau đó cấp JWT sống ngắn với `issuer=net-web`, `audience=net-api`; NestJS chỉ tin JWT ký bởi `AUTH_JWT_SECRET`. Web và API phải dùng cùng secret, dài tối thiểu 32 byte.
+Authenticated mode uses Neon Auth in Next.js. The web server reads the signed session and issues a short-lived JWT with `issuer=net-web` and `audience=net-api`; NestJS trusts only JWTs signed with `AUTH_JWT_SECRET`. Both services must use the same secret of at least 32 bytes.
 
-Guest không cần tài khoản và mất quyền khi phiên kết thúc. Message/asset guest đã gửi được giữ lại trong phòng kể cả khi chưa có thành viên đăng nhập; guest session, reaction và dữ liệu tạm chưa gắn vào tin nhắn bị thu hồi. `joinRoom`, guest send và guest end dùng chung PostgreSQL advisory lock theo room để không sai retention khi chạy đồng thời.
+Guests do not need an account and lose access when their session ends. Messages and attached assets a guest already sent remain in the room. The ended guest session, reactions, personal palette, and unattached temporary uploads are removed. `joinRoom`, guest message creation, and guest termination share a PostgreSQL advisory lock per room so concurrent requests cannot produce an inconsistent retention result.
 
-## Production hiện tại
+## Current production
 
 - Web: [chat-drawing.vercel.app](https://chat-drawing.vercel.app)
 - API: [chat-drawing-api.vercel.app/api/health](https://chat-drawing-api.vercel.app/api/health)
 - Database/auth: Neon Postgres + Neon Auth
-- Media: Vercel Blob private
+- Media: private Vercel Blob
 - Realtime fan-out: Upstash Redis + Socket.IO Redis adapter
 
-Hai Vercel project trỏ lần lượt tới `apps/web` và `apps/api`. Chạy migration Drizzle trước khi deploy API. Các biến production tối thiểu gồm `DATABASE_URL`, `AUTH_JWT_SECRET`, `REDIS_URL`, `STORAGE_DRIVER=blob`, `BLOB_READ_WRITE_TOKEN`, `CRON_SECRET`, `WEB_ORIGIN`; web cần `NEON_AUTH_BASE_URL`, `NEON_AUTH_COOKIE_SECRET`, `AUTH_JWT_SECRET`, `NEXT_PUBLIC_API_URL` và `NEXT_PUBLIC_REALTIME_URL`.
+The two Vercel projects point to `apps/web` and `apps/api`. Run Drizzle migrations before deploying the API. The minimum production variables are `DATABASE_URL`, `AUTH_JWT_SECRET`, `REDIS_URL`, `STORAGE_DRIVER=blob`, `BLOB_READ_WRITE_TOKEN`, `CRON_SECRET`, and `WEB_ORIGIN`; the web project also needs `NEON_AUTH_BASE_URL`, `NEON_AUTH_COOKIE_SECRET`, `AUTH_JWT_SECRET`, `NEXT_PUBLIC_API_URL`, and `NEXT_PUBLIC_REALTIME_URL`.
 
-## Vận hành và quan sát
+## Operations and observability
 
-API trả `X-Request-ID`, log JSON trong production và gắn request ID + trace ID vào lỗi 5xx. Nếu đặt `OTEL_EXPORTER_OTLP_ENDPOINT`, API xuất traces/metrics qua OTLP/HTTP. Cấu hình hardening, ngưỡng cảnh báo, object storage và cách chạy collector local nằm trong [docs/OPERATIONS.md](docs/OPERATIONS.md).
+The API returns `X-Request-ID`, emits JSON logs in production, and includes request and trace IDs in 5xx errors. When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, it exports traces and metrics over OTLP/HTTP. Hardening details, alert thresholds, object-storage guidance, and local collector instructions live in [docs/OPERATIONS.md](docs/OPERATIONS.md).

@@ -33,7 +33,6 @@ import { RealtimeOutboxService } from '../realtime/realtime-outbox.service';
 const EMOJIS = ['❤️', '👍', '✨', '😂', '👀'];
 const EMPTY_GUEST_ROOM_GRACE_MS = 5 * 60 * 1000;
 const ABANDONED_GUEST_ROOM_BATCH = 10;
-const ABANDONED_GUEST_ASSET_BATCH = 50;
 
 @Injectable()
 export class ChatService {
@@ -113,10 +112,10 @@ export class ChatService {
     const counterpartByRoom = new Map(counterpartRows.map((row) => [row.roomId, row.displayName]));
     return roomRows.map((room) => {
       const last = latestByRoom.get(room.id);
-      const preview = !last ? 'Bắt đầu một câu chuyện mới'
-        : last.type === 'canvas' ? 'Đã gửi một bản vẽ'
-          : last.type === 'image' ? 'Đã gửi một hình ảnh'
-            : last.body ?? 'Tin nhắn mới';
+      const preview = !last ? 'Start a new conversation'
+        : last.type === 'canvas' ? 'Sent a drawing'
+          : last.type === 'image' ? 'Sent an image'
+            : last.body ?? 'New message';
       const statistics = statisticsByRoom.get(room.id);
       return {
         ...room,
@@ -131,22 +130,22 @@ export class ChatService {
   }
 
   async inspectInvite(inviteCodeInput: unknown) {
-    const inviteCode = this.requireText(inviteCodeInput, 'Mã mời', 4, 60);
+    const inviteCode = this.requireText(inviteCodeInput, 'Invite code', 4, 60);
     const [room] = await this.db.select({ allowGuests: rooms.allowGuests, kind: rooms.kind }).from(rooms)
       .where(eq(rooms.inviteCode, inviteCode)).limit(1);
-    if (!room || room.kind === 'direct') throw new NotFoundException('Link mời không hợp lệ hoặc đã hết hạn.');
+    if (!room || room.kind === 'direct') throw new NotFoundException('The invite link is invalid or has expired.');
     return { valid: true, guestAllowed: room.allowGuests };
   }
 
   async createGuest(displayNameInput: unknown, inviteCodeInput?: unknown) {
-    const displayName = this.requireText(displayNameInput, 'Tên hiển thị', 2, 60);
+    const displayName = this.requireText(displayNameInput, 'Display name', 2, 60);
     const inviteCode = typeof inviteCodeInput === 'string' ? inviteCodeInput.trim() : '';
     const now = Date.now();
     const expiresAt = this.actors.guestTtl();
     const [candidate] = inviteCode
       ? await this.db.select({ id: rooms.id }).from(rooms).where(eq(rooms.inviteCode, inviteCode)).limit(1)
       : [];
-    if (inviteCode && !candidate) throw new NotFoundException('Link mời không hợp lệ hoặc phòng không nhận khách.');
+    if (inviteCode && !candidate) throw new NotFoundException('The invite link is invalid or the room does not accept guests.');
     return this.db.transaction(async (tx) => {
       let room: typeof rooms.$inferSelect;
       if (candidate) {
@@ -158,26 +157,22 @@ export class ChatService {
             eq(rooms.allowGuests, true),
             ne(rooms.kind, 'direct'),
           )).limit(1);
-        if (!availableRoom) throw new NotFoundException('Link mời không hợp lệ hoặc phòng không nhận khách.');
+        if (!availableRoom) throw new NotFoundException('The invite link is invalid or the room does not accept guests.');
         room = availableRoom;
       } else {
-        [room] = await tx.insert(rooms).values({ name: `Phiên của ${displayName}`, kind: 'guest', inviteCode: this.makeCode(), allowGuests: true, createdAt: now }).returning();
+        [room] = await tx.insert(rooms).values({ name: `${displayName}'s Session`, kind: 'guest', inviteCode: this.makeCode(), allowGuests: true, createdAt: now }).returning();
       }
       const [session] = await tx.insert(guestSessions).values({ roomId: room.id, displayName, createdAt: now, lastSeenAt: now, expiresAt }).returning();
       const [firstMessage] = await tx.select({ id: messages.id }).from(messages).where(eq(messages.roomId, room.id)).limit(1);
       if (!firstMessage) {
-        const [authenticatedMember] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers)
-          .where(eq(roomMembers.roomId, room.id)).limit(1);
         await tx.insert(messages).values({
           roomId: room.id,
           guestSessionId: session.id,
           senderName: 'Nét',
           type: 'system',
-          body: authenticatedMember
-            ? 'Phiên khách đã bắt đầu. Khi phiên kết thúc, khách mất quyền truy cập nhưng nội dung đã gửi vẫn được giữ lại trong phòng.'
-            : 'Phiên tạm thời đã bắt đầu. Nội dung chỉ được lưu lâu dài khi phòng có thành viên đăng nhập.',
+          body: 'The guest session started. When it ends, the guest loses access but submitted content remains in the room.',
           createdAt: now + 1,
-          expiresAt: authenticatedMember ? null : expiresAt,
+          expiresAt: null,
         });
       }
       return { sessionId: session.id, expiresAt, roomId: room.id, roomName: room.name };
@@ -185,7 +180,7 @@ export class ChatService {
   }
 
   async endGuest(actor: Actor) {
-    if (actor.kind !== 'guest') throw new UnauthorizedException('Phiên khách không còn hiệu lực.');
+    if (actor.kind !== 'guest') throw new UnauthorizedException('The guest session is no longer valid.');
     const retained = await this.endGuestById(actor.id);
     return { ok: true, retained };
   }
@@ -200,49 +195,40 @@ export class ChatService {
       if (!guest) return null;
       const assetRows = await tx.select({ key: assets.key, status: assets.status }).from(assets)
         .where(eq(assets.guestSessionId, guestId));
-      const [authenticatedMember] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers)
-        .where(eq(roomMembers.roomId, guest.roomId)).limit(1);
-      const retained = Boolean(authenticatedMember);
-      const guestMessageRows = await tx.select({ id: messages.id }).from(messages)
-        .where(eq(messages.guestSessionId, guestId));
       const removedReactions = await tx.select({ messageId: reactions.messageId, emoji: reactions.emoji }).from(reactions)
         .where(eq(reactions.actorKey, `guest:${guestId}`));
-      const disposableAssets = retained ? assetRows.filter((asset) => asset.status !== 'attached') : assetRows;
+      const disposableAssets = assetRows.filter((asset) => asset.status !== 'attached');
       if (disposableAssets.length) {
         await tx.update(assets).set({ status: 'deleting' }).where(and(
           eq(assets.guestSessionId, guestId),
           inArray(assets.key, disposableAssets.map((asset) => asset.key)),
         ));
       }
-      if (retained) {
-        await tx.update(assets).set({
-          guestSessionId: null,
-          ownerKey: `retained-guest:${guestId}`,
-          expiresAt: null,
-        }).where(and(eq(assets.guestSessionId, guestId), eq(assets.status, 'attached')));
-        await tx.update(messages).set({ guestSessionId: null, expiresAt: null }).where(eq(messages.guestSessionId, guestId));
-      } else if (guestMessageRows.length) {
-        await tx.delete(messages).where(inArray(messages.id, guestMessageRows.map((message) => message.id)));
-      }
+      await tx.update(assets).set({
+        guestSessionId: null,
+        ownerKey: `retained-guest:${guestId}`,
+        expiresAt: null,
+      }).where(and(eq(assets.guestSessionId, guestId), eq(assets.status, 'attached')));
+      await tx.update(messages).set({ guestSessionId: null, expiresAt: null }).where(eq(messages.guestSessionId, guestId));
       const outboxId = await this.outbox.enqueue(tx, guest.roomId, 'guest.ended', {
         guestSessionId: guestId,
-        retained,
-        messageIds: retained ? [] : guestMessageRows.map((message) => message.id),
+        retained: true,
+        messageIds: [],
         removedReactions,
       });
       await tx.delete(reactions).where(eq(reactions.actorKey, `guest:${guestId}`));
       await tx.delete(guestSessions).where(eq(guestSessions.id, guestId));
-      return { guest, disposableAssets, outboxId, retained };
+      return { guest, disposableAssets, outboxId };
     });
     if (!ended) return false;
     await this.outbox.deliverIds([ended.outboxId]);
     await this.assetService.deleteKeys(ended.disposableAssets.map((asset) => asset.key));
     this.realtime.disconnectActor(`guest:${guestId}`);
-    return ended.retained;
+    return true;
   }
 
   async searchUsers(actor: Actor, queryInput: unknown) {
-    if (actor.kind !== 'user') throw new UnauthorizedException('Đăng nhập để tìm thành viên.');
+    if (actor.kind !== 'user') throw new UnauthorizedException('Sign in to find members.');
     const query = typeof queryInput === 'string' ? queryInput.trim().replaceAll('%', '').replaceAll('_', '') : '';
     if (query.length < 2) return { users: [] };
     const rows = await this.db.select({ id: users.id, displayName: users.displayName, email: users.email, avatarColor: users.avatarColor })
@@ -254,15 +240,15 @@ export class ChatService {
   }
 
   async createRoom(actor: Actor, body: { name?: unknown; allowGuests?: boolean; memberIds?: unknown[] }) {
-    if (actor.kind !== 'user') throw new UnauthorizedException('Đăng nhập để tạo cuộc trò chuyện lâu dài.');
+    if (actor.kind !== 'user') throw new UnauthorizedException('Sign in to create a persistent conversation.');
     const memberIds = [...new Set((body.memberIds ?? []).filter((id): id is string => typeof id === 'string' && id !== actor.id))].slice(0, 20);
     const members = memberIds.length ? await this.db.select({ id: users.id, displayName: users.displayName }).from(users).where(inArray(users.id, memberIds)) : [];
-    if (members.length !== memberIds.length) throw new BadRequestException('Một thành viên không còn khả dụng.');
+    if (members.length !== memberIds.length) throw new BadRequestException('One of the selected members is no longer available.');
     const requestedName = typeof body.name === 'string' ? body.name.trim() : '';
     const suggestedName = members.length === 1
       ? `${actor.displayName} & ${members[0].displayName}`
-      : requestedName || (members.length > 1 ? `Nhóm ${members.slice(0, 3).map((member) => member.displayName).join(', ')}`.slice(0, 60) : body.name);
-    const name = this.requireText(suggestedName, 'Tên cuộc trò chuyện', 2, 60);
+      : requestedName || (members.length > 1 ? `Group: ${members.slice(0, 3).map((member) => member.displayName).join(', ')}`.slice(0, 60) : body.name);
+    const name = this.requireText(suggestedName, 'Conversation name', 2, 60);
     const inviteCode = this.makeCode();
     const now = Date.now();
     const created = await this.db.transaction(async (tx) => {
@@ -303,19 +289,19 @@ export class ChatService {
   }
 
   async joinRoom(actor: Actor, inviteCodeInput: unknown) {
-    if (actor.kind !== 'user') throw new UnauthorizedException('Đăng nhập để tham gia với tài khoản.');
-    const inviteCode = this.requireText(inviteCodeInput, 'Mã mời', 4, 60);
+    if (actor.kind !== 'user') throw new UnauthorizedException('Sign in to join with an account.');
+    const inviteCode = this.requireText(inviteCodeInput, 'Invite code', 4, 60);
     const [room] = await this.db.select({ id: rooms.id }).from(rooms).where(eq(rooms.inviteCode, inviteCode)).limit(1);
-    if (!room) throw new NotFoundException('Không tìm thấy cuộc trò chuyện từ link mời.');
+    if (!room) throw new NotFoundException('No conversation was found for this invite link.');
     const outboxId = await this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${room.id}, 0))`);
       const [availableRoom] = await tx.select({ id: rooms.id, kind: rooms.kind }).from(rooms)
         .where(and(eq(rooms.id, room.id), eq(rooms.inviteCode, inviteCode))).limit(1);
-      if (!availableRoom) throw new NotFoundException('Cuộc trò chuyện không còn tồn tại.');
+      if (!availableRoom) throw new NotFoundException('The conversation no longer exists.');
       if (availableRoom.kind === 'direct') {
         const [existingMember] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers)
           .where(and(eq(roomMembers.roomId, room.id), eq(roomMembers.userId, actor.id))).limit(1);
-        if (!existingMember) throw new NotFoundException('Không tìm thấy cuộc trò chuyện từ link mời.');
+        if (!existingMember) throw new NotFoundException('No conversation was found for this invite link.');
         return null;
       }
       await tx.insert(roomMembers).values({ roomId: room.id, userId: actor.id, role: 'member', joinedAt: Date.now() })
@@ -393,15 +379,15 @@ export class ChatService {
 
   async sendMessage(roomId: string, actor: Actor, body: { type?: string; text?: unknown; assetKey?: string; replyToId?: string | null; canvasParentId?: string | null; clientRequestId?: string }) {
     await this.actors.assertRoomAccess(roomId, actor);
-    if (!['text', 'image', 'canvas'].includes(body.type ?? '')) throw new BadRequestException('Loại tin nhắn không hợp lệ.');
+    if (!['text', 'image', 'canvas'].includes(body.type ?? '')) throw new BadRequestException('The message type is invalid.');
     const type = body.type as 'text' | 'image' | 'canvas';
-    const text = body.text ? this.requireText(body.text, 'Nội dung', 1, 2000) : null;
-    if (type === 'text' && !text) throw new BadRequestException('Tin nhắn không được để trống.');
-    if ((type === 'image' || type === 'canvas') && !body.assetKey) throw new BadRequestException('Thiếu nội dung hình ảnh.');
+    const text = body.text ? this.requireText(body.text, 'Content', 1, 2000) : null;
+    if (type === 'text' && !text) throw new BadRequestException('Messages cannot be empty.');
+    if ((type === 'image' || type === 'canvas') && !body.assetKey) throw new BadRequestException('Image content is missing.');
     const clientRequestId = typeof body.clientRequestId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.clientRequestId)
       ? body.clientRequestId
       : null;
-    if (body.clientRequestId && !clientRequestId) throw new BadRequestException('Mã chống gửi trùng không hợp lệ.');
+    if (body.clientRequestId && !clientRequestId) throw new BadRequestException('The duplicate-prevention key is invalid.');
     const idempotencyInput = {
       type,
       body: text,
@@ -416,21 +402,21 @@ export class ChatService {
     if (body.assetKey) await this.assetService.assertPending(body.assetKey, roomId, actor);
     if (body.replyToId) {
       const [reply] = await this.db.select({ id: messages.id }).from(messages).where(and(eq(messages.id, body.replyToId), eq(messages.roomId, roomId))).limit(1);
-      if (!reply) throw new BadRequestException('Tin nhắn được trả lời không còn tồn tại.');
+      if (!reply) throw new BadRequestException('The replied-to message no longer exists.');
     }
     let canvasVersion: number | null = null;
     if (type === 'canvas') {
       if (body.canvasParentId) {
         const [parent] = await this.db.select({ version: messages.canvasVersion }).from(messages)
           .where(and(eq(messages.id, body.canvasParentId), eq(messages.roomId, roomId), eq(messages.type, 'canvas'))).limit(1);
-        if (!parent) throw new BadRequestException('Bản vẽ gốc không còn tồn tại.');
+        if (!parent) throw new BadRequestException('The original drawing no longer exists.');
         canvasVersion = (parent.version ?? 1) + 1;
       } else canvasVersion = 1;
     }
     const now = Date.now();
     const result = await this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${roomId}, 0))`);
-      let guestContentExpiresAt = actor.kind === 'guest' ? actor.expiresAt : null;
+      const guestContentExpiresAt = null;
       if (clientRequestId) {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${clientRequestId}, 0))`);
         const [existing] = await tx.select({
@@ -452,16 +438,13 @@ export class ChatService {
       if (actor.kind === 'guest') {
         const [valid] = await tx.select({ id: guestSessions.id }).from(guestSessions)
           .where(and(eq(guestSessions.id, actor.id), eq(guestSessions.roomId, roomId), gt(guestSessions.expiresAt, now))).for('update').limit(1);
-        if (!valid) throw new UnauthorizedException('Phiên khách đã kết thúc trước khi tin nhắn được gửi.');
-        const [authenticatedMember] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers)
-          .where(eq(roomMembers.roomId, roomId)).limit(1);
-        if (authenticatedMember) guestContentExpiresAt = null;
+        if (!valid) throw new UnauthorizedException('The guest session ended before the message was sent.');
       }
       if (body.assetKey) {
         const attached = await tx.update(assets).set({ status: 'attached', expiresAt: guestContentExpiresAt }).where(and(
           eq(assets.key, body.assetKey), eq(assets.roomId, roomId), eq(assets.ownerKey, actor.actorKey), eq(assets.status, 'pending'),
         )).returning({ key: assets.key });
-        if (!attached.length) throw new BadRequestException('Hình ảnh đã được dùng bởi một tin nhắn khác.');
+        if (!attached.length) throw new BadRequestException('The image has already been used by another message.');
       }
       const [inserted] = await tx.insert(messages).values({
         roomId,
@@ -490,7 +473,7 @@ export class ChatService {
     const messageId = typeof messageIdInput === 'string' ? messageIdInput : '';
     const [target] = await this.db.select({ id: messages.id, createdAt: messages.createdAt, sequence: messages.sequence }).from(messages)
       .where(and(eq(messages.id, messageId), eq(messages.roomId, roomId))).limit(1);
-    if (!target) throw new BadRequestException('Tin nhắn cuối đã đọc không hợp lệ.');
+    if (!target) throw new BadRequestException('The last-read message is invalid.');
     const outboxId = await this.db.transaction(async (tx) => {
       const advanced = actor.kind === 'user'
         ? await tx.update(roomMembers).set({ lastReadSequence: target.sequence }).where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, actor.id), lt(roomMembers.lastReadSequence, target.sequence))).returning({ roomId: roomMembers.roomId })
@@ -504,15 +487,15 @@ export class ChatService {
   }
 
   async toggleReaction(messageId: string, actor: Actor, emoji: string) {
-    if (!EMOJIS.includes(emoji)) throw new BadRequestException('Reaction không hợp lệ.');
+    if (!EMOJIS.includes(emoji)) throw new BadRequestException('The reaction is invalid.');
     const [message] = await this.db.select({ roomId: messages.roomId }).from(messages).where(eq(messages.id, messageId)).limit(1);
-    if (!message) throw new NotFoundException('Tin nhắn không còn tồn tại.');
+    if (!message) throw new NotFoundException('The message no longer exists.');
     await this.actors.assertRoomAccess(message.roomId, actor);
     const result = await this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`${messageId}:${actor.actorKey}:${emoji}`}, 0))`);
       if (actor.kind === 'guest') {
         const [valid] = await tx.select({ id: guestSessions.id }).from(guestSessions).where(and(eq(guestSessions.id, actor.id), gt(guestSessions.expiresAt, Date.now()))).for('update').limit(1);
-        if (!valid) throw new UnauthorizedException('Phiên khách đã kết thúc.');
+        if (!valid) throw new UnauthorizedException('The guest session has ended.');
       }
       const [existing] = await tx.select({ messageId: reactions.messageId }).from(reactions)
         .where(and(eq(reactions.messageId, messageId), eq(reactions.actorKey, actor.actorKey), eq(reactions.emoji, emoji))).limit(1);
@@ -524,11 +507,20 @@ export class ChatService {
         await tx.insert(reactions).values({ messageId, actorKey: actor.actorKey, emoji, createdAt: Date.now(), expiresAt: actor.kind === 'guest' ? actor.expiresAt : null });
         reacted = true;
       }
-      const outboxId = await this.outbox.enqueue(tx, message.roomId, 'reaction.updated', { messageId, emoji, actorKey: actor.actorKey, reacted });
-      return { reacted, outboxId };
+      const [reactionCount] = await tx.select({ count: sql<number>`count(*)::int` }).from(reactions)
+        .where(and(eq(reactions.messageId, messageId), eq(reactions.emoji, emoji), or(isNull(reactions.expiresAt), gt(reactions.expiresAt, Date.now()))));
+      const count = reactionCount?.count ?? 0;
+      const outboxId = await this.outbox.enqueue(tx, message.roomId, 'reaction.updated', {
+        messageId,
+        emoji,
+        actorKey: actor.actorKey,
+        reacted,
+        count,
+      });
+      return { reacted, count, outboxId };
     });
     await this.outbox.deliverIds([result.outboxId]);
-    return { reacted: result.reacted };
+    return { reacted: result.reacted, count: result.count };
   }
 
   async cleanupExpiredGuests() {
@@ -540,11 +532,13 @@ export class ChatService {
       lt(rooms.createdAt, now - EMPTY_GUEST_ROOM_GRACE_MS),
       sql`not exists (select 1 from ${roomMembers} where ${roomMembers.roomId} = ${rooms.id})`,
       sql`not exists (select 1 from ${guestSessions} where ${guestSessions.roomId} = ${rooms.id})`,
+      sql`not exists (select 1 from ${messages} where ${messages.roomId} = ${rooms.id})`,
+      sql`not exists (select 1 from ${assets} where ${assets.roomId} = ${rooms.id})`,
     )).orderBy(asc(rooms.createdAt)).limit(ABANDONED_GUEST_ROOM_BATCH);
     for (const candidate of abandonedRoomCandidates) {
-      const claimedAssets = await this.db.transaction(async (tx) => {
+      await this.db.transaction(async (tx) => {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${candidate.id}, 0))`);
-        const [room, member, activeGuest, latestGuestEnd] = await Promise.all([
+        const [room, member, activeGuest, remainingMessage, remainingAsset, latestGuestEnd] = await Promise.all([
           tx.select({ id: rooms.id, createdAt: rooms.createdAt }).from(rooms).where(and(
             eq(rooms.id, candidate.id),
             eq(rooms.kind, 'guest'),
@@ -552,33 +546,16 @@ export class ChatService {
           )).limit(1),
           tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.roomId, candidate.id)).limit(1),
           tx.select({ id: guestSessions.id }).from(guestSessions).where(eq(guestSessions.roomId, candidate.id)).limit(1),
+          tx.select({ id: messages.id }).from(messages).where(eq(messages.roomId, candidate.id)).limit(1),
+          tx.select({ key: assets.key }).from(assets).where(eq(assets.roomId, candidate.id)).limit(1),
           tx.select({ createdAt: realtimeOutbox.createdAt }).from(realtimeOutbox).where(and(
             eq(realtimeOutbox.roomId, candidate.id),
             eq(realtimeOutbox.event, 'guest.ended'),
           )).orderBy(desc(realtimeOutbox.createdAt)).limit(1),
         ]);
         const emptySince = latestGuestEnd[0]?.createdAt ?? room[0]?.createdAt;
-        if (!room[0] || member[0] || activeGuest[0] || !emptySince || emptySince >= now - EMPTY_GUEST_ROOM_GRACE_MS) return null;
-        const legacyAssets = await tx.select({ key: assets.key }).from(assets)
-          .where(eq(assets.roomId, candidate.id)).orderBy(asc(assets.createdAt)).limit(ABANDONED_GUEST_ASSET_BATCH);
-        if (legacyAssets.length) {
-          await tx.update(assets).set({ status: 'deleting' })
-            .where(inArray(assets.key, legacyAssets.map((asset) => asset.key)));
-        }
-        await tx.delete(messages).where(eq(messages.roomId, candidate.id));
-        return legacyAssets.map((asset) => asset.key);
-      });
-      if (!claimedAssets) continue;
-      await this.assetService.deleteKeys(claimedAssets);
-      await this.db.transaction(async (tx) => {
-        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${candidate.id}, 0))`);
-        const [member, activeGuest, remainingMessage, remainingAsset] = await Promise.all([
-          tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.roomId, candidate.id)).limit(1),
-          tx.select({ id: guestSessions.id }).from(guestSessions).where(eq(guestSessions.roomId, candidate.id)).limit(1),
-          tx.select({ id: messages.id }).from(messages).where(eq(messages.roomId, candidate.id)).limit(1),
-          tx.select({ key: assets.key }).from(assets).where(eq(assets.roomId, candidate.id)).limit(1),
-        ]);
-        if (!member[0] && !activeGuest[0] && !remainingMessage[0] && !remainingAsset[0]) {
+        if (room[0] && !member[0] && !activeGuest[0] && !remainingMessage[0] && !remainingAsset[0]
+          && emptySince && emptySince < now - EMPTY_GUEST_ROOM_GRACE_MS) {
           await tx.delete(rooms).where(and(eq(rooms.id, candidate.id), eq(rooms.kind, 'guest')));
         }
       });
@@ -594,15 +571,15 @@ export class ChatService {
       const [room] = await tx.insert(rooms).values({ name: 'Minh Anh', kind: 'direct', createdBy: actor.id, inviteCode: this.makeCode(), allowGuests: false, createdAt: now }).returning({ id: rooms.id });
       await tx.insert(roomMembers).values({ roomId: room.id, userId: actor.id, role: 'owner', joinedAt: now });
       await tx.insert(messages).values([
-        { roomId: room.id, senderName: 'Minh Anh', type: 'text', body: 'Chào mừng đến với Nét. Đây là nơi chữ và hình có thể tiếp tục câu chuyện cùng nhau.', createdAt: now + 1 },
-        { roomId: room.id, senderId: actor.id, senderName: actor.displayName, type: 'text', body: 'Mình bắt đầu bằng một nét nhé ✨', createdAt: now + 2 },
+        { roomId: room.id, senderName: 'Minh Anh', type: 'text', body: 'Welcome to Nét, where words and drawings can continue the same story.', createdAt: now + 1 },
+        { roomId: room.id, senderId: actor.id, senderName: actor.displayName, type: 'text', body: 'I will start with a line ✨', createdAt: now + 2 },
       ]);
     });
   }
 
   private requireText(value: unknown, label: string, min: number, max: number) {
     const text = typeof value === 'string' ? value.trim() : '';
-    if (text.length < min || text.length > max) throw new BadRequestException(`${label} phải có từ ${min} đến ${max} ký tự.`);
+    if (text.length < min || text.length > max) throw new BadRequestException(`${label} must be between ${min} and ${max} characters.`);
     return text;
   }
 
@@ -644,10 +621,10 @@ export class ChatService {
     input: { type: string; body: string | null; assetKey: string | null; replyToId: string | null; canvasParentId: string | null },
   ) {
     const owned = message.roomId === roomId && (actor.kind === 'user' ? message.senderId === actor.id : message.guestSessionId === actor.id);
-    if (!owned) throw new BadRequestException('Mã chống gửi trùng đã thuộc một yêu cầu khác.');
+    if (!owned) throw new BadRequestException('The duplicate-prevention key belongs to another request.');
     if (message.type !== input.type || message.body !== input.body || message.assetKey !== input.assetKey
       || message.replyToId !== input.replyToId || message.canvasParentId !== input.canvasParentId) {
-      throw new BadRequestException('Mã chống gửi trùng không thể dùng cho nội dung khác.');
+      throw new BadRequestException('The duplicate-prevention key cannot be reused for different content.');
     }
     return { id: message.id, sequence: message.sequence, createdAt: message.createdAt, canvasVersion: message.canvasVersion };
   }

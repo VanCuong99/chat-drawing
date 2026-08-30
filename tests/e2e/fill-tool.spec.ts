@@ -7,15 +7,15 @@ test.use({ hasTouch: true });
 
 test.afterEach(async ({ page }) => {
   page.on('dialog', (dialog) => void dialog.accept());
-  const studio = page.getByRole('dialog', { name: 'Studio Nét' });
-  if (await studio.isVisible().catch(() => false)) await studio.getByRole('button', { name: /Đóng/ }).click().catch(() => undefined);
-  const openSidebar = page.getByRole('button', { name: 'Mở danh sách trò chuyện' });
+  const studio = page.getByRole('dialog', { name: /Nét Studio|Studio Nét/ });
+  if (await studio.isVisible().catch(() => false)) await studio.getByRole('button', { name: /Close|Đóng/ }).click().catch(() => undefined);
+  const openSidebar = page.getByRole('button', { name: /Open conversation list|Mở danh sách trò chuyện/ });
   if (await openSidebar.isVisible().catch(() => false)) await openSidebar.click();
-  const endSession = page.getByRole('button', { name: 'Kết thúc phiên khách' });
+  const endSession = page.getByRole('button', { name: /End guest session|Kết thúc phiên khách/ });
   if (await endSession.isVisible().catch(() => false)) {
     await expect(endSession).toBeInViewport();
     await endSession.click();
-    await page.getByRole('button', { name: 'Kết thúc phiên', exact: true }).click();
+    await page.getByRole('button', { name: /End Session|Kết thúc phiên/, exact: true }).click();
   }
 });
 
@@ -23,7 +23,7 @@ async function setRangeValue(locator: Locator, value: number) {
   await locator.evaluate((element, nextValue) => {
     const input = element as HTMLInputElement;
     const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-    if (!setValue) throw new Error('Không thể cập nhật thanh điều chỉnh');
+    if (!setValue) throw new Error('Unable to update range control');
     setValue.call(input, String(nextValue));
     input.dispatchEvent(new Event('input', { bubbles: true }));
   }, value);
@@ -33,7 +33,7 @@ async function setRangeValue(locator: Locator, value: number) {
 async function readCanvasPixel(canvas: Locator, point: { x: number; y: number }) {
   return canvas.evaluate((element, position) => {
     const context = (element as HTMLCanvasElement).getContext('2d');
-    if (!context) throw new Error('Không thể đọc canvas 2D');
+    if (!context) throw new Error('Unable to read the 2D canvas');
     return Array.from(context.getImageData(position.x, position.y, 1, 1).data);
   }, point);
 }
@@ -41,7 +41,7 @@ async function readCanvasPixel(canvas: Locator, point: { x: number; y: number })
 async function readCanvasColumn(canvas: Locator, x: number, fromY: number, toY: number) {
   return canvas.evaluate((element, sample) => {
     const context = (element as HTMLCanvasElement).getContext('2d');
-    if (!context) throw new Error('Không thể đọc canvas 2D');
+    if (!context) throw new Error('Unable to read the 2D canvas');
     const height = sample.toY - sample.fromY + 1;
     const data = context.getImageData(sample.x, sample.fromY, 1, height).data;
     return Array.from({ length: height }, (_, index) => Array.from(data.slice(index * 4, index * 4 + 4)));
@@ -51,7 +51,7 @@ async function readCanvasColumn(canvas: Locator, x: number, fromY: number, toY: 
 async function readCanvasRow(canvas: Locator, y: number, fromX: number, toX: number) {
   return canvas.evaluate((element, sample) => {
     const context = (element as HTMLCanvasElement).getContext('2d');
-    if (!context) throw new Error('Không thể đọc canvas 2D');
+    if (!context) throw new Error('Unable to read the 2D canvas');
     const width = sample.toX - sample.fromX + 1;
     const data = context.getImageData(sample.fromX, sample.y, width, 1).data;
     return Array.from({ length: width }, (_, index) => Array.from(data.slice(index * 4, index * 4 + 4)));
@@ -61,7 +61,7 @@ async function readCanvasRow(canvas: Locator, y: number, fromX: number, toX: num
 async function countFillEdgeGaps(canvas: Locator, bounds: { left: number; top: number; width: number; height: number }) {
   return canvas.evaluate((element, area) => {
     const context = (element as HTMLCanvasElement).getContext('2d');
-    if (!context) throw new Error('Không thể đọc canvas 2D');
+    if (!context) throw new Error('Unable to read the 2D canvas');
     const data = context.getImageData(area.left, area.top, area.width, area.height).data;
     const colorAt = (x: number, y: number) => {
       const offset = (y * area.width + x) * 4;
@@ -89,7 +89,7 @@ async function countFillEdgeGaps(canvas: Locator, bounds: { left: number; top: n
 async function readCanvasRegionSignature(canvas: Locator, bounds: { left: number; top: number; width: number; height: number }) {
   return canvas.evaluate((element, area) => {
     const context = (element as HTMLCanvasElement).getContext('2d');
-    if (!context) throw new Error('Không thể đọc canvas 2D');
+    if (!context) throw new Error('Unable to read the 2D canvas');
     const data = context.getImageData(area.left, area.top, area.width, area.height).data;
     const colors = new Set<string>();
     let minimumLightness = 255;
@@ -126,34 +126,34 @@ async function drawRectangle(page: Page, canvas: Locator) {
   };
 }
 
-test('paint bucket tô vùng kín bằng một chạm, hoàn tác được và nằm trong menu mobile @critical', async ({ page }) => {
+test('paint bucket fills a closed region in one tap, supports undo, and remains available on mobile @critical', async ({ page }) => {
   await page.goto('/');
-  await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
-  await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(`Guest Fill ${Date.now()}`);
-  await page.getByRole('button', { name: 'Vào Nét' }).click();
-  const openCanvas = page.getByRole('button', { name: 'Mở canvas' });
+  await page.getByRole('button', { name: 'Try as a Guest' }).click();
+  await page.getByRole('textbox', { name: 'Display Name' }).fill(`Guest Fill ${Date.now()}`);
+  await page.getByRole('button', { name: 'Enter Nét' }).click();
+  const openCanvas = page.getByRole('button', { name: 'Open canvas' });
   await expect(openCanvas).toBeVisible();
   await openCanvas.click();
 
-  const studio = page.getByRole('dialog', { name: 'Studio Nét' });
-  const canvas = studio.getByLabel('Vùng vẽ nâng cao');
-  await page.getByRole('button', { name: /Hình dạng/ }).click();
-  await page.getByRole('dialog', { name: 'Chọn hình dạng' }).getByRole('button', { name: 'Chữ nhật', exact: true }).click();
+  const studio = page.getByRole('dialog', { name: 'Nét Studio' });
+  const canvas = studio.getByLabel('Advanced drawing area');
+  await page.getByRole('button', { name: /Shape/ }).click();
+  await page.getByRole('dialog', { name: 'Choose a Shape' }).getByRole('button', { name: 'Rectangle', exact: true }).click();
   const center = await drawRectangle(page, canvas);
-  await expect(studio.getByText('1 thao tác')).toBeVisible();
+  await expect(studio.getByText('1 actions')).toBeVisible();
 
   const fillButton = studio.locator('.tool-rail [data-tool-id="fill"]');
   await expect(fillButton).toBeVisible();
   await fillButton.click();
   await expect(fillButton).toHaveAttribute('aria-pressed', 'true');
   await expect(canvas).toHaveCSS('cursor', /fill\.svg/);
-  await expect(studio.getByText('Chạm vùng kín để tô')).toBeVisible();
-  await expect(studio.getByLabel('Độ lan màu')).toHaveValue('24');
+  await expect(studio.getByText('Tap a closed region to fill')).toBeVisible();
+  await expect(studio.getByLabel('Color Tolerance')).toHaveValue('24');
 
   const desktopBox = await canvas.boundingBox();
   expect(desktopBox).not.toBeNull();
   await canvas.click({ position: { x: center.x / CANVAS_WIDTH * desktopBox!.width, y: center.y / CANVAS_HEIGHT * desktopBox!.height } });
-  await expect(studio.getByText('2 thao tác')).toBeVisible();
+  await expect(studio.getByText('2 actions')).toBeVisible();
   await expect.poll(async () => readCanvasPixel(canvas, center)).toEqual([111, 78, 232, 255]);
   await expect.poll(async () => readCanvasPixel(canvas, { x: 60, y: 60 })).toEqual([255, 254, 251, 255]);
   await expect.poll(async () => {
@@ -162,31 +162,31 @@ test('paint bucket tô vùng kín bằng một chạm, hoàn tác được và n
     const firstBoundaryPixel = pixels.findIndex((pixel) => paperDistance(pixel) > 90);
     if (firstBoundaryPixel < 0) return -1;
     return pixels.slice(firstBoundaryPixel).filter((pixel) => paperDistance(pixel) < 70).length;
-  }, { message: 'Màu tô phải chạm sát nét, không để lại viền màu giấy' }).toBe(0);
+  }, { message: 'The fill must reach the outline without leaving a paper-colored halo' }).toBe(0);
 
-  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
-  await expect(studio.getByText('1 thao tác')).toBeVisible();
+  await studio.getByRole('button', { name: 'Undo' }).click();
+  await expect(studio.getByText('1 actions')).toBeVisible();
   await expect.poll(async () => readCanvasPixel(canvas, center)).toEqual([255, 254, 251, 255]);
-  await studio.getByRole('button', { name: 'Làm lại' }).click();
+  await studio.getByRole('button', { name: 'Redo' }).click();
   await expect.poll(async () => readCanvasPixel(canvas, center)).toEqual([111, 78, 232, 255]);
-  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
+  await studio.getByRole('button', { name: 'Undo' }).click();
 
-  await setRangeValue(studio.getByLabel('Độ lan màu'), 36);
-  await setRangeValue(studio.getByLabel('Độ trong suốt'), 50);
+  await setRangeValue(studio.getByLabel('Color Tolerance'), 36);
+  await setRangeValue(studio.getByLabel('Opacity'), 50);
 
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(fillButton).toBeHidden();
-  await studio.getByRole('button', { name: 'Công cụ khác' }).click();
-  const moreTools = studio.getByRole('dialog', { name: 'Công cụ khác' });
-  await expect(moreTools.getByRole('button', { name: /Bút highlight/ })).toBeFocused();
-  const mobileFill = moreTools.getByRole('button', { name: /Tô màu/ });
+  await studio.getByRole('button', { name: 'More tools' }).click();
+  const moreTools = studio.getByRole('dialog', { name: 'More Tools' });
+  await expect(moreTools.getByRole('button', { name: /Highlighter/ })).toBeFocused();
+  const mobileFill = moreTools.getByRole('button', { name: /Fill/ });
   await expect(mobileFill).toBeVisible();
   const mobileFillBox = await mobileFill.boundingBox();
   expect(mobileFillBox?.width).toBeGreaterThanOrEqual(44);
   expect(mobileFillBox?.height).toBeGreaterThanOrEqual(44);
   await mobileFill.click();
   await expect(canvas).toBeFocused();
-  for (const name of ['Độ lan màu', 'Độ trong suốt']) {
+  for (const name of ['Color Tolerance', 'Opacity']) {
     const rangeBox = await studio.getByLabel(name).boundingBox();
     expect(rangeBox?.height).toBeGreaterThanOrEqual(44);
   }
@@ -197,25 +197,25 @@ test('paint bucket tô vùng kín bằng một chạm, hoàn tác được và n
     mobileCanvasBox!.x + center.x / CANVAS_WIDTH * mobileCanvasBox!.width,
     mobileCanvasBox!.y + center.y / CANVAS_HEIGHT * mobileCanvasBox!.height,
   );
-  await expect(studio.getByText('2 thao tác')).toBeVisible();
+  await expect(studio.getByText('2 actions')).toBeVisible();
   await expect.poll(async () => {
     const [red, green, blue, alpha] = await readCanvasPixel(canvas, center);
     return { red, green, blue, alpha };
   }).toEqual({ red: 183, green: 166, blue: 241, alpha: 255 });
   await expect.poll(async () => readCanvasPixel(canvas, { x: 60, y: 60 })).toEqual([255, 254, 251, 255]);
-  await expect(studio.getByText(/độ lan 36/)).toBeVisible();
+  await expect(studio.getByText(/tolerance 36/)).toBeVisible();
 
 });
 
-test('paint bucket phủ kín mép anti-alias của nét vẽ tự do mà không tràn ra ngoài @critical', async ({ page }) => {
+test('paint bucket seals an anti-aliased freehand edge without leaking outside @critical', async ({ page }) => {
   await page.goto('/');
-  await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
-  await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(`Guest Fill Edge ${Date.now()}`);
-  await page.getByRole('button', { name: 'Vào Nét' }).click();
-  await page.getByRole('button', { name: 'Mở canvas' }).click();
+  await page.getByRole('button', { name: 'Try as a Guest' }).click();
+  await page.getByRole('textbox', { name: 'Display Name' }).fill(`Guest Fill Edge ${Date.now()}`);
+  await page.getByRole('button', { name: 'Enter Nét' }).click();
+  await page.getByRole('button', { name: 'Open canvas' }).click();
 
-  const studio = page.getByRole('dialog', { name: 'Studio Nét' });
-  const canvas = studio.getByLabel('Vùng vẽ nâng cao');
+  const studio = page.getByRole('dialog', { name: 'Nét Studio' });
+  const canvas = studio.getByLabel('Advanced drawing area');
   const box = await canvas.boundingBox();
   expect(box).not.toBeNull();
   const center = { x: 600, y: 360 };
@@ -238,11 +238,11 @@ test('paint bucket phủ kín mép anti-alias của nét vẽ tự do mà không
   }
   await page.mouse.up();
 
-  await studio.getByRole('button', { name: 'Chọn màu #d34d8b' }).click();
+  await studio.getByRole('button', { name: 'Choose color #d34d8b' }).click();
   await studio.locator('.tool-rail [data-tool-id="fill"]').click();
   const centerOnScreen = screenPoint(center.x, center.y);
   await page.mouse.click(centerOnScreen.x, centerOnScreen.y);
-  await expect(studio.getByText('2 thao tác')).toBeVisible();
+  await expect(studio.getByText('2 actions')).toBeVisible();
   await expect.poll(async () => readCanvasPixel(canvas, center)).toEqual([211, 77, 139, 255]);
   await expect.poll(async () => readCanvasPixel(canvas, { x: center.x - radius - 24, y: center.y })).toEqual([255, 254, 251, 255]);
 
@@ -252,43 +252,44 @@ test('paint bucket phủ kín mép anti-alias của nét vẽ tự do mà không
     const firstBoundaryPixel = pixels.findIndex((pixel) => paperDistance(pixel) > 90);
     if (firstBoundaryPixel < 0) return -1;
     return pixels.slice(firstBoundaryPixel).filter((pixel) => paperDistance(pixel) < 70).length;
-  }, { message: 'Nét vẽ tự do không được có viền màu giấy giữa đường bao và vùng tô' }).toBe(0);
+  }, { message: 'A freehand outline must not leave a paper-colored halo around the fill' }).toBe(0);
   await expect.poll(async () => countFillEdgeGaps(canvas, {
     left: center.x - radius - 16,
     top: center.y - radius - 16,
     width: radius * 2 + 32,
     height: radius * 2 + 32,
-  }), { message: 'Không được còn pixel sáng nằm kẹp giữa màu tô và nét vẽ' }).toBe(0);
+  }), { message: 'No light pixel may remain trapped between the fill and outline' }).toBe(0);
 });
 
-test('màu nước tạo granulation ổn định, đọng viền và vẫn hoàn tác được @critical', async ({ page }) => {
+test('natural fill materials render stable grain, edge pooling, water control, and undo @critical', async ({ page }) => {
   await page.goto('/');
-  await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
-  await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(`Guest Watercolor ${Date.now()}`);
-  await page.getByRole('button', { name: 'Vào Nét' }).click();
-  await page.getByRole('button', { name: 'Mở canvas' }).click();
+  await page.getByRole('button', { name: 'Try as a Guest' }).click();
+  await page.getByRole('textbox', { name: 'Display Name' }).fill(`Guest Watercolor ${Date.now()}`);
+  await page.getByRole('button', { name: 'Enter Nét' }).click();
+  await page.getByRole('button', { name: 'Open canvas' }).click();
 
-  const studio = page.getByRole('dialog', { name: 'Studio Nét' });
-  const canvas = studio.getByLabel('Vùng vẽ nâng cao');
-  await page.getByRole('button', { name: /Hình dạng/ }).click();
-  await page.getByRole('dialog', { name: 'Chọn hình dạng' }).getByRole('button', { name: 'Chữ nhật', exact: true }).click();
+  const studio = page.getByRole('dialog', { name: 'Nét Studio' });
+  const canvas = studio.getByLabel('Advanced drawing area');
+  await page.getByRole('button', { name: /Shape/ }).click();
+  await page.getByRole('dialog', { name: 'Choose a Shape' }).getByRole('button', { name: 'Rectangle', exact: true }).click();
   const center = await drawRectangle(page, canvas);
-  await studio.getByRole('button', { name: 'Chọn màu #d34d8b' }).click();
+  await studio.getByRole('button', { name: 'Choose color #d34d8b' }).click();
   await studio.locator('.tool-rail [data-tool-id="fill"]').click();
 
-  const materialGroup = studio.getByRole('group', { name: 'Chất liệu tô' });
-  const watercolor = materialGroup.getByRole('button', { name: /Màu nước/ });
+  const materialGroup = studio.getByRole('group', { name: 'Fill Material' });
+  const watercolor = materialGroup.getByRole('button', { name: /Watercolor/ });
   await expect(watercolor).toBeVisible();
   const watercolorBox = await watercolor.boundingBox();
   expect(watercolorBox?.height).toBeGreaterThanOrEqual(44);
   await watercolor.click();
   await expect(watercolor).toHaveAttribute('aria-pressed', 'true');
-  await expect(studio.getByLabel('Độ chất liệu')).toHaveValue('60');
+  await expect(studio.getByLabel('Granulation')).toHaveValue('60');
+  await expect(studio.getByLabel('Water')).toHaveValue('45');
 
   const box = await canvas.boundingBox();
   expect(box).not.toBeNull();
   await canvas.click({ position: { x: center.x / CANVAS_WIDTH * box!.width, y: center.y / CANVAS_HEIGHT * box!.height } });
-  await expect(studio.getByText('2 thao tác')).toBeVisible();
+  await expect(studio.getByText('2 actions')).toBeVisible();
   const sample = { left: center.x - 50, top: center.y - 40, width: 100, height: 80 };
   await expect.poll(async () => {
     const signature = await readCanvasRegionSignature(canvas, sample);
@@ -299,24 +300,24 @@ test('màu nước tạo granulation ổn định, đọng viền và vẫn hoà
   expect(paintedSignature.lightnessRange).toBeGreaterThan(8);
   await expect.poll(async () => readCanvasPixel(canvas, { x: 60, y: 60 })).toEqual([255, 254, 251, 255]);
 
-  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
+  await studio.getByRole('button', { name: 'Undo' }).click();
   await expect.poll(async () => readCanvasPixel(canvas, center)).toEqual([255, 254, 251, 255]);
-  await studio.getByRole('button', { name: 'Làm lại' }).click();
+  await studio.getByRole('button', { name: 'Redo' }).click();
   await expect.poll(async () => readCanvasRegionSignature(canvas, sample)).toEqual(paintedSignature);
 
-  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
-  const pencil = materialGroup.getByRole('button', { name: /Chì màu/ });
+  await studio.getByRole('button', { name: 'Undo' }).click();
+  const pencil = materialGroup.getByRole('button', { name: /Colored Pencil/ });
   await pencil.click();
   await canvas.click({ position: { x: center.x / CANVAS_WIDTH * box!.width, y: center.y / CANVAS_HEIGHT * box!.height } });
   const pencilSignature = await readCanvasRegionSignature(canvas, sample);
   expect(pencilSignature.uniqueColors).toBeGreaterThan(20);
   expect(pencilSignature.lightnessRange).toBeGreaterThan(20);
   expect(pencilSignature.hash).not.toBe(paintedSignature.hash);
-  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
-  await studio.getByRole('button', { name: 'Làm lại' }).click();
+  await studio.getByRole('button', { name: 'Undo' }).click();
+  await studio.getByRole('button', { name: 'Redo' }).click();
   await expect.poll(async () => readCanvasRegionSignature(canvas, sample)).toEqual(pencilSignature);
 
-  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
+  await studio.getByRole('button', { name: 'Undo' }).click();
   const marker = materialGroup.getByRole('button', { name: /Marker/ });
   await marker.click();
   await canvas.click({ position: { x: center.x / CANVAS_WIDTH * box!.width, y: center.y / CANVAS_HEIGHT * box!.height } });
@@ -325,25 +326,49 @@ test('màu nước tạo granulation ổn định, đọng viền và vẫn hoà
   expect(markerSignature.lightnessRange).toBeGreaterThan(8);
   expect(markerSignature.hash).not.toBe(paintedSignature.hash);
   expect(markerSignature.hash).not.toBe(pencilSignature.hash);
-  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
-  await studio.getByRole('button', { name: 'Làm lại' }).click();
+  await studio.getByRole('button', { name: 'Undo' }).click();
+  await studio.getByRole('button', { name: 'Redo' }).click();
   await expect.poll(async () => readCanvasRegionSignature(canvas, sample)).toEqual(markerSignature);
+
+  await studio.getByRole('button', { name: 'Undo' }).click();
+  const gouache = materialGroup.getByRole('button', { name: /Gouache/ });
+  await gouache.click();
+  await canvas.click({ position: { x: center.x / CANVAS_WIDTH * box!.width, y: center.y / CANVAS_HEIGHT * box!.height } });
+  const gouacheSignature = await readCanvasRegionSignature(canvas, sample);
+  expect(gouacheSignature.uniqueColors).toBeGreaterThan(10);
+  expect(gouacheSignature.lightnessRange).toBeGreaterThanOrEqual(5);
+  expect(gouacheSignature.hash).not.toBe(paintedSignature.hash);
+  expect(gouacheSignature.hash).not.toBe(pencilSignature.hash);
+  expect(gouacheSignature.hash).not.toBe(markerSignature.hash);
+  await studio.getByRole('button', { name: 'Undo' }).click();
+  await studio.getByRole('button', { name: 'Redo' }).click();
+  await expect.poll(async () => readCanvasRegionSignature(canvas, sample)).toEqual(gouacheSignature);
 
   // A material is a glaze, so applying it over a solid fill of the same RGB
   // must still create a new visual action rather than being treated as a no-op.
-  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
-  const solid = materialGroup.getByRole('button', { name: /Phẳng/ });
+  await studio.getByRole('button', { name: 'Undo' }).click();
+  const solid = materialGroup.getByRole('button', { name: /Solid/ });
   await solid.click();
   await canvas.click({ position: { x: center.x / CANVAS_WIDTH * box!.width, y: center.y / CANVAS_HEIGHT * box!.height } });
   const solidSignature = await readCanvasRegionSignature(canvas, sample);
   await watercolor.click();
   await canvas.click({ position: { x: center.x / CANVAS_WIDTH * box!.width, y: center.y / CANVAS_HEIGHT * box!.height } });
-  await expect(studio.getByText('3 thao tác')).toBeVisible();
+  await expect(studio.getByText('3 actions')).toBeVisible();
   const glazedSignature = await readCanvasRegionSignature(canvas, sample);
   expect(glazedSignature.hash).not.toBe(solidSignature.hash);
-  await studio.getByRole('button', { name: 'Hoàn tác' }).click();
+  await studio.getByRole('button', { name: 'Undo' }).click();
   await expect.poll(async () => readCanvasRegionSignature(canvas, sample)).toEqual(solidSignature);
-  await studio.getByRole('button', { name: 'Làm lại' }).click();
+  await studio.getByRole('button', { name: 'Redo' }).click();
+  await expect.poll(async () => readCanvasRegionSignature(canvas, sample)).toEqual(glazedSignature);
+
+  // Repeated washes reuse the exact previous region mask. This models glazing
+  // without the second click fragmenting into islands created by the first
+  // wash's paper grain.
+  await canvas.click({ position: { x: center.x / CANVAS_WIDTH * box!.width, y: center.y / CANVAS_HEIGHT * box!.height } });
+  await expect(studio.getByText('4 actions')).toBeVisible();
+  const secondGlazeSignature = await readCanvasRegionSignature(canvas, sample);
+  expect(secondGlazeSignature.hash).not.toBe(glazedSignature.hash);
+  await studio.getByRole('button', { name: 'Undo' }).click();
   await expect.poll(async () => readCanvasRegionSignature(canvas, sample)).toEqual(glazedSignature);
 
   for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }]) {
@@ -352,7 +377,7 @@ test('màu nước tạo granulation ổn định, đọng viền và vẫn hoà
       const materialBox = await material.boundingBox();
       expect(materialBox?.height).toBeGreaterThanOrEqual(44);
     }
-    for (const sliderName of ['Độ chất liệu', 'Độ lan màu']) {
+    for (const sliderName of ['Granulation', 'Water', 'Color Tolerance']) {
       const sliderBox = await studio.getByLabel(sliderName).boundingBox();
       expect(sliderBox?.height).toBeGreaterThanOrEqual(44);
     }

@@ -1,6 +1,9 @@
 import { expect, test, type Locator } from '@playwright/test';
 import { createHmac } from 'node:crypto';
 import { createDatabase, eq, inArray, messages, roomMembers, rooms, users } from '@net/database';
+import { setVietnameseUi } from './use-vietnamese-ui';
+
+test.beforeEach(async ({ context }) => setVietnameseUi(context));
 
 const API_URL = 'http://localhost:3001/api';
 
@@ -136,7 +139,7 @@ test('guest mở link mời thấy ô tên trực tiếp @critical', async ({ pa
   const guestName = page.getByRole('textbox', { name: 'Tên hiển thị' });
   await expect(guestName).toBeFocused();
   expect(await guestName.evaluate((input) => getComputedStyle(input).fontSize)).toBe('16px');
-  await expect(page.getByRole('button', { name: 'Tham gia' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Vào phòng' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Vào phòng ngay' })).toHaveCount(0);
   await expect(page.getByRole('dialog')).toHaveCount(0);
   for (const action of [
@@ -151,7 +154,7 @@ test('guest mở link mời thấy ô tên trực tiếp @critical', async ({ pa
 test('link mời sai không tuyên bố phòng đã sẵn sàng và không hỏi tên guest @critical', async ({ page }) => {
   await page.route('**/api/invites/invalidInvite2026', (route) => route.fulfill({ status: 404, json: { error: 'Link mời không hợp lệ hoặc đã hết hạn.' } }));
   await page.goto('/?room=invalidInvite2026');
-  await expect(page.getByRole('heading', { name: /Link mời, không còn hiệu lực/ })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /Link mời này không còn hiệu lực/ })).toBeVisible();
   await expect(page.getByText('Phòng đã sẵn sàng')).toHaveCount(0);
   await expect(page.getByRole('textbox', { name: 'Tên hiển thị' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Về trang chủ' })).toBeVisible();
@@ -184,8 +187,8 @@ test('lỗi kiểm tra link tạm thời có thể retry mà không làm mất l
       : route.fulfill({ json: { valid: true, guestAllowed: true } });
   });
   await page.goto(`/?room=${inviteCode}`);
-  await expect(page.getByRole('heading', { name: /Chưa thể, kiểm tra lời mời/ })).toBeVisible();
-  await page.getByRole('button', { name: 'Thử kiểm tra lại' }).click();
+  await expect(page.getByRole('heading', { name: /Chưa thể kiểm tra lời mời của bạn/ })).toBeVisible();
+  await page.getByRole('button', { name: 'Kiểm tra lại' }).click();
   await expect(page.getByRole('textbox', { name: 'Tên hiển thị' })).toBeFocused();
   expect(attempts).toBe(2);
   await expect(page).toHaveURL(new RegExp(`room=${inviteCode}`));
@@ -238,7 +241,7 @@ test('người đã chọn ở mode nhóm vẫn tìm thấy khi quay lại nhắ
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Mở danh sách trò chuyện' }).click();
-  await page.getByRole('button', { name: 'Bắt đầu trò chuyện' }).click();
+  await page.getByRole('button', { name: 'Cuộc trò chuyện mới' }).click();
   const conversationSearch = page.getByRole('searchbox', { name: 'Bạn muốn nhắn cho ai?' });
   await expect(conversationSearch).toBeVisible();
   expect(await conversationSearch.evaluate((input) => getComputedStyle(input).fontSize)).toBe('16px');
@@ -267,7 +270,7 @@ test('tên phòng dài không làm tràn mobile và các nút chính đủ vùng
   await page.route('**/api/rooms/long-name-room/messages*', (route) => route.fulfill({ json: { messages: [], nextCursor: null } }));
 
   await page.goto('/');
-  await expect(page.getByRole('button', { name: 'Mời người cùng vẽ' })).toBeInViewport();
+  await expect(page.getByRole('button', { name: 'Mời một người' })).toBeInViewport();
   await expect(page.getByRole('button', { name: 'Gửi tin nhắn' })).toBeInViewport();
   const actionNames = ['Mở danh sách trò chuyện', 'Tìm trong tin nhắn', 'Thông tin cuộc trò chuyện'];
   for (const name of actionNames) {
@@ -330,7 +333,7 @@ test('ảnh trong message mở viewer, zoom bằng nút và tải file thật tr
   await page.route('**/api/assets/test-media-key*', (route) => route.fulfill({ status: 200, contentType: 'image/png', body: png }));
 
   await page.goto('/');
-  const openMedia = page.getByRole('button', { name: 'Mở hình ảnh toàn màn hình' });
+  const openMedia = page.getByRole('button', { name: 'Mở ảnh toàn màn hình' });
   await openMedia.click();
   const viewer = page.getByRole('dialog', { name: 'Hình ảnh trong cuộc trò chuyện' });
   await expect(viewer).toBeVisible();
@@ -365,7 +368,7 @@ test('ảnh trong message mở viewer, zoom bằng nút và tải file thật tr
 
   const viewerDownload = page.waitForEvent('download');
   await viewer.getByRole('button', { name: 'Tải ảnh xuống' }).click();
-  expect((await viewerDownload).suggestedFilename()).toBe('net-hinh-anh-2026-08-28.png');
+  expect((await viewerDownload).suggestedFilename()).toBe('net-image-2026-08-28.png');
   await page.keyboard.press('Escape');
   await expect(viewer).toHaveCount(0);
   await expect(openMedia).toBeFocused();
@@ -377,8 +380,8 @@ test('ảnh trong message mở viewer, zoom bằng nút và tải file thật tr
   await expect(openMedia).toBeFocused();
 
   const directDownload = page.waitForEvent('download');
-  await page.getByRole('button', { name: 'Tải hình ảnh xuống' }).click();
-  expect((await directDownload).suggestedFilename()).toBe('net-hinh-anh-2026-08-28.png');
+  await page.getByRole('button', { name: 'Tải ảnh xuống', exact: true }).click();
+  expect((await directDownload).suggestedFilename()).toBe('net-image-2026-08-28.png');
 
   await page.setViewportSize({ width: 1440, height: 900 });
   await openMedia.click();
@@ -426,7 +429,7 @@ test('viewer desktop fit đúng ảnh ngang, vuông, dọc và zoom tăng kích 
   });
 
   await page.goto('/');
-  const openButtons = page.getByRole('button', { name: 'Mở hình ảnh toàn màn hình' });
+  const openButtons = page.getByRole('button', { name: 'Mở ảnh toàn màn hình' });
   await expect(openButtons).toHaveCount(3);
 
   for (const [index, fixture] of fixtures.entries()) {
@@ -601,13 +604,13 @@ test('guest.ended giữ nội dung guest trong phần lịch sử cũ đã tải
     await page.getByRole('button', { name: 'Tải tin nhắn cũ hơn' }).click();
     await expect(page.getByText('Tin guest nằm ngoài trang mới nhất', { exact: true })).toBeVisible();
     const oldGuestArticle = page.getByRole('article').filter({ hasText: 'Tin guest nằm ngoài trang mới nhất' });
-    await expect(oldGuestArticle.getByRole('button', { name: 'Thả cảm xúc ❤️' })).toContainText('1');
+    await expect(oldGuestArticle.locator('.reaction-list').getByRole('button', { name: 'Thả cảm xúc ❤️' })).toContainText('1');
 
     const ended = await request.delete(`${API_URL}/guest`, { headers: headersB });
     expect(ended.ok()).toBe(true);
     expect((await ended.json()) as { retained?: boolean }).toMatchObject({ retained: true });
     await expect(page.getByText('Tin guest nằm ngoài trang mới nhất', { exact: true })).toBeVisible();
-    await expect(oldGuestArticle.getByRole('button', { name: 'Thả cảm xúc ❤️' })).toHaveCount(0);
+    await expect(oldGuestArticle.locator('.reaction-list').getByRole('button', { name: 'Thả cảm xúc ❤️' })).toHaveCount(0);
   } finally {
     await request.delete(`${API_URL}/guest`, { headers: headersA });
     await request.delete(`${API_URL}/guest`, { headers: headersB }).catch(() => undefined);

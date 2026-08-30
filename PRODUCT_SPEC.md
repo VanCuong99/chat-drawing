@@ -6,7 +6,7 @@ Nét is a responsive, installable web messenger where people can express an idea
 
 ## Users and retention
 
-- Authenticated users sign in with ChatGPT. Their rooms, messages, reactions, read state, images, and drawing versions are stored permanently.
+- Authenticated users sign in through Neon Auth. Their rooms, messages, reactions, read state, images, drawing versions, and personal palette are stored permanently.
 - Guests join with a display name through an invite link or start a temporary room. A guest session expires after two hours of inactivity or immediately when the guest chooses **End session**.
 - When a guest session ends, the guest loses access but sent messages and attached assets remain in the room. Guest reactions, palette data, and unattached temporary uploads are removed.
 - The drawing studio mixes 2–12 display colors simultaneously with a Kubelka–Munk-based sRGB/D65 approximation. Each component has an integer model-concentration parts value from 1–100; the UI shows normalized percentages and preserves duplicate component provenance. It must be described as an approximation because real results depend on measured pigment K/S spectra, binders, substrate, and lighting.
@@ -26,28 +26,28 @@ Nét is a responsive, installable web messenger where people can express an idea
 - Message text: 1–2,000 characters after trimming.
 - Room name and guest name: 2–60 characters.
 - Images: PNG, JPEG, GIF, or WebP, maximum 8 MB.
-- Invalid/expired invite links show a recoverable Vietnamese error.
+- Invalid or expired invite links show a recoverable error in the selected language.
 - An expired guest session returns to onboarding and does not expose previous guest content.
 - Every server write checks authenticated membership or a valid guest session.
 
 ## Runtime architecture
 
-- Vinext renders the web client; it contains no business API routes.
+- Next.js App Router renders the web client; it contains no product business API routes.
 - NestJS owns HTTP APIs, guest lifecycle, authorization, asset metadata and Socket.IO.
 - PostgreSQL is accessed exclusively through Drizzle ORM repositories/services and generated migrations.
 - Socket connections receive short-lived tokens, may join only authorized `room:{id}` channels, and every event carries a `roomId` checked again by the client.
-- Redis is the Socket.IO adapter in multi-instance production deployments; disconnected clients fall back to bounded polling.
+- Redis is the Socket.IO adapter in multi-instance production deployments; clients also run bounded HTTP reconciliation to recover from transient or replayed events.
 - Room-background activity travels through actor-scoped channels without leaking the room's message event; reconnect always performs HTTP catch-up.
 - A PostgreSQL identity sequence is the canonical message order. Read state advances to the exact rendered sequence and client request UUIDs make message retries idempotent.
 - Realtime notifications use a transactional PostgreSQL outbox and at-least-once delivery; signed asset URLs are actor/room scoped and distributed write limits are stored atomically in PostgreSQL.
-- Multi-host production stores bytes in private S3-compatible object storage while PostgreSQL remains the metadata/authorization source.
+- Multi-host production stores bytes in private Vercel Blob while PostgreSQL remains the metadata and authorization source.
 
 ## Acceptance scenarios
 
 | Priority | Scenario | Expected result |
 | --- | --- | --- |
 | High | Authenticated user reloads | Permanent rooms and messages are restored |
-| High | Guest ends session | Guest messages, reactions, and assets are removed |
+| High | Guest ends session | Guest access, reactions, palette data, and unattached uploads are removed; already-sent messages and attached assets remain |
 | High | Send text/image/drawing | Message appears and is visible to other room participants |
 | High | Remix drawing | New version links to the previous drawing and history remains intact |
 | High | Reply/react/read | UI and server state remain consistent after reload |

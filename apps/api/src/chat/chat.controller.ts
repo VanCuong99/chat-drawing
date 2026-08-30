@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { ActorService } from '../auth/actor.service';
 import { ChatService } from './chat.service';
 import { RateLimitService } from '../security/rate-limit.service';
+import { configInteger } from '../config/runtime-config';
 
 @Controller()
 export class ChatController {
@@ -26,7 +27,8 @@ export class ChatController {
   @Post('guest')
   @HttpCode(200)
   async createGuest(@Req() request: Request, @Body() body: { displayName?: unknown; inviteCode?: unknown }) {
-    await this.limits.consume('guest:create', this.guestCreateSubject(request), 30, 15 * 60 * 1000);
+    const limit = configInteger(this.config, 'GUEST_CREATE_LIMIT', 30, { min: 1, max: 10_000 });
+    await this.limits.consume('guest:create', this.guestCreateSubject(request), limit, 15 * 60 * 1000);
     return this.chat.createGuest(body.displayName, body.inviteCode);
   }
 

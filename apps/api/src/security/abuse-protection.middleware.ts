@@ -61,7 +61,7 @@ export class AbuseProtectionMiddleware implements NestMiddleware {
   private reject(response: Response, reason: string) {
     telemetry.httpRejected.add(1, { reason });
     response.setHeader('retry-after', '1');
-    response.status(429).json({ error: 'Máy chủ đang nhận quá nhiều yêu cầu. Vui lòng thử lại sau.', requestId: response.getHeader('x-request-id') });
+    response.status(429).json({ error: 'The server is receiving too many requests. Try again later.', requestId: response.getHeader('x-request-id') });
   }
 
   private prune(now: number) {

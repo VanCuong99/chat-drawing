@@ -14,7 +14,7 @@ export class RealtimeController {
     const actor = await this.actors.require(request);
     await this.limits.consume('realtime:token', actor.actorKey, 30, 60 * 1000);
     const roomId = typeof body?.roomId === 'string' ? body.roomId.trim() : '';
-    if (!roomId) throw new BadRequestException('Cần chọn cuộc trò chuyện trước khi kết nối realtime.');
+    if (!roomId) throw new BadRequestException('Select a conversation before connecting to realtime updates.');
     await this.actors.assertRoomAccess(roomId, actor);
     return {
       token: await this.jwt.signAsync({

@@ -25,4 +25,4 @@ for (const path of generatedPaths) {
   await rm(resolve(workspace, path), { recursive: true, force: true });
 }
 
-console.log(`Đã dọn ${generatedPaths.length} đường dẫn build/test có thể tạo lại.`);
+console.log(`Cleaned ${generatedPaths.length} reproducible build/test path(s).`);

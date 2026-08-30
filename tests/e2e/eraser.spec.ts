@@ -1,4 +1,7 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { setVietnameseUi } from './use-vietnamese-ui';
+
+test.beforeEach(async ({ context }) => setVietnameseUi(context));
 
 const CANVAS_WIDTH = 1200;
 const CANVAS_HEIGHT = 720;

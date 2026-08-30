@@ -1,4 +1,7 @@
 import { expect, test } from '@playwright/test';
+import { setVietnameseUi } from './use-vietnamese-ui';
+
+test.beforeEach(async ({ context }) => setVietnameseUi(context));
 
 test('bộ chọn hình mở cạnh toolbar và vẽ được hình thang @critical', async ({ page }) => {
   await page.goto('/');
@@ -29,7 +32,7 @@ test('bộ chọn hình mở cạnh toolbar và vẽ được hình thang @criti
   await expect(shapeButton).toHaveAttribute('aria-expanded', 'false');
   await expect(page.getByText('Hình thang').first()).toBeVisible();
 
-  const canvas = page.getByRole('dialog', { name: 'Studio Nét' }).locator('canvas[aria-label="Vùng vẽ nâng cao"]');
+  const canvas = page.getByRole('dialog', { name: 'Nét Studio' }).locator('canvas[aria-label="Vùng vẽ nâng cao"]');
   const box = await canvas.boundingBox();
   expect(box).not.toBeNull();
   await page.mouse.move(box!.x + 100, box!.y + 80);
@@ -92,7 +95,7 @@ test('bộ chọn hình mở cạnh toolbar và vẽ được hình thang @criti
   await page.setViewportSize({ width: 1280, height: 720 });
   page.once('dialog', (dialog) => dialog.accept());
   await page.getByRole('button', { name: /Đóng/ }).click();
-  await expect(page.getByRole('dialog', { name: 'Studio Nét' })).toBeHidden();
+  await expect(page.getByRole('dialog', { name: 'Nét Studio' })).toBeHidden();
   const endResponse = page.waitForResponse((response) => response.url().endsWith('/api/guest') && response.request().method() === 'DELETE');
   await page.getByRole('button', { name: 'Kết thúc phiên khách' }).click();
   await page.getByRole('button', { name: 'Kết thúc phiên', exact: true }).click();

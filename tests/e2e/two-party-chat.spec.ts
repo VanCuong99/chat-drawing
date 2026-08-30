@@ -1,5 +1,6 @@
 import { expect, test, type BrowserContext, type Page } from '@playwright/test';
 import { createDatabase, inArray, rooms } from '@net/database';
+import { setVietnameseUi } from './use-vietnamese-ui';
 
 const API_URL = 'http://localhost:3001/api';
 
@@ -8,7 +9,7 @@ async function startGuest(page: Page, name: string, inviteUrl = '/') {
   if (inviteUrl === '/') await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
   await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(name);
   const created = page.waitForResponse((response) => response.url().endsWith('/api/guest') && response.request().method() === 'POST');
-  await page.getByRole('button', { name: /Tham gia|Vào Nét/ }).click();
+  await page.getByRole('button', { name: /Vào phòng|Vào Nét/ }).click();
   const response = await created;
   expect(response.status()).toBe(200);
   const body = await response.json() as { sessionId: string; roomId: string };
@@ -19,7 +20,7 @@ async function startGuest(page: Page, name: string, inviteUrl = '/') {
 async function sendText(page: Page, text: string) {
   await page.getByRole('textbox', { name: 'Nội dung tin nhắn' }).fill(text);
   await page.getByRole('button', { name: 'Gửi tin nhắn' }).click();
-  return page.getByRole('article').filter({ hasText: text });
+  return page.locator('article.message-row.own').filter({ hasText: text });
 }
 
 async function safelyEnd(context: BrowserContext, page: Page, sessionId: string) {
@@ -37,6 +38,7 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
   const { db, pool } = createDatabase(databaseUrl, 1);
   const contextA = await browser.newContext({ baseURL: 'http://localhost:3000' });
   const contextB = await browser.newContext({ baseURL: 'http://localhost:3000' });
+  await Promise.all([setVietnameseUi(contextA), setVietnameseUi(contextB)]);
   const pageA = await contextA.newPage();
   const pageB = await contextB.newPage();
   const pageErrors: Error[] = [];
@@ -53,7 +55,7 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     sessionA = guestA.sessionId;
     roomIds.add(guestA.roomId);
     await pageA.getByRole('button', { name: 'Thông tin cuộc trò chuyện' }).click();
-    const inviteUrl = await pageA.getByLabel('Link mời').inputValue();
+    const inviteUrl = await pageA.locator('.info-drawer').getByRole('textbox', { name: 'Link mời' }).inputValue();
     expect(inviteUrl).toContain('?room=');
     await pageA.locator('.info-drawer').getByRole('button', { name: 'Đóng' }).click();
     const guestB = await startGuest(pageB, `Bob QA ${stamp}`, inviteUrl);
@@ -61,10 +63,13 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     roomIds.add(guestB.roomId);
 
     const fromAlice = `Alice gửi Bob ${stamp}`;
+    const bobReadReceipt = pageB.waitForResponse((response) => response.request().method() === 'PATCH' && response.url().includes(`/api/rooms/${guestA.roomId}/messages`));
     const aliceArticle = await sendText(pageA, fromAlice);
+    await pageB.bringToFront();
     const aliceOnBob = pageB.getByRole('article').filter({ hasText: fromAlice });
     await expect(aliceOnBob).toBeVisible();
-    await expect(aliceArticle).toContainText('Đã xem');
+    expect((await bobReadReceipt).status()).toBe(200);
+    await expect(aliceArticle).toContainText('Đã đọc');
 
     await aliceOnBob.getByRole('button', { name: /Trả lời/ }).click();
     const fromBob = `Bob trả lời Alice ${stamp}`;
@@ -72,10 +77,10 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     await expect(bobArticle).toContainText(fromAlice);
     const bobOnAlice = pageA.getByRole('article').filter({ hasText: fromBob });
     await expect(bobOnAlice).toBeVisible();
-    await expect(bobArticle).toContainText('Đã xem');
-    await bobOnAlice.getByRole('button', { name: 'Thả ❤️' }).click();
-    await expect(bobArticle.getByRole('button', { name: /❤️ 1/ })).toBeVisible();
-    await expect(bobOnAlice.getByRole('button', { name: /❤️ 1/ })).toBeVisible();
+    await expect(bobArticle).toContainText('Đã đọc');
+    await bobOnAlice.getByRole('button', { name: 'Thả cảm xúc ❤️' }).click();
+    await expect(bobArticle.locator('.reaction-list').getByRole('button', { name: /❤️.*1/ })).toBeVisible();
+    await expect(bobOnAlice.locator('.reaction-list').getByRole('button', { name: /❤️.*1/ })).toBeVisible();
 
     await contextB.setOffline(true);
     await expect(pageB.getByText('Đang kết nối lại')).toBeVisible();
@@ -96,7 +101,7 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     const otherBootstrap = await request.get(`${API_URL}/bootstrap`, { headers: { 'x-net-guest-session': otherSession } });
     const otherRoom = ((await otherBootstrap.json()).rooms as Array<{ inviteCode: string }>)[0];
     await pageB.goto(`/?room=${otherRoom.inviteCode}`);
-    await expect(pageB.getByRole('status')).toContainText('Bạn đang ở một phiên khách khác');
+    await expect(pageB.getByRole('status')).toContainText('Bạn đang ở trong một phiên khách khác');
     await expect(pageB.locator('.message-bubble').getByText(fromAlice, { exact: true })).toBeVisible();
 
     await pageB.reload();
@@ -106,7 +111,8 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     await pageB.getByRole('button', { name: 'Kết thúc phiên', exact: true }).click();
     expect((await ended).status()).toBe(200);
     sessionB = '';
-    await expect(pageB.getByRole('heading', { name: /Có những điều/ })).toBeVisible();
+    await expect(pageB.getByRole('status')).toContainText('Phiên khách đã kết thúc');
+    await expect(pageB.getByRole('heading', { name: /Vào phòng/ })).toBeVisible();
     await expect(pageA.locator('.message-bubble').getByText(fromBob, { exact: true })).toBeVisible();
     await expect(pageA.getByRole('article').filter({ hasText: missedWhileOffline })).toBeVisible();
     await expect(aliceArticle).toContainText('Đã gửi');

@@ -25,8 +25,8 @@ export class AssetsService {
 
   async upload(roomId: string, actor: Actor, mimeType: string, bytes: Buffer) {
     await this.actors.assertRoomAccess(roomId, actor);
-    if (!ALLOWED_TYPES.has(mimeType)) throw new UnsupportedMediaTypeException('Chỉ hỗ trợ PNG, JPEG, GIF hoặc WebP.');
-    if (!bytes.length || bytes.length > MAX_SIZE) throw new BadRequestException('Ảnh phải nhỏ hơn 8 MB.');
+    if (!ALLOWED_TYPES.has(mimeType)) throw new UnsupportedMediaTypeException('Only PNG, JPEG, GIF, and WebP are supported.');
+    if (!bytes.length || bytes.length > MAX_SIZE) throw new BadRequestException('Images must be smaller than 8 MB.');
     const key = crypto.randomUUID();
     const now = Date.now();
     await this.db.transaction(async (tx) => {
@@ -37,14 +37,14 @@ export class AssetsService {
           gt(guestSessions.expiresAt, now),
         )).for('update')
         : await tx.select({ id: users.id }).from(users).where(eq(users.id, actor.id)).for('update');
-      if (!owner.length) throw new UnauthorizedException('Phiên đã kết thúc trước khi ảnh được tải lên.');
+      if (!owner.length) throw new UnauthorizedException('The session ended before the image was uploaded.');
       const owned = await tx.select({ status: assets.status, byteSize: assets.byteSize }).from(assets)
         .where(and(eq(assets.ownerKey, actor.actorKey), ne(assets.status, 'deleting')));
       if (owned.filter((asset) => asset.status === 'pending').length >= MAX_PENDING_ASSETS) {
-        throw new BadRequestException('Bạn đang có quá nhiều ảnh chờ gửi. Hãy hoàn tất các ảnh hiện tại trước.');
+        throw new BadRequestException('Too many images are waiting to be sent. Finish the current uploads first.');
       }
       if (owned.length >= MAX_OWNER_ASSETS || owned.reduce((sum, asset) => sum + asset.byteSize, 0) + bytes.length > MAX_OWNER_BYTES) {
-        throw new BadRequestException('Bạn đã đạt giới hạn lưu trữ ảnh của phiên hoặc tài khoản này.');
+        throw new BadRequestException('This session or account has reached its image storage limit.');
       }
       await tx.insert(assets).values({
         key,
@@ -63,7 +63,7 @@ export class AssetsService {
       const [ledger] = await this.db.select({ status: assets.status, guestSessionId: assets.guestSessionId }).from(assets).where(eq(assets.key, key)).limit(1);
       if (!ledger || ledger.status !== 'pending' || (actor.kind === 'guest' && ledger.guestSessionId !== actor.id)) {
         await this.storage.delete(key);
-        throw new UnauthorizedException('Phiên khách đã kết thúc trong lúc tải ảnh.');
+        throw new UnauthorizedException('The guest session ended while the image was uploading.');
       }
       return { key, size: bytes.length };
     } catch (error) {
@@ -74,12 +74,12 @@ export class AssetsService {
 
   async read(key: string, actor: Actor) {
     const [asset] = await this.db.select().from(assets).where(eq(assets.key, key)).limit(1);
-    if (!asset) throw new NotFoundException('Hình ảnh không còn tồn tại.');
+    if (!asset) throw new NotFoundException('The image no longer exists.');
     await this.actors.assertRoomAccess(asset.roomId, actor);
     try {
       return { asset, bytes: await this.storage.get(key) };
     } catch {
-      throw new NotFoundException('Hình ảnh không còn tồn tại.');
+      throw new NotFoundException('The image no longer exists.');
     }
   }
 
@@ -102,26 +102,26 @@ export class AssetsService {
 
   async refreshReadUrl(key: string, actor: Actor) {
     const [asset] = await this.db.select({ roomId: assets.roomId }).from(assets).where(and(eq(assets.key, key), eq(assets.status, 'attached'))).limit(1);
-    if (!asset) throw new NotFoundException('Hình ảnh không còn tồn tại.');
+    if (!asset) throw new NotFoundException('The image no longer exists.');
     await this.actors.assertRoomAccess(asset.roomId, actor);
     return { assetUrl: await this.issueReadUrl(key, asset.roomId, actor) };
   }
 
   async readWithAccessToken(key: string, token: unknown) {
-    if (typeof token !== 'string' || !token) throw new UnauthorizedException('Link ảnh không hợp lệ hoặc đã hết hạn.');
+    if (typeof token !== 'string' || !token) throw new UnauthorizedException('The image link is invalid or has expired.');
     let claims: AssetReadClaims;
     try {
       claims = await this.jwt.verifyAsync<AssetReadClaims>(token, { issuer: 'net-api', audience: 'net-asset' });
     } catch {
-      throw new UnauthorizedException('Link ảnh không hợp lệ hoặc đã hết hạn.');
+      throw new UnauthorizedException('The image link is invalid or has expired.');
     }
     if (claims.purpose !== 'asset-read' || claims.assetKey !== key || typeof claims.roomId !== 'string') {
-      throw new UnauthorizedException('Link ảnh không đúng với nội dung được yêu cầu.');
+      throw new UnauthorizedException('The image link does not match the requested content.');
     }
     const actor = await this.actors.resolveClaims(claims);
-    if (!actor) throw new UnauthorizedException('Phiên xem ảnh đã hết hạn.');
+    if (!actor) throw new UnauthorizedException('The image viewing session has expired.');
     const result = await this.read(key, actor);
-    if (result.asset.roomId !== claims.roomId) throw new UnauthorizedException('Link ảnh không đúng cuộc trò chuyện.');
+    if (result.asset.roomId !== claims.roomId) throw new UnauthorizedException('The image link belongs to a different conversation.');
     return { ...result, actor };
   }
 
@@ -132,7 +132,7 @@ export class AssetsService {
       eq(assets.ownerKey, actor.actorKey),
       eq(assets.status, 'pending'),
     )).limit(1);
-    if (!asset || !(await this.storage.exists(key))) throw new BadRequestException('Hình ảnh không thuộc cuộc trò chuyện hiện tại hoặc đã được gửi.');
+    if (!asset || !(await this.storage.exists(key))) throw new BadRequestException('The image does not belong to this conversation or has already been sent.');
     return asset;
   }
 

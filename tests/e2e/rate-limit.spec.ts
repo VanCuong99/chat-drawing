@@ -20,7 +20,7 @@ test('rate limit message dùng counter Postgres nguyên tử khi request đồng
     })));
     expect(responses.filter((response) => response.status() === 200)).toHaveLength(120);
     expect(responses.filter((response) => response.status() === 429)).toHaveLength(1);
-    await expect(responses.find((response) => response.status() === 429)!.json()).resolves.toMatchObject({ error: expect.stringContaining('thao tác quá nhanh') });
+    await expect(responses.find((response) => response.status() === 429)!.json()).resolves.toMatchObject({ error: expect.stringContaining('too quickly') });
   } finally {
     await request.delete(`${API_URL}/guest`, { headers });
     await db.delete(rooms).where(eq(rooms.id, guest.roomId));

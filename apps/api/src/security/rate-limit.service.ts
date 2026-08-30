@@ -25,7 +25,7 @@ export class RateLimitService {
     if (row.count > limit) {
       telemetry.durableRateLimited.add(1, { scope });
       const retryAfterSeconds = Math.max(1, Math.ceil((row.windowStartedAt + windowMs - now) / 1000));
-      throw new HttpException(`Bạn thao tác quá nhanh. Vui lòng thử lại sau ${retryAfterSeconds} giây.`, HttpStatus.TOO_MANY_REQUESTS);
+      throw new HttpException(`Actions are being sent too quickly. Try again in ${retryAfterSeconds} seconds.`, HttpStatus.TOO_MANY_REQUESTS);
     }
   }
 

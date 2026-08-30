@@ -1,5 +1,7 @@
 import { expect, test, type APIRequestContext } from '@playwright/test';
 import { createHmac, randomUUID } from 'node:crypto';
+import { unlink } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { io, type Socket } from 'socket.io-client';
 import { and, assets, createDatabase, eq, guestSessions, inArray, messages, realtimeOutbox, roomMembers, rooms, sql, users } from '@net/database';
 
@@ -76,7 +78,7 @@ test('retry đồng thời chỉ tạo một message và một realtime event @c
       data: { type: 'text', text: 'Nội dung khác', clientRequestId },
     });
     expect(conflictingRetry.status()).toBe(400);
-    await expect(conflictingRetry.json()).resolves.toMatchObject({ error: expect.stringContaining('nội dung khác') });
+    await expect(conflictingRetry.json()).resolves.toMatchObject({ error: expect.stringContaining('different content') });
   } finally {
     socket.disconnect();
     await request.delete(`${apiOrigin}/api/guest`, { headers });
@@ -199,32 +201,45 @@ test('join, guest send và end dùng cùng room lock, không để nội dung sh
   }
 });
 
-test('standalone guest kết thúc phiên không để lại nội dung vĩnh viễn không người sở hữu @critical', async ({ request }) => {
+test('standalone guest loses access while submitted content remains available through the invite @critical', async ({ request }) => {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error('DATABASE_URL is required for standalone guest cleanup E2E');
   const { db, pool } = createDatabase(databaseUrl, 1);
   const guest = await createGuest(request, `Standalone cleanup ${Date.now()}`);
   const headers = { 'x-net-guest-session': guest.sessionId };
+  let observerSessionId = '';
   try {
+    const initialBootstrap = await request.get(`${apiOrigin}/api/bootstrap`, { headers });
+    expect(initialBootstrap.ok()).toBe(true);
+    const inviteCode = ((await initialBootstrap.json()).rooms as Array<{ inviteCode: string }>)[0].inviteCode;
     const sent = await request.post(`${apiOrigin}/api/rooms/${guest.roomId}/messages`, {
       headers,
-      data: { type: 'text', text: 'Nội dung không được mồ côi', clientRequestId: randomUUID() },
+      data: { type: 'text', text: 'Standalone retained content', clientRequestId: randomUUID() },
     });
     expect(sent.ok()).toBe(true);
     const messageId = ((await sent.json()) as { id: string }).id;
 
     const ended = await request.delete(`${apiOrigin}/api/guest`, { headers });
     expect(ended.ok()).toBe(true);
-    await expect(ended.json()).resolves.toMatchObject({ retained: false });
-    expect(await db.select({ id: messages.id }).from(messages).where(eq(messages.id, messageId))).toHaveLength(0);
+    await expect(ended.json()).resolves.toMatchObject({ retained: true });
+    const retained = await db.select({ id: messages.id, guestSessionId: messages.guestSessionId, expiresAt: messages.expiresAt }).from(messages).where(eq(messages.id, messageId));
+    expect(retained).toEqual([{ id: messageId, guestSessionId: null, expiresAt: null }]);
     expect(await db.select({ id: guestSessions.id }).from(guestSessions).where(eq(guestSessions.id, guest.sessionId))).toHaveLength(0);
+
+    const observerResponse = await request.post(`${apiOrigin}/api/guest`, { data: { displayName: `Standalone observer ${Date.now()}`, inviteCode } });
+    expect(observerResponse.ok()).toBe(true);
+    observerSessionId = ((await observerResponse.json()) as { sessionId: string }).sessionId;
+    const history = await request.get(`${apiOrigin}/api/rooms/${guest.roomId}/messages`, { headers: { 'x-net-guest-session': observerSessionId } });
+    expect(history.ok()).toBe(true);
+    expect(((await history.json()).messages as Array<{ id: string }>).some((message) => message.id === messageId)).toBe(true);
   } finally {
+    if (observerSessionId) await request.delete(`${apiOrigin}/api/guest`, { headers: { 'x-net-guest-session': observerSessionId } }).catch(() => undefined);
     await db.delete(rooms).where(eq(rooms.id, guest.roomId));
     await pool.end();
   }
 });
 
-test('maintenance dọn dữ liệu guest-only bị phiên bản cũ giữ lại, gồm cả asset đã attach @critical', async ({ request }) => {
+test('maintenance preserves retained guest-only messages and attached assets after the grace period @critical', async ({ request }) => {
   test.setTimeout(120_000);
   const databaseUrl = process.env.DATABASE_URL;
   const cronSecret = process.env.CRON_SECRET;
@@ -243,7 +258,7 @@ test('maintenance dọn dữ liệu guest-only bị phiên bản cũ giữ lại
     assetKey = ((await uploaded.json()) as { key: string }).key;
     const sent = await request.post(`${apiOrigin}/api/rooms/${guest.roomId}/messages`, {
       headers,
-      data: { type: 'image', assetKey, text: 'Ảnh guest legacy' },
+      data: { type: 'image', assetKey, text: 'Legacy retained guest image' },
     });
     expect(sent.ok()).toBe(true);
 
@@ -271,11 +286,12 @@ test('maintenance dọn dữ liệu guest-only bị phiên bản cũ giữ lại
       headers: { authorization: `Bearer ${cronSecret}` },
     });
     expect(maintenance.ok()).toBe(true);
-    expect(await db.select({ id: rooms.id }).from(rooms).where(eq(rooms.id, guest.roomId))).toHaveLength(0);
-    expect(await db.select({ id: messages.id }).from(messages).where(eq(messages.roomId, guest.roomId))).toHaveLength(0);
-    expect(await db.select({ key: assets.key }).from(assets).where(eq(assets.key, assetKey))).toHaveLength(0);
+    expect(await db.select({ id: rooms.id }).from(rooms).where(eq(rooms.id, guest.roomId))).toHaveLength(1);
+    expect((await db.select({ id: messages.id }).from(messages).where(eq(messages.roomId, guest.roomId))).length).toBeGreaterThan(0);
+    expect(await db.select({ key: assets.key }).from(assets).where(eq(assets.key, assetKey))).toHaveLength(1);
   } finally {
     await db.delete(rooms).where(eq(rooms.id, guest.roomId));
+    if (assetKey) await unlink(resolve('apps/api/.data/uploads', assetKey)).catch(() => undefined);
     await pool.end();
   }
 });

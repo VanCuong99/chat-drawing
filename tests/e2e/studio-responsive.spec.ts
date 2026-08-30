@@ -1,4 +1,7 @@
 import { expect, test } from '@playwright/test';
+import { setVietnameseUi } from './use-vietnamese-ui';
+
+test.beforeEach(async ({ context }) => setVietnameseUi(context));
 
 test('Studio không bị cắt ở màn hình ngang thấp và mobile @critical', async ({ page }) => {
   await page.setViewportSize({ width: 900, height: 600 });
@@ -10,7 +13,7 @@ test('Studio không bị cắt ở màn hình ngang thấp và mobile @critical'
   await expect(openCanvas).toBeVisible();
   await openCanvas.click();
 
-  const studio = page.getByRole('dialog', { name: 'Studio Nét' });
+  const studio = page.getByRole('dialog', { name: 'Nét Studio' });
   await expect.poll(async () => (await studio.boundingBox())?.y ?? Number.POSITIVE_INFINITY).toBeLessThan(0.5);
   const landscapeBox = await studio.boundingBox();
   expect(landscapeBox).not.toBeNull();

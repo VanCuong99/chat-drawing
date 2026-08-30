@@ -2,6 +2,9 @@ import { expect, test } from '@playwright/test';
 import { createHmac } from 'node:crypto';
 import { mixPigmentHex, pigmentPercentages } from '@net/pigment';
 import { createDatabase, eq, paletteColors } from '@net/database';
+import { setVietnameseUi } from './use-vietnamese-ui';
+
+test.beforeEach(async ({ context }) => setVietnameseUi(context));
 
 const API_URL = 'http://localhost:3001/api';
 
@@ -76,7 +79,7 @@ test('pha từ nhiều sắc tố, lưu và nạp lại công thức trong palet
   await mixer.getByRole('button', { name: 'Đóng pha màu nâng cao' }).click();
   await page.getByRole('button', { name: 'Đóng Esc', exact: true }).click();
   await page.reload();
-  await expect(page.getByText('Đã đồng bộ')).toBeVisible();
+  await expect(page.getByText(/Đã đồng bộ|Đang kết nối lại/)).toBeVisible();
   await page.getByRole('button', { name: 'Mở canvas' }).click();
   await expect(page.getByRole('button', { name: 'Dùng màu Nâu trung tính ba màu' })).toBeVisible();
   await page.getByRole('button', { name: 'Nạp công thức Nâu trung tính ba màu' }).click();

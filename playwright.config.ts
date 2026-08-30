@@ -4,6 +4,8 @@ import { existsSync } from 'node:fs';
 import { loadEnvFile } from 'node:process';
 
 if (existsSync('.env')) loadEnvFile('.env');
+if (existsSync('.env.local')) loadEnvFile('.env.local');
+if (existsSync('apps/api/.env.local')) loadEnvFile('apps/api/.env.local');
 process.env.DATABASE_URL ??= 'postgresql://net:net@localhost:5432/net';
 process.env.AUTH_JWT_SECRET ??= 'net-e2e-local-auth-secret-never-use-in-production';
 process.env.CRON_SECRET ??= 'net-e2e-local-cron-secret-never-use-in-production';
@@ -31,13 +33,13 @@ export default defineConfig({
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'], channel: process.env.CI ? undefined : 'chrome' } }],
   webServer: [
     {
-      command: `pnpm build:packages && TRUST_PROXY_HOPS=1 E2E_RATE_LIMIT_SECRET=${e2eRateLimitSecret} API_REQUEST_BURST=1000 API_MAX_ACTIVE_PER_IP=200 DATABASE_CONNECTION_TIMEOUT_MS=30000 pnpm dev:api`,
+      command: `pnpm build:packages && TRUST_PROXY_HOPS=1 E2E_RATE_LIMIT_SECRET=${e2eRateLimitSecret} GUEST_CREATE_LIMIT=1000 API_REQUEST_BURST=1000 API_MAX_ACTIVE_PER_IP=200 DATABASE_CONNECTION_TIMEOUT_MS=30000 pnpm dev:api`,
       url: 'http://localhost:3001/api/health',
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
     },
     {
-      command: 'pnpm dev:web',
+      command: 'NEXT_PUBLIC_API_URL=http://localhost:3001 NEXT_PUBLIC_REALTIME_URL=http://localhost:3001/chat pnpm dev:web',
       url: 'http://localhost:3000',
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,

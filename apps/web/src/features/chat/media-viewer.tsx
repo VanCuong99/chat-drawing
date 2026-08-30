@@ -3,6 +3,7 @@
 import { type CSSProperties, type KeyboardEvent, type MouseEvent as ReactMouseEvent, useEffect, useState } from 'react';
 import AppDialog from '@/src/shared/app-dialog';
 import type { MessageView } from '@/src/shared/chat.types';
+import { useLanguage } from '@/src/i18n/language-provider';
 
 const MIN_ZOOM = 50;
 const MAX_ZOOM = 300;
@@ -32,6 +33,7 @@ export default function MediaViewer({
   onDownload: (message: MessageView) => Promise<void>;
   onRefresh: (assetKey: string) => void;
 }) {
+  const { t } = useLanguage();
   const [zoom, setZoom] = useState(100);
   const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
   const [imageSize, setImageSize] = useState({ width: 1200, height: 720 });
@@ -50,7 +52,7 @@ export default function MediaViewer({
   }, []);
 
   if (!message?.assetUrl) return null;
-  const title = message.type === 'canvas' ? `Bản vẽ phiên bản ${message.canvasVersion ?? 1}` : 'Hình ảnh trong cuộc trò chuyện';
+  const title = message.type === 'canvas' ? t('Drawing Version {version}', { version: message.canvasVersion ?? 1 }) : t('Image in the Conversation');
   const desktopMaxWidth = Math.min(viewportSize.width * 0.56, 800);
   const desktopMaxHeight = Math.min(viewportSize.height * 0.56, 560);
   const imageRatio = imageSize.width / imageSize.height;
@@ -84,27 +86,27 @@ export default function MediaViewer({
         <header className="media-viewer-header">
           <div>
             <h2 id="media-viewer-title" tabIndex={-1} autoFocus>{title}</h2>
-            <p>{message.senderName} · dùng +/− để phóng to hoặc thu nhỏ</p>
+            <p>{message.senderName} · {t('use +/− to zoom')}</p>
           </div>
           <div className="media-viewer-actions">
-            <button type="button" onClick={() => changeZoom(zoom - ZOOM_STEP)} disabled={zoom <= MIN_ZOOM} aria-label="Thu nhỏ ảnh" data-tooltip="Thu nhỏ" data-tooltip-placement="below"><MediaIcon name="minus" /></button>
-            <output aria-label="Mức phóng đại" aria-live="polite">{zoom}%</output>
-            <button type="button" onClick={() => changeZoom(zoom + ZOOM_STEP)} disabled={zoom >= MAX_ZOOM} aria-label="Phóng to ảnh" data-tooltip="Phóng to" data-tooltip-placement="below"><MediaIcon name="plus" /></button>
-            <button type="button" onClick={() => changeZoom(100)} disabled={zoom === 100} aria-label="Đặt lại kích thước ảnh" data-tooltip="Vừa màn hình" data-tooltip-placement="below"><MediaIcon name="reset" /></button>
-            <button type="button" className="media-download-button" onClick={() => void onDownload(message)} disabled={downloading} aria-label={downloading ? 'Đang tải ảnh xuống' : 'Tải ảnh xuống'} data-tooltip={downloading ? 'Đang tải…' : 'Tải ảnh'} data-tooltip-placement="below"><MediaIcon name="download" /><span>{downloading ? 'Đang tải…' : 'Tải xuống'}</span></button>
-            <button type="button" className="media-close-button" onClick={onClose} aria-label="Đóng trình xem ảnh" data-tooltip="Đóng" data-tooltip-placement="below"><MediaIcon name="close" /></button>
+            <button type="button" onClick={() => changeZoom(zoom - ZOOM_STEP)} disabled={zoom <= MIN_ZOOM} aria-label={t('Zoom image out')} data-tooltip={t('Zoom Out')} data-tooltip-placement="below"><MediaIcon name="minus" /></button>
+            <output aria-label={t('Zoom level')} aria-live="polite">{zoom}%</output>
+            <button type="button" onClick={() => changeZoom(zoom + ZOOM_STEP)} disabled={zoom >= MAX_ZOOM} aria-label={t('Zoom image in')} data-tooltip={t('Zoom In')} data-tooltip-placement="below"><MediaIcon name="plus" /></button>
+            <button type="button" onClick={() => changeZoom(100)} disabled={zoom === 100} aria-label={t('Reset image size')} data-tooltip={t('Fit to Screen')} data-tooltip-placement="below"><MediaIcon name="reset" /></button>
+            <button type="button" className="media-download-button" onClick={() => void onDownload(message)} disabled={downloading} aria-label={downloading ? t('Downloading image') : t('Download image')} data-tooltip={downloading ? t('Downloading…') : t('Download Image')} data-tooltip-placement="below"><MediaIcon name="download" /><span>{downloading ? t('Downloading…') : t('Download')}</span></button>
+            <button type="button" className="media-close-button" onClick={onClose} aria-label={t('Close image viewer')} data-tooltip={t('Close')} data-tooltip-placement="below"><MediaIcon name="close" /></button>
           </div>
         </header>
         <div className="media-viewer-viewport" onClick={dismissFromDarkArea}>
           <div className="media-viewer-stage" style={stageStyle} onClick={dismissFromDarkArea}>
-            <button type="button" className={zoom === 100 ? 'media-viewer-image-button' : 'media-viewer-image-button zoomed'} onClick={() => changeZoom(zoom === 100 ? 200 : 100)} aria-label={zoom === 100 ? 'Phóng to ảnh lên 200%' : 'Đặt ảnh về 100%'}>
+            <button type="button" className={zoom === 100 ? 'media-viewer-image-button' : 'media-viewer-image-button zoomed'} onClick={() => changeZoom(zoom === 100 ? 200 : 100)} aria-label={zoom === 100 ? t('Zoom image to 200%') : t('Reset image to 100%')}>
               {/* Signed asset URLs are intentionally rendered as plain images. */}
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img src={message.assetUrl} width="1200" height="720" alt={title} draggable="false" onLoad={(event) => { const image = event.currentTarget; setImageSize({ width: image.naturalWidth || 1200, height: image.naturalHeight || 720 }); }} onError={() => { if (message.assetKey) onRefresh(message.assetKey); }} />
             </button>
           </div>
         </div>
-        <footer className="media-viewer-footer"><span>Chạm ảnh để phóng to · chạm vùng tối để đóng.</span><span>{MIN_ZOOM}%–{MAX_ZOOM}%</span></footer>
+        <footer className="media-viewer-footer"><span>{t('Tap the image to zoom · tap the dark area to close.')}</span><span>{MIN_ZOOM}%–{MAX_ZOOM}%</span></footer>
       </section>
     </AppDialog>
   );

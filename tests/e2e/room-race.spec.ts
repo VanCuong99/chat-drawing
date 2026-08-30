@@ -1,4 +1,7 @@
 import { expect, test } from '@playwright/test';
+import { setVietnameseUi } from './use-vietnamese-ui';
+
+test.beforeEach(async ({ context }) => setVietnameseUi(context));
 
 const room = (id: string, name: string) => ({
   id, name, kind: 'group', inviteCode: `${id}-invite`, allowGuests: true,

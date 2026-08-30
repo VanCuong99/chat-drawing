@@ -27,7 +27,7 @@ export class ActorService {
 
   async require(request: Request, touch = false) {
     const actor = await this.resolve(request, touch);
-    if (!actor) throw new UnauthorizedException('Phiên đăng nhập hoặc phiên khách đã hết hạn.');
+    if (!actor) throw new UnauthorizedException('Your sign-in or guest session has expired.');
     return actor;
   }
 
@@ -40,12 +40,12 @@ export class ActorService {
 
   async assertRoomAccess(roomId: string, actor: Actor) {
     if (actor.kind === 'guest') {
-      if (actor.roomId !== roomId) throw new ForbiddenException('Phiên khách không có quyền truy cập phòng này.');
+      if (actor.roomId !== roomId) throw new ForbiddenException('This guest session cannot access that room.');
       return;
     }
     const [membership] = await this.db.select({ roomId: roomMembers.roomId }).from(roomMembers)
       .where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, actor.id))).limit(1);
-    if (!membership) throw new ForbiddenException('Bạn chưa tham gia cuộc trò chuyện này.');
+    if (!membership) throw new ForbiddenException('You have not joined this conversation.');
   }
 
   guestTtl() { return Date.now() + GUEST_TTL_MS; }
