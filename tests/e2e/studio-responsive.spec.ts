@@ -9,7 +9,7 @@ test('Studio không bị cắt ở màn hình ngang thấp và mobile @critical'
   await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
   await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(`Guest Responsive ${Date.now()}`);
   await page.getByRole('button', { name: 'Vào Nét' }).click();
-  const openCanvas = page.getByRole('button', { name: 'Mở canvas' });
+  const openCanvas = page.locator('.composer-modes').getByRole('button', { name: 'Vẽ' });
   await expect(openCanvas).toBeVisible();
   await openCanvas.click();
 
@@ -35,17 +35,23 @@ test('Studio không bị cắt ở màn hình ngang thấp và mobile @critical'
   await expect(mobileSend).toBeDisabled();
   await expect(page.locator('.studio-header-send')).toBeHidden();
   await expect(page.getByRole('textbox', { name: 'Lời nhắn cho bản vẽ' })).toBeInViewport();
-  for (const name of [/Di chuyển/, /Bút chì/, /Tẩy/, /Hình dạng/, /Chèn chữ/, 'Công cụ khác']) {
-    await expect(page.getByRole('button', { name })).toBeInViewport();
+  for (const name of [/Bút chì/, /Tẩy/, 'Màu và cài đặt công cụ', 'Hoàn tác', 'Công cụ khác']) {
+    await expect(studio.locator('.tool-rail').getByRole('button', { name })).toBeInViewport();
   }
   await expect(page.getByRole('button', { name: /Bút highlight/ })).toBeHidden();
+  await expect(page.getByRole('button', { name: /Hình dạng/ })).toBeHidden();
+  await expect(page.getByRole('button', { name: /Chèn chữ/ })).toBeHidden();
   await page.getByRole('button', { name: 'Công cụ khác' }).click();
   const moreTools = page.getByRole('dialog', { name: 'Công cụ khác' });
   await expect(moreTools).toBeVisible();
   await expect(moreTools.getByRole('button', { name: /Bút highlight/ })).toBeVisible();
   await expect(moreTools.getByRole('button', { name: /Đường thẳng/ })).toBeVisible();
   await expect(moreTools.getByRole('button', { name: /Mũi tên/ })).toBeVisible();
+  await expect(moreTools.getByRole('button', { name: 'Chọn hình dạng' })).toBeVisible();
+  await expect(moreTools.getByRole('button', { name: 'Chèn chữ' })).toBeVisible();
   await moreTools.getByRole('button', { name: 'Đóng công cụ khác' }).click();
+  await page.getByRole('button', { name: 'Màu và cài đặt công cụ' }).click();
+  await expect(page.locator('.tool-inspector')).toBeVisible();
   await page.getByRole('button', { name: 'Mở pha màu nâng cao' }).click();
   const mixer = page.getByRole('region', { name: 'Pha màu nâng cao' });
   const mixerBox = await mixer.boundingBox();
@@ -57,8 +63,8 @@ test('Studio không bị cắt ở màn hình ngang thấp và mobile @critical'
   await expect(mixer.getByRole('button', { name: 'Dùng màu' })).toBeInViewport();
   await expect(mixer.getByRole('button', { name: 'Lưu trong phiên' })).toBeInViewport();
   await mixer.getByRole('button', { name: 'Đóng pha màu nâng cao' }).click();
-
-  await page.getByRole('button', { name: /Đóng/ }).click();
+  await page.locator('.tool-inspector').getByRole('button', { name: 'Đóng cài đặt công cụ' }).click();
+  await studio.locator('.studio-header').getByRole('button', { name: /Đóng/ }).click();
   await page.getByRole('button', { name: 'Tìm trong tin nhắn' }).click();
   await expect(page.getByRole('textbox', { name: 'Tìm nội dung tin nhắn' })).toBeVisible();
   await page.getByRole('button', { name: 'Đóng tìm kiếm' }).click();

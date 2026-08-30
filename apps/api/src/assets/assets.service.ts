@@ -87,9 +87,6 @@ export class AssetsService {
     const token = await this.jwt.signAsync({
       sub: actor.id,
       kind: actor.kind,
-      actorKey: actor.actorKey,
-      displayName: actor.displayName,
-      email: actor.email ?? undefined,
       roomId,
       assetKey: key,
       purpose: 'asset-read',

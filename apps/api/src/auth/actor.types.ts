@@ -29,7 +29,7 @@ export type RealtimeClaims = {
   exp?: number;
 };
 
-export type AssetReadClaims = RealtimeClaims & {
+export type AssetReadClaims = Pick<RealtimeClaims, 'sub' | 'kind' | 'exp'> & {
   purpose: 'asset-read';
   assetKey: string;
   roomId: string;

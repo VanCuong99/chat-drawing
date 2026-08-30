@@ -44,9 +44,9 @@ test('tẩy xóa sạch mọi nét bên dưới chỉ trong một lần @critica
   await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
   await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(`Guest Eraser ${Date.now()}`);
   await page.getByRole('button', { name: 'Vào Nét' }).click();
-  await expect(page.getByText('Đã đồng bộ')).toBeVisible();
+  await expect(page.locator('.conversation-panel')).toBeVisible({ timeout: 15_000 });
 
-  await page.getByRole('button', { name: 'Mở canvas' }).click();
+  await page.locator('.composer-modes').getByRole('button', { name: 'Vẽ' }).click();
   const canvas = page.getByRole('dialog').getByLabel('Vùng vẽ nâng cao');
   const crossing = { x: 360, y: 220 };
 

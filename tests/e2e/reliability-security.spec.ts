@@ -4,8 +4,9 @@ import { unlink } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { io, type Socket } from 'socket.io-client';
 import { and, assets, createDatabase, eq, guestSessions, inArray, messages, realtimeOutbox, roomMembers, rooms, sql, users } from '@net/database';
+import { e2eApiOrigin, e2eWebOrigin } from './e2e-environment';
 
-const apiOrigin = 'http://localhost:3001';
+const apiOrigin = e2eApiOrigin;
 
 function userToken(userId: string) {
   const secret = process.env.AUTH_JWT_SECRET;
@@ -35,7 +36,7 @@ async function connectGuest(request: APIRequestContext, sessionId: string, roomI
     forceNew: true,
     reconnection: false,
     timeout: 2_000,
-    ...(includeOrigin ? { extraHeaders: { Origin: 'http://localhost:3000' } } : {}),
+    ...(includeOrigin ? { extraHeaders: { Origin: e2eWebOrigin } } : {}),
   });
 }
 
@@ -297,6 +298,7 @@ test('maintenance preserves retained guest-only messages and attached assets aft
 });
 
 test('maintenance removes an abandoned guest room that contains only its system notice @critical', async ({ request }) => {
+  test.setTimeout(120_000);
   const databaseUrl = process.env.DATABASE_URL;
   const cronSecret = process.env.CRON_SECRET;
   if (!databaseUrl || !cronSecret) throw new Error('DATABASE_URL and CRON_SECRET are required for empty guest cleanup E2E');

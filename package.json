@@ -26,7 +26,7 @@
     "db:generate": "pnpm --filter @net/database db:generate",
     "db:migrate": "pnpm --filter @net/database db:migrate",
     "db:studio": "pnpm --filter @net/database db:studio",
-    "test:e2e": "playwright test --reporter=list"
+    "test:e2e": "node scripts/run-e2e.mjs"
   },
   "devDependencies": {
     "@net/database": "workspace:*",

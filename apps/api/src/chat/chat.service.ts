@@ -131,10 +131,66 @@ export class ChatService {
 
   async inspectInvite(inviteCodeInput: unknown) {
     const inviteCode = this.requireText(inviteCodeInput, 'Invite code', 4, 60);
-    const [room] = await this.db.select({ allowGuests: rooms.allowGuests, kind: rooms.kind }).from(rooms)
+    const [room] = await this.db.select({
+      id: rooms.id,
+      name: rooms.name,
+      allowGuests: rooms.allowGuests,
+      kind: rooms.kind,
+      createdBy: rooms.createdBy,
+      createdAt: rooms.createdAt,
+    }).from(rooms)
       .where(eq(rooms.inviteCode, inviteCode)).limit(1);
     if (!room || room.kind === 'direct') throw new NotFoundException('The invite link is invalid or has expired.');
-    return { valid: true, guestAllowed: room.allowGuests };
+    const now = Date.now();
+    const [memberRows, memberCounts, hostRows, activeGuests, activeGuestCounts, recentMessages] = await Promise.all([
+      this.db.select({
+        id: users.id,
+        displayName: users.displayName,
+        avatarColor: users.avatarColor,
+        joinedAt: roomMembers.joinedAt,
+      }).from(roomMembers)
+        .innerJoin(users, eq(users.id, roomMembers.userId))
+        .where(eq(roomMembers.roomId, room.id))
+        .orderBy(asc(roomMembers.joinedAt))
+        .limit(5),
+      this.db.select({ count: sql<number>`count(*)::int` })
+        .from(roomMembers)
+        .where(eq(roomMembers.roomId, room.id)),
+      this.db.select({ displayName: users.displayName })
+        .from(roomMembers)
+        .innerJoin(users, eq(users.id, roomMembers.userId))
+        .where(and(eq(roomMembers.roomId, room.id), eq(roomMembers.userId, room.createdBy ?? '')))
+        .limit(1),
+      this.db.select({ id: guestSessions.id, displayName: guestSessions.displayName, joinedAt: guestSessions.createdAt })
+        .from(guestSessions)
+        .where(and(eq(guestSessions.roomId, room.id), gt(guestSessions.expiresAt, now)))
+        .orderBy(asc(guestSessions.createdAt))
+        .limit(5),
+      this.db.select({ count: sql<number>`count(*)::int` })
+        .from(guestSessions)
+        .where(and(eq(guestSessions.roomId, room.id), gt(guestSessions.expiresAt, now))),
+      this.db.select({ type: messages.type, createdAt: messages.createdAt })
+        .from(messages)
+        .where(and(eq(messages.roomId, room.id), ne(messages.type, 'system')))
+        .orderBy(desc(messages.sequence))
+        .limit(1),
+    ]);
+    const participants = [
+      ...memberRows.map((member) => ({ displayName: member.displayName, avatarColor: member.avatarColor })),
+      ...activeGuests.map((guest) => ({ displayName: guest.displayName, avatarColor: null })),
+    ];
+    return {
+      valid: true,
+      guestAllowed: room.allowGuests,
+      room: {
+        name: room.name,
+        hostedBy: hostRows[0]?.displayName ?? null,
+        participants: participants.slice(0, 5),
+        participantCount: (memberCounts[0]?.count ?? 0) + (activeGuestCounts[0]?.count ?? 0),
+        recentActivity: recentMessages[0] ?? null,
+        createdAt: room.createdAt,
+      },
+    };
   }
 
   async createGuest(displayNameInput: unknown, inviteCodeInput?: unknown) {
@@ -375,6 +431,68 @@ export class ChatService {
       nextCursor: !query && output.length === limit && oldest ? String(oldest.sequence) : null,
       totalCount: query ? totalRows[0]?.count ?? 0 : null,
     };
+  }
+
+  async listCanvasLineage(roomId: string, messageId: string, actor: Actor) {
+    await this.actors.assertRoomAccess(roomId, actor);
+    const now = Date.now();
+    const selection = {
+      id: messages.id,
+      sequence: messages.sequence,
+      roomId: messages.roomId,
+      senderName: messages.senderName,
+      body: messages.body,
+      assetKey: messages.assetKey,
+      canvasParentId: messages.canvasParentId,
+      canvasVersion: messages.canvasVersion,
+      createdAt: messages.createdAt,
+    };
+    const activeCanvas = or(isNull(messages.expiresAt), gt(messages.expiresAt, now));
+    const [target] = await this.db.select(selection).from(messages).where(and(
+      eq(messages.id, messageId),
+      eq(messages.roomId, roomId),
+      eq(messages.type, 'canvas'),
+      activeCanvas,
+    )).limit(1);
+    if (!target) throw new NotFoundException('The drawing version no longer exists.');
+
+    let root = target;
+    const visitedAncestors = new Set<string>();
+    while (root.canvasParentId && !visitedAncestors.has(root.id) && visitedAncestors.size < 200) {
+      visitedAncestors.add(root.id);
+      const [parent] = await this.db.select(selection).from(messages).where(and(
+        eq(messages.id, root.canvasParentId),
+        eq(messages.roomId, roomId),
+        eq(messages.type, 'canvas'),
+        activeCanvas,
+      )).limit(1);
+      if (!parent) break;
+      root = parent;
+    }
+
+    const lineageById = new Map([[root.id, root]]);
+    let frontier = [root.id];
+    let truncated = visitedAncestors.size >= 200;
+    while (frontier.length && lineageById.size < 200) {
+      const remaining = 200 - lineageById.size;
+      const children = await this.db.select(selection).from(messages).where(and(
+        eq(messages.roomId, roomId),
+        eq(messages.type, 'canvas'),
+        inArray(messages.canvasParentId, frontier),
+        activeCanvas,
+      )).orderBy(asc(messages.sequence)).limit(remaining + 1);
+      if (children.length > remaining) truncated = true;
+      const accepted = children.slice(0, remaining);
+      for (const child of accepted) lineageById.set(child.id, child);
+      frontier = accepted.map((child) => child.id);
+    }
+
+    const rows = [...lineageById.values()].sort((left, right) => left.sequence - right.sequence);
+    const lineage = await Promise.all(rows.map(async (row) => ({
+      ...row,
+      assetUrl: row.assetKey ? await this.assetService.issueReadUrl(row.assetKey, roomId, actor) : null,
+    })));
+    return { lineage, truncated };
   }
 
   async sendMessage(roomId: string, actor: Actor, body: { type?: string; text?: unknown; assetKey?: string; replyToId?: string | null; canvasParentId?: string | null; clientRequestId?: string }) {

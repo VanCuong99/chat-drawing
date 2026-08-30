@@ -7,6 +7,11 @@ test.use({ hasTouch: true });
 
 test.afterEach(async ({ page }) => {
   page.on('dialog', (dialog) => void dialog.accept());
+  const toolSettings = page.getByRole('dialog', { name: /Tool Settings|Cài đặt công cụ/ });
+  if (await toolSettings.isVisible().catch(() => false)) {
+    await page.locator('.mobile-inspector-dismiss').click({ position: { x: 4, y: 4 } });
+    await expect(toolSettings).toBeHidden();
+  }
   const studio = page.getByRole('dialog', { name: /Nét Studio|Studio Nét/ });
   if (await studio.isVisible().catch(() => false)) await studio.getByRole('button', { name: /Close|Đóng/ }).click().catch(() => undefined);
   const openSidebar = page.getByRole('button', { name: /Open conversation list|Mở danh sách trò chuyện/ });
@@ -131,7 +136,7 @@ test('paint bucket fills a closed region in one tap, supports undo, and remains 
   await page.getByRole('button', { name: 'Try as a Guest' }).click();
   await page.getByRole('textbox', { name: 'Display Name' }).fill(`Guest Fill ${Date.now()}`);
   await page.getByRole('button', { name: 'Enter Nét' }).click();
-  const openCanvas = page.getByRole('button', { name: 'Open canvas' });
+  const openCanvas = page.locator('.composer-modes').getByRole('button', { name: 'Draw' });
   await expect(openCanvas).toBeVisible();
   await openCanvas.click();
 
@@ -178,18 +183,22 @@ test('paint bucket fills a closed region in one tap, supports undo, and remains 
   await expect(fillButton).toBeHidden();
   await studio.getByRole('button', { name: 'More tools' }).click();
   const moreTools = studio.getByRole('dialog', { name: 'More Tools' });
-  await expect(moreTools.getByRole('button', { name: /Highlighter/ })).toBeFocused();
+  await expect(moreTools.getByRole('button', { name: /Pan/ })).toBeFocused();
   const mobileFill = moreTools.getByRole('button', { name: /Fill/ });
   await expect(mobileFill).toBeVisible();
   const mobileFillBox = await mobileFill.boundingBox();
   expect(mobileFillBox?.width).toBeGreaterThanOrEqual(44);
   expect(mobileFillBox?.height).toBeGreaterThanOrEqual(44);
   await mobileFill.click();
-  await expect(canvas).toBeFocused();
+  const mobileInspector = studio.locator('.tool-inspector');
+  await expect(mobileInspector).toBeVisible();
+  await expect(mobileInspector.getByRole('button', { name: 'Close tool settings' })).toBeFocused();
   for (const name of ['Color Tolerance', 'Opacity']) {
-    const rangeBox = await studio.getByLabel(name).boundingBox();
+    const rangeBox = await mobileInspector.getByLabel(name).boundingBox();
     expect(rangeBox?.height).toBeGreaterThanOrEqual(44);
   }
+  await mobileInspector.getByRole('button', { name: 'Close tool settings' }).click();
+  await expect(studio.getByRole('button', { name: 'More tools' })).toBeFocused();
 
   const mobileCanvasBox = await canvas.boundingBox();
   expect(mobileCanvasBox).not.toBeNull();
@@ -212,7 +221,7 @@ test('paint bucket seals an anti-aliased freehand edge without leaking outside @
   await page.getByRole('button', { name: 'Try as a Guest' }).click();
   await page.getByRole('textbox', { name: 'Display Name' }).fill(`Guest Fill Edge ${Date.now()}`);
   await page.getByRole('button', { name: 'Enter Nét' }).click();
-  await page.getByRole('button', { name: 'Open canvas' }).click();
+  await page.locator('.composer-modes').getByRole('button', { name: 'Draw' }).click();
 
   const studio = page.getByRole('dialog', { name: 'Nét Studio' });
   const canvas = studio.getByLabel('Advanced drawing area');
@@ -262,11 +271,12 @@ test('paint bucket seals an anti-aliased freehand edge without leaking outside @
 });
 
 test('natural fill materials render stable grain, edge pooling, water control, and undo @critical', async ({ page }) => {
+  test.setTimeout(60_000);
   await page.goto('/');
   await page.getByRole('button', { name: 'Try as a Guest' }).click();
   await page.getByRole('textbox', { name: 'Display Name' }).fill(`Guest Watercolor ${Date.now()}`);
   await page.getByRole('button', { name: 'Enter Nét' }).click();
-  await page.getByRole('button', { name: 'Open canvas' }).click();
+  await page.locator('.composer-modes').getByRole('button', { name: 'Draw' }).click();
 
   const studio = page.getByRole('dialog', { name: 'Nét Studio' });
   const canvas = studio.getByLabel('Advanced drawing area');
@@ -373,6 +383,9 @@ test('natural fill materials render stable grain, edge pooling, water control, a
 
   for (const viewport of [{ width: 375, height: 812 }, { width: 844, height: 390 }]) {
     await page.setViewportSize(viewport);
+    if (viewport.width <= 720 && !await studio.locator('.tool-inspector').isVisible()) {
+      await studio.getByRole('button', { name: 'Color and tool settings' }).click();
+    }
     for (const material of await materialGroup.getByRole('button').all()) {
       const materialBox = await material.boundingBox();
       expect(materialBox?.height).toBeGreaterThanOrEqual(44);

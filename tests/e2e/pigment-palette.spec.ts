@@ -2,11 +2,12 @@ import { expect, test } from '@playwright/test';
 import { createHmac } from 'node:crypto';
 import { mixPigmentHex, pigmentPercentages } from '@net/pigment';
 import { createDatabase, eq, paletteColors } from '@net/database';
+import { e2eApiUrl } from './e2e-environment';
 import { setVietnameseUi } from './use-vietnamese-ui';
 
 test.beforeEach(async ({ context }) => setVietnameseUi(context));
 
-const API_URL = 'http://localhost:3001/api';
+const API_URL = e2eApiUrl;
 
 function userToken(userId: string) {
   const secret = process.env.AUTH_JWT_SECRET;
@@ -27,7 +28,7 @@ test('pha từ nhiều sắc tố, lưu và nạp lại công thức trong palet
   const guestResponsePromise = page.waitForResponse((response) => response.url().endsWith('/api/guest') && response.request().method() === 'POST');
   await page.getByRole('button', { name: 'Vào Nét' }).click();
   const guestSessionId = ((await (await guestResponsePromise).json()) as { sessionId: string }).sessionId;
-  await page.getByRole('button', { name: 'Mở canvas' }).click();
+  await page.locator('.composer-modes').getByRole('button', { name: 'Vẽ' }).click();
 
   await expect(page.getByRole('button', { name: 'Màu nước', exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: 'Mở pha màu nâng cao' }).click();
@@ -80,7 +81,7 @@ test('pha từ nhiều sắc tố, lưu và nạp lại công thức trong palet
   await page.getByRole('button', { name: 'Đóng Esc', exact: true }).click();
   await page.reload();
   await expect(page.getByText(/Đã đồng bộ|Đang kết nối lại/)).toBeVisible();
-  await page.getByRole('button', { name: 'Mở canvas' }).click();
+  await page.locator('.composer-modes').getByRole('button', { name: 'Vẽ' }).click();
   await expect(page.getByRole('button', { name: 'Dùng màu Nâu trung tính ba màu' })).toBeVisible();
   await page.getByRole('button', { name: 'Nạp công thức Nâu trung tính ba màu' }).click();
   await expect(page.getByRole('region', { name: 'Pha màu nâng cao' }).getByRole('listitem')).toHaveCount(3);

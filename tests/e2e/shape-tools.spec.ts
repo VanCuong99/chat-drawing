@@ -8,7 +8,7 @@ test('bộ chọn hình mở cạnh toolbar và vẽ được hình thang @criti
   await page.getByRole('button', { name: 'Dùng thử không cần tài khoản' }).click();
   await page.getByRole('textbox', { name: 'Tên hiển thị' }).fill(`Shape E2E ${Date.now()}`);
   await page.getByRole('button', { name: 'Vào Nét' }).click();
-  await page.getByRole('button', { name: 'Mở canvas' }).click();
+  await page.locator('.composer-modes').getByRole('button', { name: 'Vẽ' }).click();
 
   const shapeButton = page.getByRole('button', { name: /Hình dạng/ });
   await shapeButton.click();
@@ -66,35 +66,33 @@ test('bộ chọn hình mở cạnh toolbar và vẽ được hình thang @criti
   await expect(page.getByText('Hình thang').first()).toBeVisible();
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await shapeButton.scrollIntoViewIfNeeded();
-  await shapeButton.click();
-  const mobileShapeBounds = await shapeButton.boundingBox();
+  const moreToolsButton = page.getByRole('button', { name: 'Công cụ khác' });
+  await moreToolsButton.click();
+  await page.getByRole('dialog', { name: 'Công cụ khác' }).getByRole('button', { name: 'Chọn hình dạng' }).click();
   const mobilePickerBounds = await picker.boundingBox();
-  expect(mobileShapeBounds).not.toBeNull();
   expect(mobilePickerBounds).not.toBeNull();
   expect(mobilePickerBounds!.x).toBeGreaterThanOrEqual(8);
   expect(mobilePickerBounds!.x + mobilePickerBounds!.width).toBeLessThanOrEqual(382);
-  expect(mobilePickerBounds!.y).toBeGreaterThan(mobileShapeBounds!.y);
+  expect(mobilePickerBounds!.y).toBeGreaterThanOrEqual(8);
   expect(mobilePickerBounds!.y + mobilePickerBounds!.height).toBeLessThanOrEqual(836);
   await page.keyboard.press('Escape');
   await expect(picker).toBeHidden();
-  await expect(shapeButton).toBeFocused();
+  await expect(moreToolsButton).toBeFocused();
 
   await page.setViewportSize({ width: 667, height: 375 });
-  await shapeButton.scrollIntoViewIfNeeded();
-  await shapeButton.click();
-  const landscapeShapeBounds = await shapeButton.boundingBox();
+  await moreToolsButton.click();
+  await page.getByRole('dialog', { name: 'Công cụ khác' }).getByRole('button', { name: 'Chọn hình dạng' }).click();
   const landscapePickerBounds = await picker.boundingBox();
-  expect(landscapeShapeBounds).not.toBeNull();
   expect(landscapePickerBounds).not.toBeNull();
-  expect(landscapePickerBounds!.x).toBeGreaterThanOrEqual(landscapeShapeBounds!.x + landscapeShapeBounds!.width);
+  expect(landscapePickerBounds!.x).toBeGreaterThanOrEqual(8);
   expect(landscapePickerBounds!.y).toBeGreaterThanOrEqual(8);
   expect(landscapePickerBounds!.y + landscapePickerBounds!.height).toBeLessThanOrEqual(375);
   await page.keyboard.press('Escape');
+  await expect(picker).toBeHidden();
 
   await page.setViewportSize({ width: 1280, height: 720 });
   page.once('dialog', (dialog) => dialog.accept());
-  await page.getByRole('button', { name: /Đóng/ }).click();
+  await page.getByRole('dialog', { name: 'Nét Studio' }).locator('.studio-header').getByRole('button', { name: /Đóng/ }).click();
   await expect(page.getByRole('dialog', { name: 'Nét Studio' })).toBeHidden();
   const endResponse = page.waitForResponse((response) => response.url().endsWith('/api/guest') && response.request().method() === 'DELETE');
   await page.getByRole('button', { name: 'Kết thúc phiên khách' }).click();

@@ -1,8 +1,9 @@
 import { expect, test, type BrowserContext, type Page } from '@playwright/test';
 import { createDatabase, inArray, rooms } from '@net/database';
+import { e2eApiUrl, e2eWebOrigin } from './e2e-environment';
 import { setVietnameseUi } from './use-vietnamese-ui';
 
-const API_URL = 'http://localhost:3001/api';
+const API_URL = e2eApiUrl;
 
 async function startGuest(page: Page, name: string, inviteUrl = '/') {
   await page.goto(inviteUrl);
@@ -36,8 +37,8 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error('DATABASE_URL is required for two-party chat E2E');
   const { db, pool } = createDatabase(databaseUrl, 1);
-  const contextA = await browser.newContext({ baseURL: 'http://localhost:3000' });
-  const contextB = await browser.newContext({ baseURL: 'http://localhost:3000' });
+  const contextA = await browser.newContext({ baseURL: e2eWebOrigin });
+  const contextB = await browser.newContext({ baseURL: e2eWebOrigin });
   await Promise.all([setVietnameseUi(contextA), setVietnameseUi(contextB)]);
   const pageA = await contextA.newPage();
   const pageB = await contextB.newPage();

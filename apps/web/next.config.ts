@@ -6,6 +6,10 @@ if (process.env.VERCEL && (!process.env.NEXT_PUBLIC_API_URL || !process.env.NEXT
 }
 
 const nextConfig: NextConfig = {
+  distDir: process.env.NET_E2E_NEXT_DIST_DIR ?? '.next',
+  typescript: process.env.NET_E2E_TSCONFIG_PATH
+    ? { tsconfigPath: process.env.NET_E2E_TSCONFIG_PATH }
+    : undefined,
   outputFileTracingRoot: new URL('../..', import.meta.url).pathname,
   async rewrites() {
     return {

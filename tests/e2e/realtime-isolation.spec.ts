@@ -2,8 +2,9 @@ import { expect, test, type APIRequestContext } from '@playwright/test';
 import { createHmac } from 'node:crypto';
 import { io, type Socket } from 'socket.io-client';
 import { createDatabase, eq, inArray, rooms, users } from '@net/database';
+import { e2eApiOrigin, e2eWebOrigin } from './e2e-environment';
 
-const apiOrigin = 'http://localhost:3001';
+const apiOrigin = e2eApiOrigin;
 
 function userToken(userId: string) {
   const secret = process.env.AUTH_JWT_SECRET;
@@ -26,7 +27,7 @@ async function connectGuest(request: APIRequestContext, sessionId: string, roomI
   const tokenResponse = await request.post(`${apiOrigin}/api/realtime/token`, { headers: { 'x-net-guest-session': sessionId }, data: { roomId } });
   expect(tokenResponse.ok()).toBe(true);
   const { token } = await tokenResponse.json() as { token: string };
-  const socket = io(`${apiOrigin}/chat`, { path: '/socket.io', transports: ['websocket'], auth: { token }, forceNew: true, extraHeaders: { origin: 'http://localhost:3000' } });
+  const socket = io(`${apiOrigin}/chat`, { path: '/socket.io', transports: ['websocket'], auth: { token }, forceNew: true, extraHeaders: { origin: e2eWebOrigin } });
   await new Promise<void>((resolve, reject) => {
     socket.once('connect', resolve);
     socket.once('connect_error', reject);
@@ -114,7 +115,7 @@ test('actor channel báo unread cho phòng nền nhưng không phát message.cre
 
     const tokenResponse = await request.post(`${apiOrigin}/api/realtime/token`, { headers: { authorization }, data: { roomId: activeRoomId } });
     const { token } = await tokenResponse.json() as { token: string };
-    socket = io(`${apiOrigin}/chat`, { path: '/socket.io', transports: ['websocket'], auth: { token }, forceNew: true, extraHeaders: { origin: 'http://localhost:3000' } });
+    socket = io(`${apiOrigin}/chat`, { path: '/socket.io', transports: ['websocket'], auth: { token }, forceNew: true, extraHeaders: { origin: e2eWebOrigin } });
     await new Promise<void>((resolve, reject) => {
       socket!.once('connect', resolve);
       socket!.once('connect_error', reject);

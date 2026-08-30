@@ -1,11 +1,12 @@
 import { expect, test, type Locator } from '@playwright/test';
-import { createHmac } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { createDatabase, eq, inArray, messages, roomMembers, rooms, users } from '@net/database';
+import { e2eApiUrl, e2eWebOrigin } from './e2e-environment';
 import { setVietnameseUi } from './use-vietnamese-ui';
 
 test.beforeEach(async ({ context }) => setVietnameseUi(context));
 
-const API_URL = 'http://localhost:3001/api';
+const API_URL = e2eApiUrl;
 
 const room = (id: string) => ({
   id,
@@ -68,13 +69,13 @@ async function settledImageBox(image: Locator): Promise<ElementBox> {
   return latest;
 }
 
-function userToken(userId: string) {
+function userToken(userId: string, displayName = userId) {
   const secret = process.env.AUTH_JWT_SECRET;
   if (!secret) throw new Error('AUTH_JWT_SECRET is required for authenticated bootstrap E2E');
   const now = Math.floor(Date.now() / 1000);
   const encode = (value: object) => Buffer.from(JSON.stringify(value)).toString('base64url');
   const header = encode({ alg: 'HS256', typ: 'JWT' });
-  const payload = encode({ sub: userId, kind: 'user', email: `${userId}@example.test`, displayName: userId, actorKey: `user:${userId}`, iss: 'net-web', aud: 'net-api', iat: now, exp: now + 3600 });
+  const payload = encode({ sub: userId, kind: 'user', email: `${userId}@example.test`, displayName, actorKey: `user:${userId}`, iss: 'net-web', aud: 'net-api', iat: now, exp: now + 3600 });
   const unsigned = `${header}.${payload}`;
   return `${unsigned}.${createHmac('sha256', secret).update(unsigned).digest('base64url')}`;
 }
@@ -121,7 +122,50 @@ test('link đăng nhập giữ nguyên mã mời trong returnTo @critical', asyn
   await page.goto(`/?room=${inviteCode}`);
   const href = await page.getByRole('link', { name: 'Đăng nhập để vào ngay' }).getAttribute('href');
   expect(href).toBeTruthy();
-  expect(new URL(href!, 'http://localhost:3000').searchParams.get('returnTo')).toBe(`/?room=${inviteCode}`);
+  expect(new URL(href!, e2eWebOrigin).searchParams.get('returnTo')).toBe(`/?room=${inviteCode}`);
+});
+
+test('invite cho biết ai mời, tên phòng, người tham gia và hoạt động gần đây @critical', async ({ page }) => {
+  const inviteCode = 'socialInvite2026';
+  await page.route(`**/api/invites/${inviteCode}`, (route) => route.fulfill({ json: {
+    valid: true,
+    guestAllowed: true,
+    room: {
+      name: 'Weekend Sketch Club',
+      hostedBy: 'Minh Anh',
+      participants: [
+        { id: 'minh', displayName: 'Minh Anh', avatarColor: '#6f4ee8' },
+        { id: 'an', displayName: 'An Vẽ', avatarColor: '#3aa694' },
+      ],
+      participantCount: 2,
+      recentActivity: { type: 'canvas', createdAt: Date.now() },
+      createdAt: Date.now() - 60_000,
+    },
+  } }));
+  await page.goto(`/?room=${inviteCode}`);
+  await expect(page.getByText('Phòng do Minh Anh tạo')).toBeVisible();
+  await expect(page.getByText('Weekend Sketch Club')).toBeVisible();
+  await expect(page.getByLabel('2 người trong phòng này')).toBeVisible();
+  await expect(page.getByText(/Vừa có một bản vẽ được chia sẻ/)).toBeVisible();
+});
+
+test('khách có thể thử một nét trước khi chọn tên @critical', async ({ page }) => {
+  await page.goto('/');
+  const canvas = page.getByLabel('Canvas nhỏ để thử Nét');
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error('Không tìm thấy canvas thử trên landing.');
+  await page.mouse.move(box.x + 50, box.y + 60);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 160, box.y + 120, { steps: 8 });
+  await page.mouse.up();
+  const useMark = page.getByRole('button', { name: /Tiếp tục nét này/ });
+  await expect(useMark).toBeEnabled();
+  await page.getByRole('button', { name: 'Xóa' }).click();
+  await expect(useMark).toBeDisabled();
+  await canvas.press('Space');
+  await expect(useMark).toBeEnabled();
+  await useMark.click();
+  await expect(page.getByRole('dialog', { name: 'Bạn muốn được gọi là gì?' })).toBeVisible();
 });
 
 test('landing không yêu cầu người dùng dán lại link mời trong app @critical', async ({ page }) => {
@@ -137,7 +181,8 @@ test('guest mở link mời thấy ô tên trực tiếp @critical', async ({ pa
   await page.route('**/api/invites/reviewInvite2026', (route) => route.fulfill({ json: { valid: true, guestAllowed: true } }));
   await page.goto('/?room=reviewInvite2026');
   const guestName = page.getByRole('textbox', { name: 'Tên hiển thị' });
-  await expect(guestName).toBeFocused();
+  await expect(guestName).toBeVisible();
+  await expect(guestName).not.toBeFocused();
   expect(await guestName.evaluate((input) => getComputedStyle(input).fontSize)).toBe('16px');
   await expect(page.getByRole('button', { name: 'Vào phòng' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Vào phòng ngay' })).toHaveCount(0);
@@ -160,7 +205,7 @@ test('link mời sai không tuyên bố phòng đã sẵn sàng và không hỏi
   await expect(page.getByRole('button', { name: 'Về trang chủ' })).toBeVisible();
   const signInHref = await page.getByRole('link', { name: 'Đăng nhập' }).getAttribute('href');
   expect(signInHref).toBeTruthy();
-  expect(new URL(signInHref!, 'http://localhost:3000').searchParams.get('returnTo')).toBe('/');
+  expect(new URL(signInHref!, e2eWebOrigin).searchParams.get('returnTo')).toBe('/');
 });
 
 test('link phòng không nhận guest dẫn thẳng tới đăng nhập và giữ returnTo @critical', async ({ page }) => {
@@ -172,7 +217,7 @@ test('link phòng không nhận guest dẫn thẳng tới đăng nhập và gi�
   await expect(page.getByRole('textbox', { name: 'Tên hiển thị' })).toHaveCount(0);
   const href = await page.getByRole('link', { name: 'Đăng nhập và vào phòng' }).getAttribute('href');
   expect(href).toBeTruthy();
-  expect(new URL(href!, 'http://localhost:3000').searchParams.get('returnTo')).toBe(`/?room=${inviteCode}`);
+  expect(new URL(href!, e2eWebOrigin).searchParams.get('returnTo')).toBe(`/?room=${inviteCode}`);
   const homeBox = await page.getByRole('button', { name: 'Về trang chủ' }).boundingBox();
   expect(homeBox?.height).toBeGreaterThanOrEqual(44);
 });
@@ -228,31 +273,33 @@ test('authenticated user mở link thì tự join và chuyển đúng phòng @cr
   expect(joinCount).toBe(1);
 });
 
-test('người đã chọn ở mode nhóm vẫn tìm thấy khi quay lại nhắn riêng @critical', async ({ page }) => {
+test('một people picker tự chuyển từ chat riêng sang nhóm theo số người đã chọn @critical', async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 });
   const person = { id: 'person-1', displayName: 'Bạn Nét', email: 'ba•••@example.test', avatarColor: '#3aa694' };
+  const secondPerson = { id: 'person-2', displayName: 'An Vẽ', email: 'an•••@example.test', avatarColor: '#6f4ee8' };
   await page.route('**/api/bootstrap', (route) => route.fulfill({ json: {
     actor: { kind: 'user', id: 'review-user', displayName: 'Review User', email: 'review@example.test' },
     rooms: [room('review-room')],
   } }));
   await page.route('**/api/realtime/token', (route) => route.fulfill({ status: 503, json: { error: 'Dùng polling trong test' } }));
   await page.route('**/api/rooms/review-room/messages*', (route) => route.fulfill({ json: { messages: [], nextCursor: null } }));
-  await page.route('**/api/users?q=*', (route) => route.fulfill({ json: { users: [person] } }));
+  await page.route('**/api/users?q=*', (route) => route.fulfill({ json: { users: [person, secondPerson] } }));
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Mở danh sách trò chuyện' }).click();
   await page.getByRole('button', { name: 'Cuộc trò chuyện mới' }).click();
-  const conversationSearch = page.getByRole('searchbox', { name: 'Bạn muốn nhắn cho ai?' });
+  const conversationSearch = page.getByRole('searchbox', { name: 'Bạn muốn sáng tạo cùng ai?' });
   await expect(conversationSearch).toBeVisible();
   expect(await conversationSearch.evaluate((input) => getComputedStyle(input).fontSize)).toBe('16px');
   await expect(page.getByRole('button', { name: /Vào bằng link/ })).toHaveCount(0);
   await expect(page.getByText(/dán link/i)).toHaveCount(0);
-  await page.getByRole('button', { name: /Tạo nhóm/ }).click();
-  await page.getByRole('searchbox', { name: 'Thêm thành viên' }).fill('Bạn');
-  await page.getByRole('button', { name: /Bạn Nét.*Thêm/ }).click();
-  await expect(page.getByRole('button', { name: 'Xóa Bạn Nét khỏi nhóm' })).toBeVisible();
-  await page.getByRole('button', { name: /Nhắn riêng/ }).click();
-  await expect(page.getByRole('button', { name: /Bạn Nét.*Nhắn tin/ })).toBeVisible();
+  await conversationSearch.fill('Bạn');
+  await page.getByRole('button', { name: /Bạn Nét.*Chọn/ }).click();
+  await expect(page.getByRole('button', { name: 'Bỏ chọn Bạn Nét' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Nhắn cho Bạn Nét' })).toBeVisible();
+  await page.getByRole('button', { name: /An Vẽ.*Chọn/ }).click();
+  await expect(page.getByRole('textbox', { name: /Tên nhóm/ })).toBeVisible();
+  await expect(page.getByRole('button', { name: /Tạo nhóm · 3 người/ })).toBeVisible();
 });
 
 test('tên phòng dài không làm tràn mobile và các nút chính đủ vùng chạm @critical', async ({ page }) => {
@@ -306,6 +353,227 @@ test('tên phòng dài không làm tràn mobile và các nút chính đủ vùng
   const closeBox = await page.locator('.info-drawer').getByRole('button', { name: 'Đóng' }).boundingBox();
   expect(closeBox?.width).toBeGreaterThanOrEqual(44);
   expect(closeBox?.height).toBeGreaterThanOrEqual(44);
+});
+
+test('Studio mobile ưu tiên canvas và chỉ giữ dock năm công cụ chính @critical', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const studioRoom = { ...room('studio-mobile-room'), messageCount: 2 };
+  await page.route('**/api/bootstrap', (route) => route.fulfill({ json: {
+    actor: { kind: 'user', id: 'review-user', displayName: 'Review User', email: 'review@example.test' },
+    rooms: [studioRoom],
+  } }));
+  await page.route('**/api/realtime/token', (route) => route.fulfill({ status: 503, json: { error: 'Dùng polling trong test' } }));
+  await page.route('**/api/rooms/studio-mobile-room/messages*', (route) => route.fulfill({ json: { messages: [], nextCursor: null } }));
+  await page.goto('/');
+  await page.locator('.composer-modes').getByRole('button', { name: 'Vẽ' }).click();
+  const studio = page.getByRole('dialog', { name: 'Nét Studio' });
+  await expect(studio).toBeVisible();
+  await expect(studio.locator('.tool-rail button:visible')).toHaveCount(5);
+  const workspaceBox = await studio.locator('.studio-workspace').boundingBox();
+  const canvasBox = await studio.locator('.canvas-panel').boundingBox();
+  const drawableBox = await studio.getByLabel('Vùng vẽ nâng cao').boundingBox();
+  expect(workspaceBox && canvasBox ? canvasBox.height / workspaceBox.height : 0).toBeGreaterThan(0.78);
+  expect(canvasBox && drawableBox ? drawableBox.width / canvasBox.width : 0).toBeGreaterThan(0.9);
+  expect(workspaceBox && drawableBox ? drawableBox.height / workspaceBox.height : 0).toBeGreaterThan(0.25);
+  await expect(studio.locator('.tool-inspector')).not.toBeVisible();
+  await studio.getByRole('button', { name: 'Màu và cài đặt công cụ' }).click();
+  const toolDialog = studio.getByRole('dialog', { name: 'Cài đặt công cụ' });
+  await expect(toolDialog).toBeVisible();
+  await page.keyboard.press('Shift+Tab');
+  await expect(toolDialog.locator(':focus')).toHaveCount(1);
+  for (const colorButton of await toolDialog.locator('.color,.custom-color').all()) {
+    const colorBox = await colorButton.boundingBox();
+    expect(colorBox?.width).toBeGreaterThanOrEqual(44);
+    expect(colorBox?.height).toBeGreaterThanOrEqual(44);
+  }
+  await toolDialog.getByRole('button', { name: 'Đóng cài đặt công cụ' }).click();
+  await expect(studio.locator('.tool-inspector')).not.toBeVisible();
+  await expect(studio.getByRole('button', { name: 'Màu và cài đặt công cụ' })).toBeFocused();
+  const drawingArea = studio.getByLabel('Vùng vẽ nâng cao');
+  const drawingBox = await drawingArea.boundingBox();
+  if (!drawingBox) throw new Error('Không đo được canvas Studio mobile.');
+  await page.mouse.move(drawingBox.x + 60, drawingBox.y + 70);
+  await page.mouse.down();
+  await page.mouse.move(drawingBox.x + 150, drawingBox.y + 120, { steps: 8 });
+  await page.mouse.up();
+  await expect(studio.getByText('1 thao tác')).toBeVisible();
+  await expect(studio.getByText(/Đã lưu bản nháp/)).toBeVisible();
+  page.once('dialog', (dialog) => dialog.accept());
+  await studio.locator('.studio-header').getByRole('button', { name: /Đóng/ }).click();
+  await expect(studio).toBeHidden();
+  await page.locator('.composer-modes').getByRole('button', { name: 'Vẽ' }).click();
+  const restoredStudio = page.getByRole('dialog', { name: 'Nét Studio' });
+  await expect(restoredStudio.getByText(/Đã khôi phục bản nháp/)).toBeVisible();
+  await expect(restoredStudio.getByText('1 thao tác')).toBeVisible();
+});
+
+test('Studio pinch-to-zoom và pan hai ngón không tạo nét ngoài ý muốn @critical', async ({ page, context }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const studioRoom = { ...room('studio-gesture-room'), messageCount: 1 };
+  await page.route('**/api/bootstrap', (route) => route.fulfill({ json: {
+    actor: { kind: 'user', id: 'gesture-user', displayName: 'Gesture User', email: 'gesture@example.test' },
+    rooms: [studioRoom],
+  } }));
+  await page.route('**/api/realtime/token', (route) => route.fulfill({ status: 503, json: { error: 'Dùng polling trong test' } }));
+  await page.route('**/api/rooms/studio-gesture-room/messages*', (route) => route.fulfill({ json: { messages: [], nextCursor: null } }));
+  await page.goto('/');
+  await page.locator('.composer-modes').getByRole('button', { name: 'Vẽ' }).click();
+
+  const studio = page.getByRole('dialog', { name: 'Nét Studio' });
+  const canvas = studio.getByLabel('Vùng vẽ nâng cao');
+  const viewport = studio.locator('.canvas-viewport');
+  await expect(studio.getByText('Một ngón vẽ · hai ngón thu phóng và di chuyển')).toBeVisible();
+  const viewportBox = await viewport.boundingBox();
+  if (!viewportBox) throw new Error('Không đo được viewport canvas cho gesture.');
+  const center = { x: viewportBox.x + viewportBox.width / 2, y: viewportBox.y + viewportBox.height / 2 };
+  const client = await context.newCDPSession(page);
+  await client.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
+  const dispatchTouch = async (type: 'touchStart' | 'touchMove' | 'touchEnd', points: Array<{ id: number; x: number; y: number }>) => {
+    await client.send('Input.dispatchTouchEvent', {
+      type,
+      touchPoints: points.map((point) => ({ ...point, radiusX: 5, radiusY: 5, force: 0.5 })),
+    });
+  };
+
+  await dispatchTouch('touchStart', [
+    { id: 1, x: center.x - 40, y: center.y },
+    { id: 2, x: center.x + 40, y: center.y },
+  ]);
+  await dispatchTouch('touchMove', [
+    { id: 1, x: center.x - 70, y: center.y },
+    { id: 2, x: center.x + 70, y: center.y },
+  ]);
+  await dispatchTouch('touchEnd', []);
+
+  await expect(studio.getByLabel('Mức phóng đại')).toHaveText('175%');
+  await expect(studio.getByText('0 thao tác')).toBeVisible();
+  const scrollAfterZoom = await viewport.evaluate((element) => element.scrollLeft);
+  expect(scrollAfterZoom).toBeGreaterThan(0);
+
+  await dispatchTouch('touchStart', [
+    { id: 3, x: center.x - 55, y: center.y },
+    { id: 4, x: center.x + 55, y: center.y },
+  ]);
+  await dispatchTouch('touchMove', [
+    { id: 3, x: center.x - 95, y: center.y },
+    { id: 4, x: center.x + 15, y: center.y },
+  ]);
+  await dispatchTouch('touchEnd', []);
+  await expect.poll(() => viewport.evaluate((element) => element.scrollLeft)).toBeGreaterThan(scrollAfterZoom + 20);
+  await expect(studio.getByText('0 thao tác')).toBeVisible();
+
+  const visibleCanvasBox = await canvas.boundingBox();
+  if (!visibleCanvasBox) throw new Error('Không đo được canvas sau gesture.');
+  const strokeStart = {
+    x: Math.max(viewportBox.x + 60, visibleCanvasBox.x + 80),
+    y: Math.max(viewportBox.y + 90, visibleCanvasBox.y + 90),
+  };
+  await dispatchTouch('touchStart', [{ id: 5, ...strokeStart }]);
+  await dispatchTouch('touchMove', [{ id: 5, x: strokeStart.x + 45, y: strokeStart.y + 28 }]);
+  await dispatchTouch('touchEnd', []);
+  await expect(studio.getByText('1 thao tác')).toBeVisible();
+  await client.detach();
+});
+
+test('vẽ và tiếp tục bản vẽ là hành động nổi bật nhưng message mobile vẫn gọn @critical', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const canvasRoom = { ...room('canvas-conversation-room'), messageCount: 1, mediaCount: 1 };
+  const canvasMessage = {
+    ...message(1, ''),
+    id: 'canvas-message',
+    roomId: canvasRoom.id,
+    type: 'canvas',
+    body: null,
+    assetKey: 'canvas-asset',
+    assetUrl: '/api/assets/canvas-asset?access=review',
+    canvasVersion: 2,
+  };
+  await page.route('**/api/bootstrap', (route) => route.fulfill({ json: {
+    actor: { kind: 'user', id: 'review-user', displayName: 'Review User', email: 'review@example.test' },
+    rooms: [canvasRoom],
+  } }));
+  await page.route('**/api/realtime/token', (route) => route.fulfill({ status: 503, json: { error: 'Dùng polling trong test' } }));
+  await page.route('**/api/rooms/canvas-conversation-room/messages*', (route) => route.fulfill({ json: { messages: [canvasMessage], nextCursor: null } }));
+  await page.goto('/');
+
+  const modes = page.locator('.composer-modes');
+  await expect(modes.getByRole('button', { name: 'Chữ' })).toBeVisible();
+  await expect(modes.getByRole('button', { name: 'Vẽ' })).toBeVisible();
+  await expect(modes.getByRole('button', { name: 'Ảnh' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /Vẽ tiếp bản này.*phiên bản 3/ })).toBeVisible();
+  await expect(page.locator('.message-tools')).not.toBeVisible();
+  const overflow = page.locator('.message-overflow');
+  await expect(overflow).toBeVisible();
+  const overflowBox = await overflow.locator('summary').boundingBox();
+  expect(overflowBox?.width).toBeGreaterThanOrEqual(44);
+  expect(overflowBox?.height).toBeGreaterThanOrEqual(44);
+  await overflow.locator('summary').click();
+  await expect(overflow.getByRole('button', { name: 'Trả lời' })).toBeVisible();
+  for (const reaction of await overflow.locator('div>span button').all()) {
+    const reactionBox = await reaction.boundingBox();
+    expect(reactionBox?.width).toBeGreaterThanOrEqual(44);
+    expect(reactionBox?.height).toBeGreaterThanOrEqual(44);
+  }
+  const inviteBox = await page.getByRole('button', { name: 'Sao chép link mời' }).boundingBox();
+  expect(inviteBox?.width).toBeGreaterThanOrEqual(44);
+  expect(inviteBox?.height).toBeGreaterThanOrEqual(44);
+});
+
+test('lịch sử bản vẽ cho phép so sánh và tiếp tục từ bất kỳ phiên bản nào @critical', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const canvasRoom = { ...room('canvas-lineage-room'), messageCount: 3, mediaCount: 3 };
+  const lineage = [1, 2, 3].map((version) => ({
+    ...message(version, version === 2 ? 'Thêm một nhánh cây' : ''),
+    id: `canvas-v${version}`,
+    roomId: canvasRoom.id,
+    senderName: version === 1 ? 'Minh Anh' : 'Review User',
+    senderId: version === 1 ? 'minh-anh' : 'review-user',
+    type: 'canvas',
+    assetKey: `canvas-asset-v${version}`,
+    assetUrl: `/api/assets/canvas-asset-v${version}?access=review`,
+    canvasParentId: version === 1 ? null : `canvas-v${version - 1}`,
+    canvasVersion: version,
+  }));
+  await page.route('**/api/bootstrap', (route) => route.fulfill({ json: {
+    actor: { kind: 'user', id: 'review-user', displayName: 'Review User', email: 'review@example.test' },
+    rooms: [canvasRoom],
+  } }));
+  await page.route('**/api/realtime/token', (route) => route.fulfill({ status: 503, json: { error: 'Dùng polling trong test' } }));
+  await page.route('**/api/rooms/canvas-lineage-room/messages/canvas-v3/lineage', (route) => route.fulfill({ json: { lineage } }));
+  await page.route('**/api/rooms/canvas-lineage-room/messages*', (route) => route.fulfill({ json: { messages: [lineage[2]], nextCursor: null } }));
+  await page.route('**/api/assets/canvas-asset-v*', (route) => route.fulfill({
+    status: 200,
+    contentType: 'image/svg+xml',
+    body: '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720"><rect width="100%" height="100%" fill="#f7f2ff"/><path d="M120 500 Q480 110 1080 430" fill="none" stroke="#6f4ee8" stroke-width="28"/></svg>',
+  }));
+  await page.route('**/api/assets/*/access', (route) => {
+    const key = new URL(route.request().url()).pathname.split('/').at(-2);
+    return route.fulfill({ json: { assetUrl: `/api/assets/${key}?access=refreshed` } });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: /Xem lịch sử 3 phiên bản|Xem lịch sử phiên bản/ }).click();
+  const dialog = page.getByRole('dialog', { name: 'Lịch sử bản vẽ' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText('3 phiên bản')).toBeVisible();
+  await expect(dialog.getByRole('combobox', { name: 'Bản so sánh A' })).toHaveValue('canvas-v2');
+  await expect(dialog.getByRole('combobox', { name: 'Bản so sánh B' })).toHaveValue('canvas-v3');
+  await expect(dialog.getByRole('img', { name: 'Bản so sánh A · phiên bản 2' })).toBeHidden();
+  await expect(dialog.getByRole('img', { name: 'Bản so sánh B · phiên bản 3' })).toBeVisible();
+  const previewChoice = dialog.getByRole('group', { name: 'Chọn phiên bản để xem trước' });
+  await previewChoice.getByRole('button', { name: /A · Phiên bản 2/ }).click();
+  await expect(dialog.getByRole('img', { name: 'Bản so sánh A · phiên bản 2' })).toBeVisible();
+  await expect(dialog.getByRole('img', { name: 'Bản so sánh B · phiên bản 3' })).toBeHidden();
+  await previewChoice.getByRole('button', { name: /B · Phiên bản 3/ }).click();
+  const continueButton = dialog.getByRole('button', { name: /Vẽ tiếp từ phiên bản 3/ });
+  const continueBox = await continueButton.boundingBox();
+  expect(continueBox?.height).toBeGreaterThanOrEqual(44);
+  await dialog.getByRole('button', { name: /Phiên bản 1.*Minh Anh/ }).click();
+  await expect(dialog.getByRole('combobox', { name: 'Bản so sánh B' })).toHaveValue('canvas-v1');
+  await expect(dialog.getByRole('button', { name: /Vẽ tiếp từ phiên bản 1/ })).toBeVisible();
+  await dialog.getByRole('button', { name: /Vẽ tiếp từ phiên bản 1/ }).click();
+  await expect(page.getByRole('dialog', { name: 'Nét Studio' })).toBeVisible();
+  await expect(page.getByText('Tiếp nối phiên bản 1')).toBeVisible();
 });
 
 test.describe('tải ảnh theo múi giờ của người dùng', () => {
@@ -379,8 +647,10 @@ test('ảnh trong message mở viewer, zoom bằng nút và tải file thật tr
   await expect(viewer).toHaveCount(0);
   await expect(openMedia).toBeFocused();
 
+  const overflow = page.locator('.message-overflow');
+  await overflow.locator('summary').click();
   const directDownload = page.waitForEvent('download');
-  await page.getByRole('button', { name: 'Tải ảnh xuống', exact: true }).click();
+  await overflow.getByRole('button', { name: 'Tải xuống', exact: true }).click();
   expect((await directDownload).suggestedFilename()).toBe('net-image-2026-08-28.png');
 
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -510,6 +780,58 @@ test('tạo chat trực tiếp đồng thời chỉ tạo một phòng và hiể
   }
 });
 
+test('API invite chỉ lộ ngữ cảnh xã hội an toàn và trang đăng nhập giữ ngữ cảnh phòng @critical', async ({ page, request }) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error('DATABASE_URL is required for invite preview E2E');
+  const { db, pool } = createDatabase(databaseUrl, 1);
+  const stamp = Date.now();
+  const actorId = `invite-owner-${stamp}`;
+  const memberIds = [`invite-member-a-${stamp}`, `invite-member-b-${stamp}`];
+  const overflowMemberIds = Array.from({ length: 19 }, (_, index) => `invite-overflow-${index}-${stamp}`);
+  const authorization = `Bearer ${userToken(actorId, 'Minh Anh')}`;
+  let roomId = '';
+  await db.insert(users).values([
+    { id: actorId, email: `${actorId}@example.test`, displayName: 'Minh Anh', avatarColor: '#6f4ee8', createdAt: stamp, updatedAt: stamp },
+    ...memberIds.map((id, index) => ({ id, email: `${id}@example.test`, displayName: index ? 'An Vẽ' : 'Bảo Nét', avatarColor: index ? '#3aa694' : '#ef7668', createdAt: stamp, updatedAt: stamp })),
+  ]);
+  try {
+    const created = await request.post(`${API_URL}/rooms`, {
+      headers: { authorization },
+      data: { name: 'Weekend Sketch Club', memberIds, allowGuests: true },
+    });
+    expect(created.ok()).toBe(true);
+    const room = await created.json() as { id: string; inviteCode: string };
+    roomId = room.id;
+    const sent = await request.post(`${API_URL}/rooms/${room.id}/messages`, {
+      headers: { authorization },
+      data: { type: 'text', text: 'Nội dung riêng không được lộ trong preview', clientRequestId: randomUUID() },
+    });
+    expect(sent.ok()).toBe(true);
+    const inspected = await request.get(`${API_URL}/invites/${room.inviteCode}`);
+    expect(inspected.ok()).toBe(true);
+    const payload = await inspected.json() as {
+      room: { name: string; hostedBy: string; participantCount: number; participants: Array<{ displayName: string }>; recentActivity: { type: string } };
+      guestAllowed: boolean;
+    };
+    expect(payload).toMatchObject({ guestAllowed: true, room: { name: 'Weekend Sketch Club', hostedBy: 'Minh Anh', participantCount: 3, recentActivity: { type: 'text' } } });
+    expect(payload.room.participants.map((participant) => participant.displayName)).toEqual(expect.arrayContaining(['Minh Anh', 'Bảo Nét', 'An Vẽ']));
+    expect(JSON.stringify(payload)).not.toContain('Nội dung riêng');
+    await db.insert(users).values(overflowMemberIds.map((id, index) => ({ id, email: `${id}@example.test`, displayName: `Thành viên ${index + 4}`, avatarColor: '#4e8fb8', createdAt: stamp, updatedAt: stamp })));
+    await db.insert(roomMembers).values(overflowMemberIds.map((userId, index) => ({ roomId: room.id, userId, role: 'member' as const, joinedAt: stamp + index + 10 })));
+    const crowdedPreview = await request.get(`${API_URL}/invites/${room.inviteCode}`);
+    await expect(crowdedPreview.json()).resolves.toMatchObject({ room: { participantCount: 22, hostedBy: 'Minh Anh' } });
+    const returnTo = `/?room=${encodeURIComponent(room.inviteCode)}`;
+    await page.goto(`/auth/sign-in?returnTo=${encodeURIComponent(returnTo)}`);
+    await expect(page.getByText('Weekend Sketch Club')).toBeVisible();
+    await expect(page.getByText(/Phòng do Minh Anh tạo · 22 người/)).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Hiện mật khẩu' })).toBeVisible();
+  } finally {
+    if (roomId) await db.delete(rooms).where(eq(rooms.id, roomId));
+    await db.delete(users).where(inArray(users.id, [actorId, ...memberIds, ...overflowMemberIds]));
+    await pool.end();
+  }
+});
+
 test('refresh realtime không huỷ pagination và không đánh dấu tin chưa nhìn là đã xem @critical', async ({ page }) => {
   let latestRequests = 0;
   let releaseOlder!: () => void;
@@ -588,7 +910,7 @@ test('guest.ended giữ nội dung guest trong phần lịch sử cũ đã tải
     const reacted = await request.post(`${API_URL}/messages/${oldGuestMessageId}/reactions`, { headers: headersB, data: { emoji: '❤️' } });
     expect(reacted.ok()).toBe(true);
     const now = Date.now();
-    await db.insert(messages).values(Array.from({ length: 85 }, (_, index) => ({
+    await db.insert(messages).values(Array.from({ length: 105 }, (_, index) => ({
       roomId: guestA.roomId,
       guestSessionId: guestA.sessionId,
       senderName: 'Retained A',
@@ -612,7 +934,7 @@ test('guest.ended giữ nội dung guest trong phần lịch sử cũ đã tải
     await expect(page.getByText('Tin guest nằm ngoài trang mới nhất', { exact: true })).toBeVisible();
     await expect(oldGuestArticle.locator('.reaction-list').getByRole('button', { name: 'Thả cảm xúc ❤️' })).toHaveCount(0);
   } finally {
-    await request.delete(`${API_URL}/guest`, { headers: headersA });
+    await request.delete(`${API_URL}/guest`, { headers: headersA }).catch(() => undefined);
     await request.delete(`${API_URL}/guest`, { headers: headersB }).catch(() => undefined);
     await db.delete(rooms).where(eq(rooms.id, guestA.roomId));
     await db.delete(users).where(eq(users.id, retainedUserId));

@@ -12,20 +12,30 @@ import {
   useRef,
   useState,
 } from 'react';
-import type { ActorView, MessageView, PaletteColorView, RoomView, UserSummary } from '@/src/shared/chat.types';
+import type { ActorView, CanvasLineageItem, MessageView, PaletteColorView, RoomView, UserSummary } from '@/src/shared/chat.types';
 import { io, type Socket } from 'socket.io-client';
 import AppDialog from '@/src/shared/app-dialog';
+import LandingDoodle from '@/src/features/chat/landing-doodle';
+import { deleteStudioDraftsForPrefix } from '@/src/features/drawing/studio-drafts';
 import MediaViewer from '@/src/features/chat/media-viewer';
 import { useLanguage } from '@/src/i18n/language-provider';
 import { localeTag, translateApiMessage, type Locale } from '@/src/i18n/messages';
 import LanguageSwitcher from '@/src/shared/language-switcher';
 
 const DrawingStudio = lazy(() => import('@/src/features/drawing/drawing-studio'));
+const DrawingLineage = lazy(() => import('@/src/features/chat/drawing-lineage'));
 
 type InitialUser = { id: string; displayName: string; email: string } | null;
 type Phase = 'loading' | 'landing' | 'app';
-type ConversationStartMode = 'direct' | 'group';
 type InviteStatus = 'none' | 'checking' | 'guest' | 'auth-only' | 'invalid' | 'unavailable';
+type InvitePreview = {
+  name: string;
+  hostedBy: string | null;
+  participants: Array<{ displayName: string; avatarColor: string | null }>;
+  participantCount: number;
+  recentActivity: { type: 'text' | 'image' | 'canvas'; createdAt: number } | null;
+  createdAt: number;
+};
 type InstallPromptEvent = Event & { prompt: () => Promise<void>; userChoice: Promise<{ outcome: string }> };
 
 class ApiRequestError extends Error {
@@ -34,7 +44,7 @@ class ApiRequestError extends Error {
 
 const EMOJIS = ['❤️', '👍', '✨', '😂', '👀'];
 
-type UiIconName = 'arrow' | 'check' | 'close' | 'download' | 'draw' | 'external' | 'group' | 'info' | 'install' | 'link' | 'lock' | 'menu' | 'message' | 'plus' | 'reply' | 'search' | 'send' | 'user';
+type UiIconName = 'arrow' | 'check' | 'close' | 'download' | 'draw' | 'external' | 'group' | 'history' | 'info' | 'install' | 'link' | 'lock' | 'menu' | 'message' | 'plus' | 'reply' | 'search' | 'send' | 'user';
 
 function UiIcon({ name, size = 20 }: { name: UiIconName; size?: number }) {
   const paths = {
@@ -45,6 +55,7 @@ function UiIcon({ name, size = 20 }: { name: UiIconName; size?: number }) {
     draw: <><path d="m4 20 4.6-1.1L19 8.5 15.5 5 5.1 15.4 4 20Z" /><path d="m13.8 6.7 3.5 3.5" /></>,
     external: <><path d="M14 4h6v6" /><path d="M20 4 11 13" /><path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6" /></>,
     group: <><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" /></>,
+    history: <><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" /><path d="M12 7v5l3 2" /></>,
     info: <><circle cx="12" cy="12" r="9" /><path d="M12 11v6" /><path d="M12 7h.01" /></>,
     install: <><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></>,
     link: <><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" /><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" /></>,
@@ -95,6 +106,20 @@ function localDateStamp(value: number) {
   return `${year}-${month}-${day}`;
 }
 
+function sameMessage(left: MessageView, right: MessageView) {
+  return left.id === right.id
+    && left.sequence === right.sequence
+    && left.body === right.body
+    && left.assetUrl === right.assetUrl
+    && left.editedAt === right.editedAt
+    && left.readCount === right.readCount
+    && left.reactions.length === right.reactions.length
+    && left.reactions.every((reaction, index) => {
+      const next = right.reactions[index];
+      return next && reaction.emoji === next.emoji && reaction.count === next.count && reaction.reacted === next.reacted;
+    });
+}
+
 const LEGACY_SYSTEM_MESSAGE_KEYS: Record<string, string> = {
   'Phiên khách đã bắt đầu. Khi phiên kết thúc, khách mất quyền truy cập nhưng nội dung đã gửi vẫn được giữ lại trong phòng.': 'The guest session started. When it ends, the guest loses access but submitted content remains in the room.',
   'Phiên tạm thời đã bắt đầu. Nội dung chỉ được lưu lâu dài khi phòng có thành viên đăng nhập.': 'The guest session started. When it ends, the guest loses access but submitted content remains in the room.',
@@ -116,11 +141,38 @@ function Logo({ compact = false }: { compact?: boolean }) {
   );
 }
 
+function InviteContext({ preview }: { preview: InvitePreview | null }) {
+  const { locale, t } = useLanguage();
+  if (!preview) return null;
+  const activity = preview.recentActivity?.type === 'canvas'
+    ? t('A drawing was shared')
+    : preview.recentActivity?.type === 'image'
+      ? t('An image was shared')
+      : preview.recentActivity
+        ? t('The conversation is active')
+        : t('Be the first to add something');
+  return (
+    <div className="invite-context">
+      <div className="invite-context-copy">
+        <small>{preview.hostedBy ? t('Hosted by {name}', { name: preview.hostedBy }) : t('You were invited to')}</small>
+        <strong>{preview.name}</strong>
+      </div>
+      <div className="invite-context-meta">
+        <div className="invite-participants" aria-label={t('{count} people in this room', { count: preview.participantCount })}>
+          {preview.participants.slice(0, 4).map((participant, index) => <span key={`${participant.displayName}-${index}`} className="avatar" style={participant.avatarColor ? { '--avatar': participant.avatarColor } as CSSProperties : avatarStyle(participant.displayName)}>{participant.displayName.slice(0, 1)}</span>)}
+          {preview.participantCount > 4 && <b>+{preview.participantCount - 4}</b>}
+        </div>
+        <span><i /> {activity}{preview.recentActivity ? ` · ${timeLabel(preview.recentActivity.createdAt, locale)}` : ''}</span>
+      </div>
+    </div>
+  );
+}
+
 export default function NetApp({ initialUser, initialApiToken, signInPath, signOutPath }: { initialUser: InitialUser; initialApiToken: string | null; signInPath: string; signOutPath: string }) {
   const { locale, t } = useLanguage();
   const [phase, setPhase] = useState<Phase>('loading');
   const [actor, setActor] = useState<ActorView | null>(initialUser ? { kind: 'user', id: initialUser.id, displayName: initialUser.displayName, email: initialUser.email } : null);
-  const [guestSession, setGuestSession] = useState<string | null>(() => typeof window === 'undefined' ? null : sessionStorage.getItem('net_guest_session'));
+  const [guestSession, setGuestSession] = useState<string | null>(() => typeof window === 'undefined' || initialUser ? null : sessionStorage.getItem('net_guest_session'));
   const [rooms, setRooms] = useState<RoomView[]>([]);
   const [activeRoomId, setActiveRoomId] = useState<string | null>(null);
   const [messages, setMessages] = useState<MessageView[]>([]);
@@ -140,8 +192,8 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const [guestErrorField, setGuestErrorField] = useState<'name' | 'form' | null>(null);
   const [inviteCode, setInviteCode] = useState(() => typeof window === 'undefined' ? '' : new URLSearchParams(window.location.search).get('room') ?? '');
   const [inviteStatus, setInviteStatus] = useState<InviteStatus>(() => typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('room') ? 'checking' : 'none');
+  const [invitePreview, setInvitePreview] = useState<InvitePreview | null>(null);
   const [createRoomOpen, setCreateRoomOpen] = useState(false);
-  const [conversationStartMode, setConversationStartMode] = useState<ConversationStartMode>('direct');
   const [roomName, setRoomName] = useState('');
   const [contactQuery, setContactQuery] = useState('');
   const [contactResults, setContactResults] = useState<UserSummary[]>([]);
@@ -149,12 +201,12 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const [conversationStartError, setConversationStartError] = useState('');
   const [selectedContacts, setSelectedContacts] = useState<UserSummary[]>([]);
   const [allowGuests, setAllowGuests] = useState(true);
-  const [sidebarPeople, setSidebarPeople] = useState<UserSummary[]>([]);
-  const [sidebarPeopleLoading, setSidebarPeopleLoading] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [studio, setStudio] = useState<{ sourceUrl?: string | null; parentId?: string | null; version?: number | null } | null>(null);
+  const [studio, setStudio] = useState<{ sourceUrl?: string | null; parentId?: string | null; version?: number | null; draftSource?: boolean } | null>(null);
+  const [pendingLandingSketch, setPendingLandingSketch] = useState<string | null>(null);
   const [viewingMedia, setViewingMedia] = useState<MessageView | null>(null);
+  const [lineageViewer, setLineageViewer] = useState<{ messageId: string; lineage: CanvasLineageItem[]; loading: boolean; error: string; truncated: boolean } | null>(null);
   const [downloadingAssetKey, setDownloadingAssetKey] = useState<string | null>(null);
   const [paletteColors, setPaletteColors] = useState<PaletteColorView[]>([]);
   const [paletteLoading, setPaletteLoading] = useState(false);
@@ -174,15 +226,16 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const endRef = useRef<HTMLDivElement>(null);
   const messageScrollRef = useRef<HTMLElement>(null);
   const conversationAtBottomRef = useRef(false);
+  const messageInputRef = useRef<HTMLTextAreaElement>(null);
   const joinedInvite = useRef(false);
   const activeRoomRef = useRef<string | null>(null);
   const latestMessageRequestGeneration = useRef(0);
   const historyMessageRequestGeneration = useRef(0);
+  const paginationInitializedRoomRef = useRef<string | null>(null);
   const messageSearchGeneration = useRef(0);
   const paletteRequestGeneration = useRef(0);
   const paletteMutationGeneration = useRef(0);
   const contactSearchGeneration = useRef(0);
-  const sidebarPeopleGeneration = useRef(0);
   const paletteMutationActiveRef = useRef(false);
   const paletteAbortRef = useRef<AbortController | null>(null);
   const actorIdRef = useRef<string | null>(null);
@@ -192,6 +245,8 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const endingGuestRef = useRef(false);
   const assetRefreshes = useRef(new Map<string, Promise<string | null>>());
   const automaticAssetRefreshAttempts = useRef(new Map<string, number>());
+  const lineageRequestGeneration = useRef(0);
+  const continuationGeneration = useRef(0);
 
   const activeRoom = rooms.find((room) => room.id === activeRoomId) ?? null;
   const actorId = actor?.id ?? null;
@@ -223,6 +278,8 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   }, [apiToken, guestSession, initialUser, locale]);
 
   const clearGuestSession = useCallback((message: string) => {
+    const storedGuest = sessionStorage.getItem('net_guest_session');
+    if (storedGuest) void deleteStudioDraftsForPrefix(`guest:${storedGuest}:`).catch(() => undefined);
     sessionStorage.removeItem('net_guest_session');
     latestMessageRequestGeneration.current += 1;
     historyMessageRequestGeneration.current += 1;
@@ -235,8 +292,10 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     actorIdRef.current = null;
     setPaletteMutating(false);
     activeRoomRef.current = null;
+    continuationGeneration.current += 1;
+    paginationInitializedRoomRef.current = null;
     setGuestSession(null); setActor(null); setRooms([]); setMessages([]); setNextCursor(null); setPaletteColors([]);
-    setActiveRoomId(null); setReplyTo(null); setViewingMedia(null); setPhase('landing'); setSidebarOpen(false); setInfoOpen(false);
+    setActiveRoomId(null); setReplyTo(null); setViewingMedia(null); setLineageViewer(null); setPhase('landing'); setSidebarOpen(false); setInfoOpen(false);
     setError(message);
   }, []);
 
@@ -245,16 +304,20 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     historyMessageRequestGeneration.current += 1;
     messageSearchGeneration.current += 1;
     activeRoomRef.current = roomId;
+    paginationInitializedRoomRef.current = null;
     setActiveRoomId(roomId); setMessages([]); setNextCursor(null); setReplyTo(null);
     setMessageSearchResults([]); setMessageSearchTotal(0); setMessageSearchLoading(false);
     conversationAtBottomRef.current = false;
-    setSidebarOpen(false); setInfoOpen(false); setViewingMedia(null); setMessageQuery(''); setConversationAtBottom(false);
+    lineageRequestGeneration.current += 1;
+    continuationGeneration.current += 1;
+    setSidebarOpen(false); setInfoOpen(false); setViewingMedia(null); setLineageViewer(null); setMessageQuery(''); setConversationAtBottom(false);
   }, []);
 
   const consumeInvite = useCallback(() => {
     joinedInvite.current = false;
     setInviteCode('');
     setInviteStatus('none');
+    setInvitePreview(null);
     window.history.replaceState(null, '', '/');
   }, []);
 
@@ -271,6 +334,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
         historyMessageRequestGeneration.current += 1;
         messageSearchGeneration.current += 1;
         setMessages([]); setNextCursor(null); setReplyTo(null); setMessageSearchResults([]); setMessageSearchTotal(0);
+        paginationInitializedRoomRef.current = null;
       }
       activeRoomRef.current = next;
       setActiveRoomId(next);
@@ -319,9 +383,11 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           setPhase('loading');
           setInviteStatus('checking');
           try {
-            const invitation = await api<{ valid: true; guestAllowed: boolean }>(`/api/invites/${encodeURIComponent(queryInvite)}`, {}, null);
+            const invitation = await api<{ valid: true; guestAllowed: boolean; room?: InvitePreview }>(`/api/invites/${encodeURIComponent(queryInvite)}`, {}, null);
+            setInvitePreview(invitation.room ?? null);
             setInviteStatus(invitation.guestAllowed ? 'guest' : 'auth-only');
           } catch (inviteError) {
+            setInvitePreview(null);
             setInviteStatus(inviteError instanceof ApiRequestError && [400, 404].includes(inviteError.status) ? 'invalid' : 'unavailable');
           }
           setPhase('landing');
@@ -331,16 +397,25 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           clearGuestSession(t('Your guest session expired. You no longer have access; messages and attached images remain in the room.'));
           return;
         }
-        setError(navigator.onLine
-          ? t('Nét cannot connect right now. Your session is safe; try again in a moment.')
-          : t('You are offline. Your session is safe and will recover when the connection returns.'));
-        setPhase(savedGuest || initialUser ? 'loading' : 'landing');
+        const hasActiveIdentity = Boolean(savedGuest || initialUser);
+        setError(hasActiveIdentity
+          ? navigator.onLine
+            ? t('Nét cannot connect right now. Your session is safe; try again in a moment.')
+            : t('You are offline. Your session is safe and will recover when the connection returns.')
+          : navigator.onLine
+            ? t('We could not load Nét. Try again in a moment.')
+            : t('You are offline. Check your connection and try again.'));
+        setPhase(hasActiveIdentity ? 'loading' : 'landing');
       });
     }, 0);
     const onInstall = (event: Event) => { event.preventDefault(); setInstallPrompt(event as InstallPromptEvent); };
     window.addEventListener('beforeinstallprompt', onInstall);
     return () => { window.clearTimeout(boot); window.removeEventListener('beforeinstallprompt', onInstall); };
   }, [api, bootstrapRetry, clearGuestSession, consumeInvite, guestSession, initialUser, inviteCode, loadBootstrap, selectRoom, t]);
+
+  useEffect(() => {
+    if (initialUser) sessionStorage.removeItem('net_guest_session');
+  }, [initialUser]);
 
   useEffect(() => {
     if ('serviceWorker' in navigator) void navigator.serviceWorker.register('/sw.js');
@@ -395,7 +470,10 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       const cursor = before ? `?before=${encodeURIComponent(before)}` : quiet ? '?limit=100' : '';
       const data = await api<{ messages: MessageView[]; nextCursor: string | null }>(`/api/rooms/${roomId}/messages${cursor}`);
       if (activeRoomRef.current !== roomId || generation !== requestGeneration.current) return;
-      if (!quiet) setNextCursor(data.nextCursor);
+      if (!quiet || paginationInitializedRoomRef.current !== roomId) {
+        setNextCursor(data.nextCursor);
+        paginationInitializedRoomRef.current = roomId;
+      }
       if (before) {
         setMessages((current) => {
           const merged = new Map(current.map((message) => [message.id, message]));
@@ -407,6 +485,12 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           if (!data.messages.length) return [];
           const ids = new Set(data.messages.map((message) => message.id));
           const oldest = data.messages[0];
+          const currentById = new Map(current.map((message) => [message.id, message]));
+          const unchanged = data.messages.every((message) => {
+            const existing = currentById.get(message.id);
+            return existing ? sameMessage(existing, message) : false;
+          }) && current.every((message) => message.sequence < oldest.sequence || ids.has(message.id));
+          if (unchanged) return current;
           const retained = current.filter((message) => message.sequence < oldest.sequence || ids.has(message.id));
           const merged = new Map(retained.map((message) => [message.id, message]));
           for (const message of data.messages) merged.set(message.id, message);
@@ -764,6 +848,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
 
   useEffect(() => {
     if (phase !== 'landing' || (!guestModal && inviteStatus !== 'guest')) return;
+    if (window.matchMedia('(max-width: 720px)').matches) return;
     const frame = window.requestAnimationFrame(() => guestNameRef.current?.focus());
     return () => window.cancelAnimationFrame(frame);
   }, [guestModal, inviteStatus, phase]);
@@ -814,28 +899,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
         });
     }, 220);
     return () => window.clearTimeout(timeout);
-  }, [actor?.kind, api, contactQuery, conversationStartMode, createRoomOpen, t]);
-
-  useEffect(() => {
-    const generation = ++sidebarPeopleGeneration.current;
-    const query = roomQuery.trim();
-    if (actor?.kind !== 'user' || query.length < 2) {
-      return;
-    }
-    const timeout = window.setTimeout(() => {
-      void api<{ users: UserSummary[] }>(`/api/users?q=${encodeURIComponent(query)}`)
-        .then((data) => {
-          if (generation === sidebarPeopleGeneration.current) setSidebarPeople(data.users);
-        })
-        .catch(() => {
-          if (generation === sidebarPeopleGeneration.current) setSidebarPeople([]);
-        })
-        .finally(() => {
-          if (generation === sidebarPeopleGeneration.current) setSidebarPeopleLoading(false);
-        });
-    }, 220);
-    return () => window.clearTimeout(timeout);
-  }, [actor?.kind, api, roomQuery]);
+  }, [actor?.kind, api, contactQuery, createRoomOpen, t]);
 
   const startGuest = async (event: FormEvent) => {
     event.preventDefault();
@@ -862,6 +926,10 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       setGuestModal(false);
       await loadBootstrap(data.sessionId);
       consumeInvite();
+      if (pendingLandingSketch) {
+        setStudio({ sourceUrl: pendingLandingSketch, draftSource: true });
+        setPendingLandingSketch(null);
+      }
     } catch (startError) {
       setGuestFormError(startError instanceof Error ? startError.message : t('The guest session could not be started. Try again.'));
       setGuestErrorField('form');
@@ -875,6 +943,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     endingGuestRef.current = true;
     try {
       const result = await api<{ retained?: boolean }>('/api/guest', { method: 'DELETE' });
+      if (guestSession) await deleteStudioDraftsForPrefix(`guest:${guestSession}:`).catch(() => undefined);
       clearGuestSession('');
       setNotice(result.retained
         ? t('Your guest session ended. You no longer have access; content you sent remains in the room.')
@@ -893,7 +962,6 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const resetConversationStarter = () => {
     contactSearchGeneration.current += 1;
     setCreateRoomOpen(false);
-    setConversationStartMode('direct');
     setRoomName('');
     setContactQuery('');
     setContactResults([]);
@@ -903,47 +971,30 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     setAllowGuests(true);
   };
 
-  const openConversationStarter = (mode: ConversationStartMode = 'direct') => {
-    setConversationStartMode(mode);
+  const openConversationStarter = () => {
     setConversationStartError('');
     setCreateRoomOpen(true);
   };
 
-  const startDirectChat = async (contact: UserSummary) => {
-    if (busy) return;
-    setBusy(true); setConversationStartError('');
-    try {
-      const created = await api<{ id: string; reused?: boolean }>('/api/rooms', {
-        method: 'POST',
-        body: JSON.stringify({ allowGuests: false, memberIds: [contact.id] }),
-      });
-      await loadBootstrap();
-      selectRoom(created.id);
-      resetConversationStarter();
-      setRoomQuery('');
-      setNotice(created.reused ? t('Reopened your conversation with {name}.', { name: contact.displayName }) : t('Started a conversation with {name}.', { name: contact.displayName }));
-    } catch (createError) {
-      const message = createError instanceof Error ? createError.message : t('The conversation could not be started. Try again.');
-      if (createRoomOpen) setConversationStartError(message);
-      else setError(message);
-    }
-    setBusy(false);
-  };
-
-  const createRoom = async (event: FormEvent) => {
+  const createConversation = async (event: FormEvent) => {
     event.preventDefault();
-    if (selectedContacts.length < 2) {
-      setConversationStartError(t('Select at least 2 people to create a group. For 1 person, start a direct message.'));
+    if (!selectedContacts.length) {
+      setConversationStartError(t('Select at least one person.'));
       return;
     }
+    const group = selectedContacts.length > 1;
     setBusy(true); setConversationStartError('');
     try {
-      const created = await api<{ id: string }>('/api/rooms', { method: 'POST', body: JSON.stringify({ name: roomName, allowGuests, memberIds: selectedContacts.map((contact) => contact.id) }) });
+      const created = await api<{ id: string; reused?: boolean }>('/api/rooms', { method: 'POST', body: JSON.stringify({ name: group ? roomName : undefined, allowGuests: group ? allowGuests : false, memberIds: selectedContacts.map((contact) => contact.id) }) });
       await loadBootstrap();
       selectRoom(created.id);
       resetConversationStarter();
-      setNotice(t('Created a new group.'));
-    } catch (createError) { setConversationStartError(createError instanceof Error ? createError.message : t('The group could not be created. Try again.')); }
+      setNotice(group
+        ? t('Created a new group.')
+        : created.reused
+          ? t('Reopened your conversation with {name}.', { name: selectedContacts[0].displayName })
+          : t('Started a conversation with {name}.', { name: selectedContacts[0].displayName }));
+    } catch (createError) { setConversationStartError(createError instanceof Error ? createError.message : t('The conversation could not be started. Try again.')); }
     setBusy(false);
   };
 
@@ -1016,7 +1067,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     } catch (drawingError) { setError(drawingError instanceof Error ? drawingError.message : t('The drawing could not be sent. Try again.')); }
   };
 
-  const openStudio = (nextStudio: { sourceUrl?: string | null; parentId?: string | null; version?: number | null }) => {
+  const openStudio = (nextStudio: { sourceUrl?: string | null; parentId?: string | null; version?: number | null; draftSource?: boolean }) => {
     paletteAbortRef.current?.abort();
     const controller = new AbortController();
     const generation = ++paletteRequestGeneration.current;
@@ -1099,8 +1150,47 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
 
   const continueDrawing = async (message: MessageView) => {
     if (!message.assetKey) return;
+    const roomId = activeRoomRef.current;
+    if (!roomId || message.roomId !== roomId) return;
+    const generation = ++continuationGeneration.current;
     const freshUrl = await refreshAssetUrl(message.assetKey);
-    if (freshUrl) openStudio({ sourceUrl: freshUrl, parentId: message.id, version: message.canvasVersion });
+    if (freshUrl && generation === continuationGeneration.current && activeRoomRef.current === roomId) {
+      openStudio({ sourceUrl: freshUrl, parentId: message.id, version: message.canvasVersion });
+    }
+  };
+
+  const loadDrawingLineage = async (messageId: string) => {
+    if (!activeRoomId) return;
+    const roomId = activeRoomId;
+    const generation = ++lineageRequestGeneration.current;
+    setLineageViewer((current) => ({ messageId, lineage: current?.messageId === messageId ? current.lineage : [], loading: true, error: '', truncated: false }));
+    try {
+      const data = await api<{ lineage: CanvasLineageItem[]; truncated?: boolean }>(`/api/rooms/${roomId}/messages/${messageId}/lineage`);
+      if (generation !== lineageRequestGeneration.current || activeRoomRef.current !== roomId) return;
+      setLineageViewer({ messageId, lineage: data.lineage, loading: false, error: '', truncated: Boolean(data.truncated) });
+    } catch (lineageError) {
+      if (generation !== lineageRequestGeneration.current || activeRoomRef.current !== roomId) return;
+      setLineageViewer({
+        messageId,
+        lineage: [],
+        loading: false,
+        error: lineageError instanceof Error ? lineageError.message : t('Drawing history could not be loaded. Try again.'),
+        truncated: false,
+      });
+    }
+  };
+
+  const continueFromLineage = async (item: CanvasLineageItem) => {
+    if (!item.assetKey) return;
+    const roomId = activeRoomRef.current;
+    if (!roomId || item.roomId !== roomId) return;
+    const generation = ++continuationGeneration.current;
+    const freshUrl = await refreshAssetUrl(item.assetKey);
+    if (!freshUrl || generation !== continuationGeneration.current || activeRoomRef.current !== roomId) return;
+    lineageRequestGeneration.current += 1;
+    continuationGeneration.current += 1;
+    setLineageViewer(null);
+    openStudio({ sourceUrl: freshUrl, parentId: item.id, version: item.canvasVersion });
   };
 
   const savePaletteColor = async (input: { name: string; components: Array<{ color: string; weight: number }> }) => {
@@ -1167,9 +1257,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   };
 
   const filteredRooms = rooms.filter((room) => `${room.name} ${room.preview}`.toLocaleLowerCase(localeTag(locale)).includes(roomQuery.trim().toLocaleLowerCase(localeTag(locale))));
-  const availableContacts = conversationStartMode === 'group'
-    ? contactResults.filter((user) => !selectedContacts.some((selected) => selected.id === user.id))
-    : contactResults;
+  const selectedContactIds = new Set(selectedContacts.map((contact) => contact.id));
   const normalizedInviteCode = extractInviteCode(inviteCode);
   const inviteSignInPath = normalizedInviteCode
     ? `/auth/sign-in?returnTo=${encodeURIComponent(`/?room=${encodeURIComponent(normalizedInviteCode)}`)}`
@@ -1183,6 +1271,11 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     && (activeRoom?.messageCount ?? messages.length) <= 1
     && messages.every((message) => message.type === 'system');
   const inviteReady = inviteStatus === 'guest';
+  const showGuestConversion = actor?.kind === 'guest'
+    && messages.some((message) => message.type === 'canvas' && message.guestSessionId === actor.id);
+  const guestConversionPath = activeRoom
+    ? `/auth/sign-up?returnTo=${encodeURIComponent(`/?room=${encodeURIComponent(activeRoom.inviteCode)}`)}`
+    : signInPath;
 
   if (phase === 'loading') return <div className="boot-screen"><Logo /><span className="loading-line" /><p>{error || t('Opening your space…')}</p>{error && <button type="button" className="primary-button" onClick={() => { setError(''); setBootstrapRetry((current) => current + 1); }}>{t('Try Connecting Again')}</button>}</div>;
 
@@ -1196,7 +1289,8 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
             <h1>{inviteReady ? <><span>{t('Enter the room,')}</span>{' '}<em>{t('just choose a name.')}</em></> : inviteStatus === 'auth-only' ? <><span>{t('Sign in,')}</span>{' '}<em>{t('then join instantly.')}</em></> : inviteStatus === 'invalid' ? <><span>{t('This invite link')}</span>{' '}<em>{t('is no longer active.')}</em></> : inviteStatus === 'unavailable' ? <><span>{t('We cannot check')}</span>{' '}<em>{t('your invite yet.')}</em></> : <><span>{t('Some things are')}</span>{' '}<em>{t('easier to draw than say.')}</em></>}</h1>
             <p>{inviteReady ? t('No room search or code entry. Choose a display name, then start chatting and drawing together.') : inviteStatus === 'auth-only' ? t('This room does not accept guests. After you sign in, Nét will take you directly to the conversation.') : inviteStatus === 'invalid' ? t('The invite may have expired or the room may no longer exist. Ask the sender for a new link.') : inviteStatus === 'unavailable' ? t('Nét cannot verify this link while the connection is interrupted. Your invite stays intact so you can try again.') : t('Nét is a messenger for unfinished ideas—send text, images, or a canvas that someone else can continue as a new version.')}</p>
             {inviteReady ? <section className="invite-join-panel" aria-labelledby="invite-join-title">
-              <div className="invite-join-status"><span><UiIcon name="check" /></span><div><strong id="invite-join-title">{t('Room Ready')}</strong><small>{t('Your invite link has been verified.')}</small></div></div>
+              <InviteContext preview={invitePreview} />
+              <div className="invite-join-status"><span><UiIcon name="check" /></span><div><strong id="invite-join-title">{t('Join the creative thread')}</strong><small>{t('Your invite link has been verified.')}</small></div></div>
               <form className="invite-join-form" onSubmit={startGuest} noValidate>
                 <label>{t('Display Name')}<input ref={guestNameRef} name="guest-invite-name" autoComplete="nickname" value={guestName} onChange={(event) => { setGuestName(event.target.value); setGuestFormError(''); setGuestErrorField(null); }} placeholder={t('For example, Alex…')} maxLength={60} aria-invalid={guestErrorField === 'name'} aria-describedby={guestFormError ? 'guest-form-error' : undefined} /></label>
                 <button type="submit" className="hero-primary" disabled={busy}>{busy ? t('Joining…') : <>{t('Join Room')} <UiIcon name="arrow" size={18} /></>}</button>
@@ -1205,6 +1299,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
               <div className="invite-join-alternatives"><a href={inviteSignInPath}>{t('Sign In to Join')}</a><button type="button" onClick={() => { consumeInvite(); setGuestFormError(''); setGuestErrorField(null); }}>{t('Back Home')}</button></div>
               <small>{t('Guests lose access when their session ends. Messages and attached images remain in the room.')}</small>
             </section> : inviteStatus === 'auth-only' ? <section className="invite-join-panel invite-state-panel" aria-labelledby="invite-auth-title">
+              <InviteContext preview={invitePreview} />
               <div className="invite-join-status"><span><UiIcon name="user" /></span><div><strong id="invite-auth-title">{t('This Room Is for Signed-In Members')}</strong><small>{t('The invite is valid and ready.')}</small></div></div>
               <a className="hero-primary" href={inviteSignInPath}>{t('Sign In & Join')} <UiIcon name="arrow" size={18} /></a>
               <button type="button" onClick={consumeInvite}>{t('Back Home')}</button>
@@ -1216,25 +1311,25 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
               <button type="button" className="hero-primary" onClick={() => setBootstrapRetry((current) => current + 1)}>{t('Check Again')}</button>
               <button type="button" onClick={consumeInvite}>{t('Back Home')}</button>
             </section> : <>
-              <div className="hero-actions"><a className="hero-primary" href={signInPath}>{t('Sign In')} <UiIcon name="arrow" size={18} /></a><button type="button" onClick={() => { setError(''); setGuestFormError(''); setGuestErrorField(null); setGuestModal(true); }}>{t('Try as a Guest')}</button></div>
-              <small>{t('No account required · Guest access ends with the session')}</small>
+              <div className="hero-actions"><button type="button" className="hero-primary" onClick={() => document.getElementById('landing-doodle')?.focus()}>{t('Try Drawing')} <UiIcon name="draw" size={18} /></button><button type="button" onClick={() => { setError(''); setGuestFormError(''); setGuestErrorField(null); setGuestModal(true); }}>{t('Try as a Guest')}</button><a href={signInPath}>{t('Sign In')}</a></div>
+              <small>{t('Draw first · choose a name only when you are ready to send')}</small>
             </>}
           </div>
-          <div className="hero-demo" aria-label={t('Example conversation with messages and drawings')}>
+          {inviteStatus === 'none' ? <LandingDoodle onUse={(dataUrl) => { setPendingLandingSketch(dataUrl); setError(''); setGuestFormError(''); setGuestErrorField(null); setGuestModal(true); }} /> : <div className="hero-demo" aria-label={t('Example conversation with messages and drawings')}>
             <div className="demo-top"><span className="avatar" style={avatarStyle('minh')}>M</span><div><strong>Minh Anh</strong><small><i /> {t('drawing with you')}</small></div><b>•••</b></div>
             <div className="demo-canvas"><span className="demo-sun" /><span className="demo-line line-a" /><span className="demo-line line-b" /><strong>{t('Could we add')}<br />{t('a tree here?')}</strong><i>↙</i></div>
             <div className="demo-message">{t('I’ll continue this idea')} ✨</div>
             <div className="demo-version"><span>⌁</span><div><small>{t('Version {version}', { version: 2 })}</small><strong>{t('An idea continued')}</strong></div></div>
-          </div>
+          </div>}
         </section>
         <section className="feature-strip" id="how">
           <article><b>01</b><span>{t('Send It Like a Message')}</span><p>{t('Text, images, and canvases share one conversation timeline.')}</p></article>
           <article><b>02</b><span>{t('Continue, Never Overwrite')}</span><p>{t('Every edit creates a clearly tracked version.')}</p></article>
           <article><b>03</b><span>{t('Privacy That Fits')}</span><p>{t('Accounts keep content long term; guest access ends with the session.')}</p></article>
         </section>
-        <AppDialog open={guestModal} onClose={() => { setGuestModal(false); setGuestFormError(''); setGuestErrorField(null); }} labelledBy="guest-dialog-title" describedBy="guest-dialog-description">
+        <AppDialog open={guestModal} onClose={() => { setGuestModal(false); setPendingLandingSketch(null); setGuestFormError(''); setGuestErrorField(null); }} labelledBy="guest-dialog-title" describedBy="guest-dialog-description">
             <form className="dialog-card guest-dialog" onSubmit={startGuest} noValidate>
-              <button type="button" className="dialog-close" onClick={() => { setGuestModal(false); setGuestFormError(''); setGuestErrorField(null); }} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below">×</button>
+              <button type="button" className="dialog-close" onClick={() => { setGuestModal(false); setPendingLandingSketch(null); setGuestFormError(''); setGuestErrorField(null); }} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below">×</button>
               <span className="eyebrow">{t('Guest Session')}</span><h2 id="guest-dialog-title">{t('What Should We Call You?')}</h2>
               <p id="guest-dialog-description">{t('Choose a name so people can recognize you in the conversation.')}</p>
               <label>{t('Display Name')}<input ref={guestNameRef} name="guest-name" autoComplete="nickname" value={guestName} onChange={(event) => { setGuestName(event.target.value); setGuestFormError(''); setGuestErrorField(null); }} placeholder={t('For example, Alex…')} maxLength={60} aria-invalid={guestErrorField === 'name'} aria-describedby={guestErrorField === 'name' ? 'guest-form-error' : undefined} /></label>
@@ -1254,12 +1349,12 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       <aside className={sidebarOpen ? 'product-sidebar open' : 'product-sidebar'}>
         <div className="sidebar-head"><Logo compact /><LanguageSwitcher compact /><button type="button" className="mobile-close" onClick={() => setSidebarOpen(false)} aria-label={t('Close list')} data-tooltip={t('Close list')} data-tooltip-placement="below">×</button></div>
         {actor?.kind === 'user' && <button type="button" className="new-conversation-button" onClick={() => openConversationStarter()}><span><UiIcon name="message" /></span>{t('New Conversation')}<UiIcon name="plus" size={18} /></button>}
-        <label className="product-search"><UiIcon name="search" size={17} /><input name="room-search" type="search" autoComplete="off" value={roomQuery} onChange={(event) => { const value = event.target.value; setRoomQuery(value); setSidebarPeople([]); setSidebarPeopleLoading(actor?.kind === 'user' && value.trim().length >= 2); }} placeholder={actor?.kind === 'user' ? t('Search chats or people…') : t('Search conversations…')} aria-label={actor?.kind === 'user' ? t('Search conversations or people') : t('Search conversations')} /></label>
+        <label className="product-search"><UiIcon name="search" size={17} /><input name="room-search" type="search" autoComplete="off" value={roomQuery} onChange={(event) => setRoomQuery(event.target.value)} placeholder={t('Search conversations…')} aria-label={t('Search conversations')} /></label>
         <div className="sidebar-label"><span>{t('Recent')}</span><small>{t('{count} conversations', { count: rooms.length })}</small></div>
         <div className="room-list">
           {filteredRooms.map((room) => <button type="button" key={room.id} className={room.id === activeRoomId ? 'room-item active' : 'room-item'} onClick={() => selectRoom(room.id)}><span className="avatar" style={avatarStyle(room.name)}>{room.name.slice(0, 1)}</span><span><strong>{room.name}</strong><small>{room.preview}</small></span><span className="room-meta"><time>{timeLabel(room.lastActivity, locale)}</time>{room.unreadCount > 0 && <b aria-label={t('{count} unread messages', { count: room.unreadCount })}>{Math.min(room.unreadCount, 99)}</b>}</span></button>)}
           {!filteredRooms.length && !roomQuery.trim() && <p className="empty-copy">{t('No conversations yet.')}</p>}
-          {actor?.kind === 'user' && roomQuery.trim().length >= 2 && <section className="sidebar-people" aria-label={t('People')}><div className="sidebar-label"><span>{t('People')}</span><small>{sidebarPeopleLoading ? t('Searching…') : t('{count} results', { count: sidebarPeople.length })}</small></div>{sidebarPeople.map((person) => <button type="button" key={person.id} onClick={() => void startDirectChat(person)} disabled={busy}><span className="avatar" style={{ '--avatar': person.avatarColor } as CSSProperties}>{person.displayName.slice(0, 1)}</span><span><strong>{person.displayName}</strong><small>{person.email}</small></span><UiIcon name="message" size={18} /></button>)}{!sidebarPeopleLoading && !filteredRooms.length && !sidebarPeople.length && <p className="empty-copy">{t('No results. Try another name or email.')}</p>}</section>}
+          {!filteredRooms.length && roomQuery.trim() && <p className="empty-copy">{t('No conversations found. Start a new conversation to find people.')}</p>}
         </div>
         {actor?.kind === 'guest' && <div className="guest-retention"><span>{t('Temporary Session')}</span><p>{t('You lose access when it ends. Messages and attached images remain in the room.')}</p></div>}
         <div className="account-card"><span className="avatar" style={avatarStyle(actor?.id ?? 'guest')}>{actor?.displayName.slice(0, 1)}</span><span><strong>{actor?.displayName}</strong><small>{actor?.kind === 'user' ? actor.email : t('Guest · up to 2 hours')}</small></span>{actor?.kind === 'user' ? <a href={signOutPath} aria-label={t('Sign Out')} data-tooltip={t('Sign Out')} data-tooltip-placement="above"><UiIcon name="external" size={18} /></a> : <button type="button" className="end-session-button" data-end-guest="true" onClick={() => setGuestEndConfirmOpen(true)} aria-label={t('End guest session')}>{t('End Session')}</button>}</div>
@@ -1273,7 +1368,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
             <section ref={messageScrollRef} className="message-scroll" aria-live="polite" aria-label={t('Message history')}>
               <div className="message-lane"><div className="day-pill">{t('Today')}</div>
                 {nextCursor && !normalizedMessageQuery && <button type="button" className="load-older" onClick={() => void loadOlder()} disabled={loadingOlder}>{loadingOlder ? t('Loading…') : t('Load Older Messages')}</button>}
-                {showInviteOnboarding && <section className="invite-onboarding" aria-labelledby="invite-onboarding-title"><span className="invite-onboarding-icon" aria-hidden="true"><UiIcon name="draw" size={22} /></span><div><h2 id="invite-onboarding-title">{t('Start Your Way')}</h2><p>{t('Invite someone to draw with you, or make the first mark and share it later.')}</p></div><div className="invite-onboarding-actions"><button type="button" className="primary-button" onClick={() => void copyInvite()}><UiIcon name="link" size={17} /> {t('Invite Someone')}</button><button type="button" className="secondary-button" onClick={() => openStudio({})}><UiIcon name="draw" size={17} /> {t('Draw Now')}</button></div></section>}
+                {showInviteOnboarding && <section className="invite-onboarding" aria-labelledby="invite-onboarding-title"><span className="invite-onboarding-icon" aria-hidden="true"><UiIcon name="draw" size={22} /></span><div><h2 id="invite-onboarding-title">{t('Start Your Way')}</h2><p>{t('Invite someone to draw with you, or make the first mark and share it later.')}</p></div><div className="invite-onboarding-actions"><button type="button" className="primary-button" onClick={() => openStudio({})}><UiIcon name="draw" size={17} /> {t('Draw Now')}</button><button type="button" className="secondary-button" onClick={() => void copyInvite()}><UiIcon name="link" size={17} /> {t('Invite Someone')}</button></div></section>}
                 {!visibleMessages.length && <div className="conversation-empty"><span aria-hidden="true"><UiIcon name="draw" size={28} /></span><h2>{normalizedMessageQuery ? t('No Messages Found') : t('Start with a Word or a Line')}</h2><p>{normalizedMessageQuery.length === 1 ? t('Enter at least 2 characters to search the full history.') : normalizedMessageQuery ? t('Try another keyword.') : t('Send a message, share an image, or open the canvas.')}</p></div>}
                 {visibleMessages.map((message) => {
                   const own = actor?.kind === 'user' ? message.senderId === actor.id : message.guestSessionId === actor?.id;
@@ -1295,9 +1390,11 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
                           {message.type === 'canvas' && <span className="version-badge">{t('Version {version}', { version: message.canvasVersion ?? 1 })}</span>}
                           {message.body && <div className="message-bubble">{message.body}</div>}
                         </div>
+                        {message.type === 'canvas' && <div className="canvas-loop-actions"><button type="button" className="continue-drawing-cta" onClick={() => void continueDrawing(message)}><UiIcon name="draw" size={17} /><span><strong>{t('Continue This Drawing')}</strong><small>{t('Create version {version} without changing the original', { version: (message.canvasVersion ?? 1) + 1 })}</small></span><UiIcon name="arrow" size={16} /></button><button type="button" className="drawing-history-cta" onClick={() => void loadDrawingLineage(message.id)}><UiIcon name="history" size={17} /><span>{t('View Version History')}</span></button></div>}
                         <div className="message-meta"><time>{timeLabel(message.createdAt, locale)}</time>{own && <span>{message.readCount > 0 ? t('Read') : t('Sent')}</span>}</div>
                         <div className="reaction-list">{message.reactions.map((reaction) => <button type="button" key={reaction.emoji} className={reaction.reacted ? 'reacted' : ''} onClick={() => void react(message.id, reaction.emoji)} aria-label={reaction.reacted ? t('Remove {emoji} reaction, {count} total', { emoji: reaction.emoji, count: reaction.count }) : t('Add {emoji} reaction, {count} total', { emoji: reaction.emoji, count: reaction.count })}>{reaction.emoji} <span>{reaction.count}</span></button>)}</div>
-                        <div className="message-tools"><button type="button" onClick={() => setReplyTo(message)}><UiIcon name="reply" size={16} /> <span>{t('Reply')}</span></button>{message.assetUrl && <button type="button" onClick={() => void downloadMedia(message)} disabled={downloadingAssetKey === (message.assetKey ?? message.id)} aria-label={downloadingAssetKey === (message.assetKey ?? message.id) ? t('Downloading image') : t('Download image')} data-tooltip={downloadingAssetKey === (message.assetKey ?? message.id) ? t('Downloading…') : t('Download Image')} data-tooltip-placement="above"><UiIcon name="download" size={16} /> <span>{downloadingAssetKey === (message.assetKey ?? message.id) ? t('Downloading…') : t('Download')}</span></button>}{message.type === 'canvas' && <button type="button" onClick={() => void continueDrawing(message)}><UiIcon name="draw" size={16} /> <span>{t('Continue Drawing')}</span></button>}<div>{EMOJIS.map((emoji) => <button type="button" key={emoji} onClick={() => void react(message.id, emoji)} aria-label={t('Add {emoji} reaction', { emoji })} data-tooltip={t('Add {emoji}', { emoji })}>{emoji}</button>)}</div></div>
+                        <div className="message-tools"><button type="button" onClick={() => setReplyTo(message)}><UiIcon name="reply" size={16} /> <span>{t('Reply')}</span></button>{message.assetUrl && <button type="button" onClick={() => void downloadMedia(message)} disabled={downloadingAssetKey === (message.assetKey ?? message.id)} aria-label={downloadingAssetKey === (message.assetKey ?? message.id) ? t('Downloading image') : t('Download image')} data-tooltip={downloadingAssetKey === (message.assetKey ?? message.id) ? t('Downloading…') : t('Download Image')} data-tooltip-placement="above"><UiIcon name="download" size={16} /> <span>{downloadingAssetKey === (message.assetKey ?? message.id) ? t('Downloading…') : t('Download')}</span></button>}<div>{EMOJIS.map((emoji) => <button type="button" key={emoji} onClick={() => void react(message.id, emoji)} aria-label={t('Add {emoji} reaction', { emoji })} data-tooltip={t('Add {emoji}', { emoji })}>{emoji}</button>)}</div></div>
+                        <details className="message-overflow"><summary aria-label={t('More actions for this message')}>•••</summary><div><button type="button" onClick={() => setReplyTo(message)}><UiIcon name="reply" size={16} /> {t('Reply')}</button>{message.assetUrl && <button type="button" onClick={() => void downloadMedia(message)} disabled={downloadingAssetKey === (message.assetKey ?? message.id)}><UiIcon name="download" size={16} /> {t('Download')}</button>}<span>{EMOJIS.map((emoji) => <button type="button" key={emoji} onClick={() => void react(message.id, emoji)} aria-label={t('Add {emoji} reaction', { emoji })}>{emoji}</button>)}</span></div></details>
                       </div>
                     </article>
                   );
@@ -1306,8 +1403,10 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
               </div>
             </section>
             <footer className="composer-zone">
+              {showGuestConversion && <div className="guest-conversion"><span><UiIcon name="lock" size={17} /><span><strong>{t('Keep this room and your drawing history')}</strong><small>{t('Create an account after contributing so you can return anytime.')}</small></span></span><a href={guestConversionPath}>{t('Keep My Work')} <UiIcon name="arrow" size={15} /></a></div>}
               {replyTo && <div className="reply-draft"><span>{t('Replying to')} <strong>{replyTo.senderName}</strong><small>{replyTo.body || (replyTo.type === 'canvas' ? t('Drawing') : t('Image'))}</small></span><button type="button" onClick={() => setReplyTo(null)} aria-label={t('Cancel reply')} data-tooltip={t('Cancel Reply')} data-tooltip-placement="above">×</button></div>}
-              <div className="composer"><button type="button" onClick={() => fileRef.current?.click()} disabled={busy} aria-label={t('Choose image')} data-tooltip={t('Send Image')} data-tooltip-placement="above"><UiIcon name="plus" size={20} /></button><textarea name="message" autoComplete="off" value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitText(); } }} placeholder={t('Write a message…')} maxLength={2000} aria-label={t('Message content')} /><button type="button" className="draw-button" onClick={() => openStudio({})} disabled={busy} aria-label={t('Open canvas')} data-tooltip={t('Open Nét Studio')} data-tooltip-placement="above"><UiIcon name="draw" size={19} /></button><button type="button" className="send-button" onClick={() => void submitText()} disabled={busy || !draft.trim()} aria-label={t('Send message')} data-tooltip={t('Send Message')} data-tooltip-placement="above"><UiIcon name="send" size={18} /></button></div>
+              <div className="composer-modes" role="toolbar" aria-label={t('Reply with text, drawing, or photo')}><button type="button" onClick={() => messageInputRef.current?.focus()}><UiIcon name="message" size={17} /> {t('Text')}</button><button type="button" className="draw-mode" onClick={() => openStudio({})} disabled={busy}><UiIcon name="draw" size={17} /> {t('Draw')}</button><button type="button" onClick={() => fileRef.current?.click()} disabled={busy}><UiIcon name="plus" size={17} /> {t('Photo')}</button></div>
+              <div className="composer"><textarea ref={messageInputRef} name="message" autoComplete="off" value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitText(); } }} placeholder={t('Write a message…')} maxLength={2000} aria-label={t('Message content')} /><button type="button" className="send-button" onClick={() => void submitText()} disabled={busy || !draft.trim()} aria-label={t('Send message')} data-tooltip={t('Send Message')} data-tooltip-placement="above"><UiIcon name="send" size={18} /></button></div>
               <input ref={fileRef} hidden name="message-image" aria-label={t('Image file')} type="file" accept="image/png,image/jpeg,image/gif,image/webp" onChange={(event) => void attachImage(event)} />
               <p><kbd>Enter</kbd> {t('send')} · <kbd>Shift</kbd> + <kbd>Enter</kbd> {t('new line')} · {t('images up to 8 MB')}</p>
             </footer>
@@ -1321,19 +1420,16 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           <button type="button" className="dialog-close" onClick={resetConversationStarter} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below">×</button>
           <span className="eyebrow">{t('Quick Connect')}</span>
           <h2 id="create-room-title">{t('Start a Conversation')}</h2>
-          <p id="create-room-description">{t('Find one person to message now, or select several people to create a group.')}</p>
-          <div className="starter-modes" aria-label={t('Choose how to start')}>
-            <button type="button" aria-pressed={conversationStartMode === 'direct'} className={conversationStartMode === 'direct' ? 'active' : ''} onClick={() => { setConversationStartMode('direct'); setConversationStartError(''); }}><UiIcon name="user" /><span><strong>{t('Direct Message')}</strong><small>{t('Select to open chat')}</small></span></button>
-            <button type="button" aria-pressed={conversationStartMode === 'group'} className={conversationStartMode === 'group' ? 'active' : ''} onClick={() => { setConversationStartMode('group'); setConversationStartError(''); }}><UiIcon name="group" /><span><strong>{t('Create Group')}</strong><small>{t('At least 2 people')}</small></span></button>
-          </div>
+          <p id="create-room-description">{t('Choose people first. One person starts a direct chat; two or more creates a group.')}</p>
 
-          <form className="people-picker" onSubmit={conversationStartMode === 'group' ? createRoom : (event) => event.preventDefault()}>
-            <label>{conversationStartMode === 'direct' ? t('Who would you like to message?') : t('Add Members')}<div className="starter-search"><UiIcon name="search" /><input name="contact-search" type="search" autoComplete="off" value={contactQuery} onChange={(event) => { const value = event.target.value; setContactQuery(value); setContactResults([]); setContactSearching(value.trim().length >= 2); setConversationStartError(''); }} placeholder={t('Enter a name or email…')} aria-describedby="people-search-status" /></div></label>
-            <div id="people-search-status" className="search-status" role="status" aria-live="polite">{contactSearching ? t('Searching…') : contactQuery.trim().length === 1 ? t('Enter 1 more character') : contactQuery.trim().length >= 2 ? t('{count} matching people', { count: availableContacts.length }) : conversationStartMode === 'direct' ? t('Choose someone to open a conversation immediately.') : t('Choose at least 2 people.')}</div>
-            {selectedContacts.length > 0 && conversationStartMode === 'group' && <div className="selected-contacts" aria-label={t('Selected members')}>{selectedContacts.map((contact) => <button type="button" key={contact.id} aria-label={t('Remove {name} from group', { name: contact.displayName })} onClick={() => setSelectedContacts((current) => current.filter((item) => item.id !== contact.id))}>{contact.displayName}<span aria-hidden="true">×</span></button>)}</div>}
-            {contactQuery.trim().length >= 2 && <div className="contact-results">{availableContacts.map((contact) => <button type="button" key={contact.id} disabled={busy} onClick={() => conversationStartMode === 'direct' ? void startDirectChat(contact) : setSelectedContacts((current) => [...current, contact])}><span className="avatar" style={{ '--avatar': contact.avatarColor } as CSSProperties}>{contact.displayName.slice(0, 1)}</span><span><strong>{contact.displayName}</strong><small>{contact.email}</small></span>{conversationStartMode === 'direct' ? <span className="result-action">{t('Message')} <UiIcon name="arrow" size={16} /></span> : <span className="result-action">{t('Add')} <UiIcon name="plus" size={16} /></span>}</button>)}{!contactSearching && availableContacts.length === 0 && <div className="contact-empty"><UiIcon name="search" /><strong>{t('No Person Found')}</strong><small>{t('Try another name or email.')}</small></div>}</div>}
+          <form className="people-picker" onSubmit={createConversation}>
+            <label>{t('Who do you want to create with?')}<div className="starter-search"><UiIcon name="search" /><input name="contact-search" type="search" autoComplete="off" value={contactQuery} onChange={(event) => { const value = event.target.value; setContactQuery(value); setContactResults([]); setContactSearching(value.trim().length >= 2); setConversationStartError(''); }} placeholder={t('Enter a name or email…')} aria-describedby="people-search-status" /></div></label>
+            <div id="people-search-status" className="search-status" role="status" aria-live="polite">{contactSearching ? t('Searching…') : contactQuery.trim().length === 1 ? t('Enter 1 more character') : contactQuery.trim().length >= 2 ? t('{count} matching people', { count: contactResults.length }) : t('Select one or more people. Nét chooses the conversation type for you.')}</div>
+            {selectedContacts.length > 0 && <div className="selected-contacts" aria-label={t('Selected members')}>{selectedContacts.map((contact) => <button type="button" key={contact.id} aria-label={t('Remove {name}', { name: contact.displayName })} onClick={() => setSelectedContacts((current) => current.filter((item) => item.id !== contact.id))}>{contact.displayName}<span aria-hidden="true">×</span></button>)}</div>}
+            {contactQuery.trim().length >= 2 && <div className="contact-results">{contactResults.map((contact) => { const selected = selectedContactIds.has(contact.id); return <button type="button" key={contact.id} className={selected ? 'selected' : ''} disabled={busy} aria-pressed={selected} onClick={() => setSelectedContacts((current) => selected ? current.filter((item) => item.id !== contact.id) : [...current, contact])}><span className="avatar" style={{ '--avatar': contact.avatarColor } as CSSProperties}>{contact.displayName.slice(0, 1)}</span><span><strong>{contact.displayName}</strong><small>{contact.email}</small></span><span className="result-action">{selected ? t('Selected') : t('Select')} <UiIcon name={selected ? 'check' : 'plus'} size={16} /></span></button>; })}{!contactSearching && contactResults.length === 0 && <div className="contact-empty"><UiIcon name="search" /><strong>{t('No Person Found')}</strong><small>{t('Try another name or email.')}</small></div>}</div>}
             {conversationStartError && <p className="form-error" role="alert">{conversationStartError}</p>}
-            {conversationStartMode === 'group' && <div className="group-options"><label>{t('Group Name')} <small>{t('(optional)')}</small><input name="room-name" autoComplete="off" value={roomName} onChange={(event) => setRoomName(event.target.value)} placeholder={t('Nét will suggest one from the members')} maxLength={60} /></label><label className="checkbox-row"><input type="checkbox" name="allow-guests" checked={allowGuests} onChange={(event) => setAllowGuests(event.target.checked)} /><span><strong>{t('Allow guests to join by link')}</strong><small>{t('Content sent by guests remains after they leave the session.')}</small></span></label><button type="submit" className="primary-button wide" disabled={busy || selectedContacts.length < 2}>{busy ? t('Creating group…') : t('Create Group{members}', { members: selectedContacts.length ? ` · ${selectedContacts.length + 1} ${t('people')}` : '' })}</button></div>}
+            {selectedContacts.length === 1 && <button type="submit" className="primary-button wide conversation-create-action" disabled={busy}>{busy ? t('Opening conversation…') : t('Message {name}', { name: selectedContacts[0].displayName })}</button>}
+            {selectedContacts.length > 1 && <div className="group-options"><label>{t('Group Name')} <small>{t('(optional)')}</small><input name="room-name" autoComplete="off" value={roomName} onChange={(event) => setRoomName(event.target.value)} placeholder={t('Nét will suggest one from the members')} maxLength={60} /></label><label className="checkbox-row"><input type="checkbox" name="allow-guests" checked={allowGuests} onChange={(event) => setAllowGuests(event.target.checked)} /><span><strong>{t('Allow guests to join by link')}</strong><small>{t('Content sent by guests remains after they leave the session.')}</small></span></label><button type="submit" className="primary-button wide" disabled={busy}>{busy ? t('Creating group…') : t('Create Group{members}', { members: ` · ${selectedContacts.length + 1} ${t('people')}` })}</button></div>}
           </form>
         </section>
       </AppDialog>
@@ -1345,9 +1441,10 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           <div className="confirmation-actions"><button type="button" onClick={() => setGuestEndConfirmOpen(false)}>{t('Keep Session')}</button><button type="button" className="danger-button" onClick={() => void endGuest()}>{t('End Session')}</button></div>
         </section>
       </AppDialog>
-      {studio && <Suspense fallback={<div className="studio-loading" role="status">{t('Opening Nét Studio…')}</div>}><DrawingStudio sourceUrl={studio.sourceUrl} version={studio.version} paletteColors={paletteColors} paletteLoading={paletteLoading} paletteMutating={paletteMutating} palettePersistence={actor?.kind === 'user' ? 'account' : 'session'} onClose={closeStudio} onSend={sendDrawing} onSavePalette={savePaletteColor} onDeletePalette={deletePaletteColor} /></Suspense>}
+      {studio && actor && activeRoomId && <Suspense fallback={<div className="studio-loading" role="status">{t('Opening Nét Studio…')}</div>}><DrawingStudio sourceUrl={studio.sourceUrl} sourceIsDraft={studio.draftSource} version={studio.version} draftKey={`${actor.kind}:${actor.id}:${activeRoomId}:${studio.parentId ?? 'new'}`} paletteColors={paletteColors} paletteLoading={paletteLoading} paletteMutating={paletteMutating} palettePersistence={actor?.kind === 'user' ? 'account' : 'session'} onClose={closeStudio} onSend={sendDrawing} onSavePalette={savePaletteColor} onDeletePalette={deletePaletteColor} /></Suspense>}
+      {lineageViewer && <Suspense fallback={<div className="studio-loading" role="status">{t('Loading drawing history…')}</div>}><DrawingLineage key={`${lineageViewer.messageId}:${lineageViewer.loading ? 'loading' : 'ready'}:${lineageViewer.error ? 'error' : 'ok'}`} lineage={lineageViewer.lineage} initialId={lineageViewer.messageId} loading={lineageViewer.loading} error={lineageViewer.error} truncated={lineageViewer.truncated} onClose={() => { lineageRequestGeneration.current += 1; continuationGeneration.current += 1; setLineageViewer(null); }} onRetry={() => void loadDrawingLineage(lineageViewer.messageId)} onContinue={(item) => void continueFromLineage(item)} /></Suspense>}
       {viewingMedia && <MediaViewer key={viewingMedia.id} message={viewingMedia} downloading={downloadingAssetKey === (viewingMedia.assetKey ?? viewingMedia.id)} onClose={() => setViewingMedia(null)} onDownload={downloadMedia} onRefresh={(assetKey) => { void refreshAssetUrl(assetKey, true); }} />}
-      {(error || notice) && <div className={error ? 'toast error' : 'toast'} role="status" aria-live="polite"><span>{error || notice}</span>{error && <button type="button" onClick={() => setError('')} aria-label={t('Dismiss notification')} data-tooltip={t('Dismiss notification')} data-tooltip-placement="above">×</button>}</div>}
+      {(error || notice) && <div className={`${error ? 'toast error' : 'toast'}${studio ? ' studio-toast' : ''}`} role="status" aria-live="polite"><span>{error || notice}</span>{error && <button type="button" onClick={() => setError('')} aria-label={t('Dismiss notification')} data-tooltip={t('Dismiss notification')} data-tooltip-placement="above">×</button>}</div>}
     </div></>
   );
 }

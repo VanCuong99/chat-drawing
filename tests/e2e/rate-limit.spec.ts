@@ -1,7 +1,8 @@
 import { expect, test } from '@playwright/test';
 import { createDatabase, eq, rooms } from '@net/database';
+import { e2eApiUrl } from './e2e-environment';
 
-const API_URL = 'http://localhost:3001/api';
+const API_URL = e2eApiUrl;
 
 test('rate limit message dùng counter Postgres nguyên tử khi request đồng thời @critical', async ({ request }) => {
   test.setTimeout(60_000);

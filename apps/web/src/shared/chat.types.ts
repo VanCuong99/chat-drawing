@@ -53,3 +53,7 @@ export type MessageView = {
   readCount: number;
   reactions: ReactionView[];
 };
+
+export type CanvasLineageItem = Pick<MessageView,
+  'id' | 'sequence' | 'roomId' | 'senderName' | 'body' | 'assetKey' | 'assetUrl' | 'canvasParentId' | 'canvasVersion' | 'createdAt'
+>;

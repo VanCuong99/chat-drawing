@@ -72,6 +72,15 @@ export class ChatController {
     return this.chat.listMessages(roomId, await this.actors.require(request), limit, before, query);
   }
 
+  @Get('rooms/:id/messages/:messageId/lineage')
+  async canvasLineage(
+    @Req() request: Request,
+    @Param('id') roomId: string,
+    @Param('messageId') messageId: string,
+  ) {
+    return this.chat.listCanvasLineage(roomId, messageId, await this.actors.require(request));
+  }
+
   @Post('rooms/:id/messages')
   @HttpCode(200)
   async sendMessage(

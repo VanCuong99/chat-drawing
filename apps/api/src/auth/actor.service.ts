@@ -31,7 +31,7 @@ export class ActorService {
     return actor;
   }
 
-  async resolveClaims(claims: RealtimeClaims): Promise<Actor | null> {
+  async resolveClaims(claims: Pick<RealtimeClaims, 'sub' | 'kind'>): Promise<Actor | null> {
     if (claims.kind === 'guest') return this.resolveGuest(claims.sub, false);
     const [user] = await this.db.select().from(users).where(eq(users.id, claims.sub)).limit(1);
     if (!user) return null;

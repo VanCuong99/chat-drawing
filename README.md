@@ -68,6 +68,14 @@ pnpm db:migrate
 pnpm db:studio
 ```
 
+Run the complete browser suite with:
+
+```bash
+pnpm test:e2e
+```
+
+The E2E runner never loads developer environment files. It creates a PostgreSQL cluster, database, upload directory, and API/web ports that exist only for that test run, applies Drizzle migrations, and removes the temporary resources afterward. The Playwright configuration rejects remote, shared, or manually supplied database targets. The runner requires local PostgreSQL command-line tools (`initdb`, `pg_ctl`, and `createdb`).
+
 ## Realtime room isolation
 
 1. HTTP issues a short-lived Socket.IO token for the verified actor.

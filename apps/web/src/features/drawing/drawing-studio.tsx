@@ -14,10 +14,17 @@ import { MAX_PIGMENT_COMPONENTS, mixPigmentHex, pigmentPercentages, type Pigment
 import type { PaletteColorView } from '@/src/shared/chat.types';
 import AppDialog from '@/src/shared/app-dialog';
 import { useLanguage } from '@/src/i18n/language-provider';
+import { deleteStudioDraft, readStudioDraft, saveStudioDraft } from './studio-drafts';
 
 const CANVAS_WIDTH = 1200;
 const CANVAS_HEIGHT = 720;
+const MIN_ZOOM = 50;
+const MAX_ZOOM = 180;
 const COLORS = ['#27242e', '#6f4ee8', '#ef7668', '#e19a3f', '#3aa694', '#3085c7', '#d34d8b', '#ffffff'];
+
+const clampZoom = (value: number) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value));
+const contactDistance = (first: TouchContact, second: TouchContact) => Math.hypot(second.x - first.x, second.y - first.y);
+const contactMidpoint = (first: TouchContact, second: TouchContact): TouchContact => ({ x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 });
 
 type Point = { x: number; y: number; pressure: number };
 type StrokeTool = 'pen' | 'marker' | 'eraser';
@@ -36,6 +43,14 @@ type DrawAction = StrokeAction | ShapeAction | FillAction | TextAction;
 type Scene = { actions: DrawAction[]; paper: Paper };
 type History = { past: Scene[]; present: Scene; future: Scene[] };
 type MixerPigment = PigmentComponent & { id: string };
+type StoredDraft = { scene: Scene; caption: string; savedAt: number };
+type TouchContact = { x: number; y: number };
+type CanvasGesture = {
+  pointerIds: [number, number];
+  startDistance: number;
+  startZoom: number;
+  anchor: { x: number; y: number };
+};
 
 const INITIAL_SCENE: Scene = { actions: [], paper: 'white' };
 const INITIAL_MIXER_COMPONENTS: MixerPigment[] = [
@@ -89,6 +104,7 @@ const TOOLS: Array<{ id: Tool; label: string; key: string }> = [
 
 const RAIL_TOOLS = TOOLS.filter((tool) => ['hand', 'pen', 'marker', 'eraser', 'fill', 'line', 'arrow'].includes(tool.id));
 const MORE_TOOLS = RAIL_TOOLS.filter((tool) => ['marker', 'fill', 'line', 'arrow'].includes(tool.id));
+const MOBILE_MORE_TOOLS = RAIL_TOOLS.filter((tool) => ['hand', 'marker', 'fill', 'line', 'arrow'].includes(tool.id));
 const SHAPE_TOOLS = TOOLS.filter((tool): tool is { id: ClosedShapeTool; label: string; key: string } => ['rectangle', 'roundedRectangle', 'ellipse', 'triangle', 'trapezoid', 'diamond', 'star', 'bubble'].includes(tool.id));
 const TEXT_TOOL = TOOLS.find((tool) => tool.id === 'text')!;
 
@@ -747,9 +763,11 @@ function makeLayer() {
   return layer;
 }
 
-export default function DrawingStudio({ sourceUrl, version, paletteColors, paletteLoading = false, paletteMutating = false, palettePersistence = 'session', onClose, onSend, onSavePalette, onDeletePalette }: {
+export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, version, draftKey, paletteColors, paletteLoading = false, paletteMutating = false, palettePersistence = 'session', onClose, onSend, onSavePalette, onDeletePalette }: {
   sourceUrl?: string | null;
+  sourceIsDraft?: boolean;
   version?: number | null;
+  draftKey: string;
   paletteColors: PaletteColorView[];
   paletteLoading?: boolean;
   paletteMutating?: boolean;
@@ -767,6 +785,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const shapeButtonRef = useRef<HTMLButtonElement>(null);
   const moreToolsButtonRef = useRef<HTMLButtonElement>(null);
   const moreToolsSheetRef = useRef<HTMLElement>(null);
+  const mobileInspectorTriggerRef = useRef<HTMLButtonElement | null>(null);
   const mixerToggleRef = useRef<HTMLButtonElement>(null);
   const mixerIdRef = useRef(4);
   const fillSeedRef = useRef(1);
@@ -780,6 +799,13 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const textDragRef = useRef<{ id: string; start: Point; origin: Point; current: TextAction; isNew: boolean; moved: boolean } | null>(null);
   const activePointerRef = useRef<number | null>(null);
   const panRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
+  const touchContactsRef = useRef(new Map<number, TouchContact>());
+  const gestureRef = useRef<CanvasGesture | null>(null);
+  const gestureFrameRef = useRef<number | null>(null);
+  const pendingGestureRef = useRef<{ zoom: number; midpoint: TouchContact } | null>(null);
+  const pendingTouchFillRef = useRef<{ pointerId: number; point: Point } | null>(null);
+  const zoomRef = useRef(100);
+  const zoomOutputRef = useRef<HTMLOutputElement>(null);
   const sendingRef = useRef(false);
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const [history, setHistory] = useState<History>({ past: [], present: INITIAL_SCENE, future: [] });
@@ -787,6 +813,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const [selectedShape, setSelectedShape] = useState<ClosedShapeTool>('rectangle');
   const [shapeMenuOpen, setShapeMenuOpen] = useState(false);
   const [moreToolsOpen, setMoreToolsOpen] = useState(false);
+  const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   const [shapeMenuPosition, setShapeMenuPosition] = useState({ left: 0, top: 0 });
   const [color, setColor] = useState('#6f4ee8');
   const [toolSizes, setToolSizes] = useState<Record<SizedTool, number>>(INITIAL_TOOL_SIZES);
@@ -807,6 +834,8 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const [fillWater, setFillWater] = useState(45);
   const [zoom, setZoom] = useState(100);
   const [caption, setCaption] = useState('');
+  const [draftReady, setDraftReady] = useState(false);
+  const [draftStatus, setDraftStatus] = useState<'idle' | 'saving' | 'saved' | 'restored'>('idle');
   const [sending, setSending] = useState(false);
   const [sourceLoading, setSourceLoading] = useState(Boolean(sourceUrl));
   const [sourceError, setSourceError] = useState(false);
@@ -824,6 +853,44 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   const activeFillMaterial = FILL_MATERIALS.find((item) => item.id === fillMaterial) ?? FILL_MATERIALS[0];
 
   useEffect(() => { actionsRef.current = actions; }, [actions]);
+
+  useEffect(() => { zoomRef.current = zoom; }, [zoom]);
+
+  useEffect(() => () => {
+    if (gestureFrameRef.current !== null) window.cancelAnimationFrame(gestureFrameRef.current);
+    touchContactsRef.current.clear();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void readStudioDraft<StoredDraft>(draftKey)
+      .then((draft) => {
+        if (cancelled || !draft || !Array.isArray(draft.scene?.actions)) return;
+        setHistory({ past: [], present: draft.scene, future: [] });
+        setCaption(draft.caption);
+        setDraftStatus('restored');
+        setHint(t('Draft restored'));
+      })
+      .catch(() => undefined)
+      .finally(() => { if (!cancelled) setDraftReady(true); });
+    return () => { cancelled = true; };
+  }, [draftKey, t]);
+
+  useEffect(() => {
+    if (!draftReady) return;
+    const timeout = window.setTimeout(() => {
+      if (!isDirty) {
+        void deleteStudioDraft(draftKey).catch(() => undefined);
+        setDraftStatus('idle');
+        return;
+      }
+      setDraftStatus('saving');
+      void saveStudioDraft<StoredDraft>(draftKey, { scene: history.present, caption, savedAt: Date.now() })
+        .then(() => setDraftStatus('saved'))
+        .catch(() => setDraftStatus('idle'));
+    }, 700);
+    return () => window.clearTimeout(timeout);
+  }, [caption, draftKey, draftReady, history.present, isDirty]);
 
   const paintPreview = useCallback((preview?: DrawAction | null, paperOverride?: Paper, selectedText?: TextAction | null) => {
     const canvas = canvasRef.current;
@@ -1000,10 +1067,126 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
     setHistory((current) => ({ past: [...current.past, current.present], present: { ...current.present, actions: [...current.present.actions, action] }, future: [] }));
   }, []);
 
+  const applyFillAt = (canvas: HTMLCanvasElement, point: Point) => {
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    if (!context) return;
+    paintPreview(null, paper, null);
+    try {
+      const seed = (Math.imul(fillSeedRef.current++, 2654435761)
+        ^ Math.imul(Math.floor(point.x), 374761393)
+        ^ Math.imul(Math.floor(point.y), 668265263)) >>> 0;
+      const previousAction = actionsRef.current.at(-1);
+      const action = previousAction?.kind === 'fill' && fillContainsPoint(previousAction, point)
+        ? layerFillAction(previousAction, color, opacity, fillMaterial, fillTexture, fillWater, seed)
+        : makeFillAction(context.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT), point, color, opacity, fillTolerance, fillMaterial, fillTexture, fillWater, seed);
+      if (!action) {
+        setHint(t('This region already uses the selected color'));
+        return;
+      }
+      commit(action);
+      setHint(t('Filled with {material} · tolerance {tolerance} · ⌘Z to undo', { material: t(activeFillMaterial.label).toLocaleLowerCase(), tolerance: fillTolerance }));
+    } catch {
+      setHint(t('This image region could not be read. Try again on a new drawing.'));
+    }
+  };
+
+  const discardWorkingInteraction = (canvas: HTMLCanvasElement) => {
+    if (textDragFrameRef.current !== null) {
+      window.cancelAnimationFrame(textDragFrameRef.current);
+      textDragFrameRef.current = null;
+    }
+    activePointerRef.current = null;
+    panRef.current = null;
+    workingRef.current = null;
+    textDragRef.current = null;
+    pendingTouchFillRef.current = null;
+    hideEraserCursor();
+    paintPreview(null);
+    canvas.dataset.gesture = 'true';
+  };
+
+  const applyPendingGesture = () => {
+    gestureFrameRef.current = null;
+    const pending = pendingGestureRef.current;
+    const gesture = gestureRef.current;
+    const viewport = viewportRef.current;
+    const board = canvasRef.current?.parentElement;
+    if (!pending || !gesture || !viewport || !board) return;
+    pendingGestureRef.current = null;
+    viewport.style.setProperty('--canvas-zoom', `${pending.zoom}%`);
+    zoomRef.current = pending.zoom;
+    if (zoomOutputRef.current) zoomOutputRef.current.textContent = `${Math.round(pending.zoom)}%`;
+    const boardBounds = board.getBoundingClientRect();
+    const anchoredClientX = boardBounds.left + boardBounds.width * gesture.anchor.x;
+    const anchoredClientY = boardBounds.top + boardBounds.height * gesture.anchor.y;
+    viewport.scrollLeft += anchoredClientX - pending.midpoint.x;
+    viewport.scrollTop += anchoredClientY - pending.midpoint.y;
+  };
+
+  const scheduleGestureFrame = () => {
+    const gesture = gestureRef.current;
+    if (!gesture) return;
+    const first = touchContactsRef.current.get(gesture.pointerIds[0]);
+    const second = touchContactsRef.current.get(gesture.pointerIds[1]);
+    if (!first || !second) return;
+    pendingGestureRef.current = {
+      zoom: clampZoom(gesture.startZoom * contactDistance(first, second) / gesture.startDistance),
+      midpoint: contactMidpoint(first, second),
+    };
+    if (gestureFrameRef.current === null) gestureFrameRef.current = window.requestAnimationFrame(applyPendingGesture);
+  };
+
+  const startCanvasGesture = (canvas: HTMLCanvasElement) => {
+    const contacts = Array.from(touchContactsRef.current.entries()).slice(0, 2);
+    if (contacts.length < 2) return;
+    const [[firstId, first], [secondId, second]] = contacts;
+    const boardBounds = canvas.parentElement?.getBoundingClientRect();
+    if (!boardBounds) return;
+    const midpoint = contactMidpoint(first, second);
+    discardWorkingInteraction(canvas);
+    gestureRef.current = {
+      pointerIds: [firstId, secondId],
+      startDistance: Math.max(1, contactDistance(first, second)),
+      startZoom: zoomRef.current,
+      anchor: {
+        x: Math.max(0, Math.min(1, (midpoint.x - boardBounds.left) / boardBounds.width)),
+        y: Math.max(0, Math.min(1, (midpoint.y - boardBounds.top) / boardBounds.height)),
+      },
+    };
+    setHint(t('Pinch to zoom · move two fingers to pan'));
+  };
+
+  const finishCanvasGesturePointer = (canvas: HTMLCanvasElement, pointerId: number) => {
+    touchContactsRef.current.delete(pointerId);
+    const gesture = gestureRef.current;
+    if (!gesture) return false;
+    const gestureEnded = gesture.pointerIds.includes(pointerId)
+      || gesture.pointerIds.some((id) => !touchContactsRef.current.has(id));
+    if (gestureEnded) {
+      if (gestureFrameRef.current !== null) window.cancelAnimationFrame(gestureFrameRef.current);
+      if (pendingGestureRef.current) applyPendingGesture();
+      gestureRef.current = null;
+      pendingGestureRef.current = null;
+      canvas.dataset.gesture = 'false';
+      const settledZoom = Math.round(zoomRef.current);
+      setZoom(settledZoom);
+      setHint(t('Zoom {zoom}% · use two fingers to move around', { zoom: settledZoom }));
+    }
+    return true;
+  };
+
   const begin = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (sendingRef.current || sourceLoading || sourceError || event.button !== 0 || activePointerRef.current !== null) return;
-    if (event.pointerType === 'touch' && !event.isPrimary) return;
+    if (sendingRef.current || sourceLoading || sourceError || event.button !== 0) return;
     event.preventDefault();
+    if (event.pointerType === 'touch') {
+      touchContactsRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      event.currentTarget.setPointerCapture(event.pointerId);
+      if (touchContactsRef.current.size >= 2) {
+        if (!gestureRef.current) startCanvasGesture(event.currentTarget);
+        return;
+      }
+    }
+    if (activePointerRef.current !== null) return;
     updateEraserCursor(event);
     if (tool === 'hand') {
       const viewport = viewportRef.current;
@@ -1016,26 +1199,10 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
     }
     const point = getPoint(event);
     if (tool === 'fill') {
-      const context = event.currentTarget.getContext('2d', { willReadFrequently: true });
-      if (!context) return;
-      paintPreview(null, paper, null);
-      try {
-        const seed = (Math.imul(fillSeedRef.current++, 2654435761)
-          ^ Math.imul(Math.floor(point.x), 374761393)
-          ^ Math.imul(Math.floor(point.y), 668265263)) >>> 0;
-        const previousAction = actionsRef.current.at(-1);
-        const action = previousAction?.kind === 'fill' && fillContainsPoint(previousAction, point)
-          ? layerFillAction(previousAction, color, opacity, fillMaterial, fillTexture, fillWater, seed)
-          : makeFillAction(context.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT), point, color, opacity, fillTolerance, fillMaterial, fillTexture, fillWater, seed);
-        if (!action) {
-          setHint(t('This region already uses the selected color'));
-          return;
-        }
-        commit(action);
-        setHint(t('Filled with {material} · tolerance {tolerance} · ⌘Z to undo', { material: t(activeFillMaterial.label).toLocaleLowerCase(), tolerance: fillTolerance }));
-      } catch {
-        setHint(t('This image region could not be read. Try again on a new drawing.'));
-      }
+      if (event.pointerType === 'touch') {
+        activePointerRef.current = event.pointerId;
+        pendingTouchFillRef.current = { pointerId: event.pointerId, point };
+      } else applyFillAt(event.currentTarget, point);
       return;
     }
     if (tool === 'text') {
@@ -1081,9 +1248,25 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   };
 
   const move = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (event.pointerType === 'touch') {
+      touchContactsRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      if (gestureRef.current) {
+        event.preventDefault();
+        scheduleGestureFrame();
+        return;
+      }
+    }
     updateEraserCursor(event);
     if (event.pointerId !== activePointerRef.current) return;
     event.preventDefault();
+    if (pendingTouchFillRef.current?.pointerId === event.pointerId) {
+      const point = getPoint(event);
+      if (Math.hypot(point.x - pendingTouchFillRef.current.point.x, point.y - pendingTouchFillRef.current.point.y) > 8) {
+        pendingTouchFillRef.current = null;
+        setHint(t('Tap without dragging to fill a region'));
+      }
+      return;
+    }
     if (panRef.current) {
       const viewport = viewportRef.current;
       if (!viewport) return;
@@ -1134,6 +1317,12 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   };
 
   const finish = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (event.pointerType === 'touch') {
+      const wasGesture = finishCanvasGesturePointer(event.currentTarget, event.pointerId);
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+      hideEraserCursor();
+      if (wasGesture) return;
+    }
     if (event.pointerId !== activePointerRef.current) return;
     if (textDragFrameRef.current !== null) {
       window.cancelAnimationFrame(textDragFrameRef.current);
@@ -1144,6 +1333,12 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
     panRef.current = null;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
     if (event.pointerType === 'touch') hideEraserCursor();
+    const pendingFill = pendingTouchFillRef.current;
+    pendingTouchFillRef.current = null;
+    if (pendingFill?.pointerId === event.pointerId) {
+      applyFillAt(event.currentTarget, pendingFill.point);
+      return;
+    }
     const textDrag = textDragRef.current;
     textDragRef.current = null;
     if (textDrag) {
@@ -1168,6 +1363,10 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   };
 
   const cancelStroke = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (event.pointerType === 'touch' && finishCanvasGesturePointer(event.currentTarget, event.pointerId)) {
+      hideEraserCursor();
+      return;
+    }
     if (event.pointerId !== activePointerRef.current) return;
     if (textDragFrameRef.current !== null) {
       window.cancelAnimationFrame(textDragFrameRef.current);
@@ -1177,6 +1376,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
     panRef.current = null;
     workingRef.current = null;
     textDragRef.current = null;
+    pendingTouchFillRef.current = null;
     hideEraserCursor();
     paintPreview(null);
   };
@@ -1253,6 +1453,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
       const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png', 0.95));
       if (!blob) throw new Error(t('The drawing could not be exported.'));
       await onSend(blob, caption.trim());
+      await deleteStudioDraft(draftKey).catch(() => undefined);
     } finally {
       selectedTextIdRef.current = selectedTextId;
       sendingRef.current = false;
@@ -1322,11 +1523,23 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
     if (restoreFocus) requestAnimationFrame(() => mixerToggleRef.current?.focus());
   };
 
+  const shapeTrigger = useCallback(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 720px)').matches
+    ? moreToolsButtonRef.current
+    : shapeButtonRef.current, []);
+
+  const focusShapeTrigger = useCallback(() => shapeTrigger()?.focus(), [shapeTrigger]);
+
   const selectTool = (nextTool: Tool) => {
     const restoreShapeFocus = shapeMenuOpen;
     const moveFocusToCanvas = moreToolsOpen;
+    const openMobileProperties = moreToolsOpen
+      && typeof window !== 'undefined'
+      && window.matchMedia('(max-width: 720px)').matches
+      && nextTool !== 'hand';
+    if (openMobileProperties) mobileInspectorTriggerRef.current = moreToolsButtonRef.current;
     setShapeMenuOpen(false);
     setMoreToolsOpen(false);
+    setMobileInspectorOpen(openMobileProperties);
     setTool(nextTool);
     if (isClosedShapeTool(nextTool)) setSelectedShape(nextTool);
     if (nextTool !== 'text') {
@@ -1334,8 +1547,23 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
       setSelectedTextId(null);
     }
     if (nextTool === 'fill') setHint(t('Tap a closed region on the paper to fill it'));
-    if (restoreShapeFocus) requestAnimationFrame(() => shapeButtonRef.current?.focus());
-    else if (moveFocusToCanvas) requestAnimationFrame(() => canvasRef.current?.focus());
+    if (restoreShapeFocus) requestAnimationFrame(focusShapeTrigger);
+    else if (moveFocusToCanvas && !openMobileProperties) requestAnimationFrame(() => canvasRef.current?.focus());
+  };
+
+  const selectDockTool = (nextTool: Tool) => {
+    const reopenProperties = typeof window !== 'undefined'
+      && window.matchMedia('(max-width: 720px)').matches
+      && tool === nextTool;
+    if (reopenProperties && document.activeElement instanceof HTMLButtonElement) mobileInspectorTriggerRef.current = document.activeElement;
+    selectTool(nextTool);
+    if (reopenProperties) setMobileInspectorOpen(true);
+  };
+
+  const closeMobileInspector = () => {
+    setMobileInspectorOpen(false);
+    const trigger = mobileInspectorTriggerRef.current;
+    requestAnimationFrame(() => (trigger?.isConnected ? trigger : canvasRef.current)?.focus());
   };
 
   const toggleMoreTools = () => {
@@ -1345,11 +1573,32 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
       return;
     }
     setMoreToolsOpen(true);
-    requestAnimationFrame(() => moreToolsSheetRef.current?.querySelector<HTMLButtonElement>('[data-more-tool]')?.focus());
   };
 
+  useEffect(() => {
+    if (!moreToolsOpen) return;
+    const frame = requestAnimationFrame(() => moreToolsSheetRef.current?.querySelector<HTMLButtonElement>('[data-more-tool]')?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [moreToolsOpen]);
+
+  useEffect(() => {
+    if (!mobileInspectorOpen) return;
+    const frame = requestAnimationFrame(() => document.querySelector<HTMLButtonElement>('#tool-properties .mobile-inspector-header button')?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [mobileInspectorOpen]);
+
+  useEffect(() => {
+    const desktop = window.matchMedia('(min-width: 721px)');
+    const leaveMobileSheetMode = () => {
+      if (desktop.matches) setMobileInspectorOpen(false);
+    };
+    leaveMobileSheetMode();
+    desktop.addEventListener('change', leaveMobileSheetMode);
+    return () => desktop.removeEventListener('change', leaveMobileSheetMode);
+  }, []);
+
   const positionShapeMenu = useCallback(() => {
-    const button = shapeButtonRef.current;
+    const button = shapeTrigger();
     if (!button) return;
     const bounds = button.getBoundingClientRect();
     const viewportPadding = 8;
@@ -1371,35 +1620,49 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
     const preferredTop = horizontalRail ? bounds.bottom + 8 : bounds.top - 104;
     const top = Math.max(viewportPadding, Math.min(preferredTop, window.innerHeight - menuHeight - viewportPadding));
     setShapeMenuPosition({ left, top });
-  }, []);
+  }, [shapeTrigger]);
 
   const toggleShapeMenu = () => {
-    if (!shapeMenuOpen) {
-      positionShapeMenu();
-      requestAnimationFrame(() => {
-        positionShapeMenu();
-        document.querySelector<HTMLElement>('#shape-picker .shape-options button')?.focus();
-      });
-    }
+    if (!shapeMenuOpen) positionShapeMenu();
     setShapeMenuOpen((open) => !open);
   };
 
   useEffect(() => {
     if (!shapeMenuOpen) return;
     const reposition = () => positionShapeMenu();
+    const frame = requestAnimationFrame(() => {
+      reposition();
+      const picker = document.getElementById('shape-picker');
+      if (picker && !picker.contains(document.activeElement)) picker.querySelector<HTMLElement>('.shape-options button')?.focus();
+    });
     window.addEventListener('resize', reposition);
     window.addEventListener('scroll', reposition, true);
     return () => {
+      cancelAnimationFrame(frame);
       window.removeEventListener('resize', reposition);
       window.removeEventListener('scroll', reposition, true);
     };
   }, [positionShapeMenu, shapeMenuOpen]);
 
+  useEffect(() => {
+    if (!shapeMenuOpen) return;
+    const dismissShapePicker = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      setShapeMenuOpen(false);
+      requestAnimationFrame(focusShapeTrigger);
+    };
+    document.addEventListener('keydown', dismissShapePicker, true);
+    return () => document.removeEventListener('keydown', dismissShapePicker, true);
+  }, [focusShapeTrigger, shapeMenuOpen]);
+
   const onKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.key === 'Tab') {
       const dialog = dialogRef.current;
       if (!dialog) return;
-      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>('button:not(:disabled):not([tabindex="-1"]), input:not(:disabled), textarea:not(:disabled), canvas[tabindex="0"], [tabindex]:not([tabindex="-1"])')).filter((element) => element.getClientRects().length > 0);
+      const focusRoot = mobileInspectorOpen ? dialog.querySelector<HTMLElement>('#tool-properties') : dialog;
+      if (!focusRoot) return;
+      const focusable = Array.from(focusRoot.querySelectorAll<HTMLElement>('button:not(:disabled):not([tabindex="-1"]), input:not(:disabled), textarea:not(:disabled), canvas[tabindex="0"], [tabindex]:not([tabindex="-1"])')).filter((element) => element.getClientRects().length > 0);
       if (!focusable.length) return;
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
@@ -1413,10 +1676,15 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
       moreToolsButtonRef.current?.focus();
       return;
     }
+    if (event.key === 'Escape' && mobileInspectorOpen) {
+      event.preventDefault();
+      closeMobileInspector();
+      return;
+    }
     if (event.key === 'Escape' && shapeMenuOpen) {
       event.preventDefault();
       setShapeMenuOpen(false);
-      shapeButtonRef.current?.focus();
+      focusShapeTrigger();
       return;
     }
     if (event.key === 'Escape') { requestClose(); return; }
@@ -1458,18 +1726,20 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
   return (
     <div className="studio-backdrop">
       <section ref={dialogRef} className="studio advanced-studio" role="dialog" aria-modal="true" aria-labelledby="studio-title" onKeyDown={onKeyDown} tabIndex={-1}>
-        <header className="studio-header advanced-studio-header">
+        <header className="studio-header advanced-studio-header" inert={mobileInspectorOpen ? true : undefined}>
           <button type="button" className="plain-button" onClick={requestClose} disabled={paletteMutating} data-studio-initial-focus>{t('Close')} <kbd>Esc</kbd></button>
-          <div><small>{sourceUrl ? t('Continuing version {version}', { version: version ?? 1 }) : 'Canvas 1200 × 720'}</small><h2 id="studio-title">Nét Studio</h2></div>
+          <div><small className={sourceUrl ? 'studio-source-label' : ''}>{sourceIsDraft ? t('Starting from your first mark') : sourceUrl ? t('Continuing version {version}', { version: version ?? 1 }) : 'Canvas 1200 × 720'}</small><h2 id="studio-title">Nét Studio</h2></div>
           <button type="button" className="primary-button studio-header-send" onClick={() => void send()} disabled={!canSendCanvas || paletteMutating || sending || sourceLoading || sourceError} title={!canSendCanvas ? t('Draw at least one mark or choose a paper before sending') : undefined}>{sendLabel}</button>
         </header>
 
         <div className="studio-workspace">
-          <div className="tool-rail-shell">
+          <div className="tool-rail-shell" inert={mobileInspectorOpen ? true : undefined}>
             <aside className="tool-rail" aria-label={t('Drawing tools')}>
-              {RAIL_TOOLS.map((item) => <button type="button" key={item.id} className={`${tool === item.id ? 'tool-button active' : 'tool-button'} ${MORE_TOOLS.some((moreTool) => moreTool.id === item.id) ? 'secondary-tool' : ''}`} data-tool-id={item.id} onClick={() => selectTool(item.id)} title={t('{tool} — key {key}', { tool: t(item.label), key: item.key })} aria-label={`${t(item.label)} (${item.key})`} aria-pressed={tool === item.id}><b><ToolIcon tool={item.id} /></b><span className="desktop-tool-label">{t(item.label)}</span><span className="mobile-tool-label">{item.id === 'hand' ? t('Pan') : item.id === 'pen' ? t('Pencil') : item.id === 'eraser' ? t('Eraser') : t(item.label)}</span></button>)}
+              {RAIL_TOOLS.map((item) => <button type="button" key={item.id} className={`${tool === item.id ? 'tool-button active' : 'tool-button'} ${MORE_TOOLS.some((moreTool) => moreTool.id === item.id) ? 'secondary-tool' : ''}`} data-tool-id={item.id} onClick={() => item.id === 'pen' || item.id === 'eraser' ? selectDockTool(item.id) : selectTool(item.id)} title={t('{tool} — key {key}', { tool: t(item.label), key: item.key })} aria-label={`${t(item.label)} (${item.key})`} aria-pressed={tool === item.id}><b><ToolIcon tool={item.id} /></b><span className="desktop-tool-label">{t(item.label)}</span><span className="mobile-tool-label">{item.id === 'hand' ? t('Pan') : item.id === 'pen' ? t('Pencil') : item.id === 'eraser' ? t('Eraser') : t(item.label)}</span></button>)}
               <button type="button" ref={shapeButtonRef} className={closedShapeTool ? 'tool-button active' : 'tool-button'} data-tool-id="shape" onClick={toggleShapeMenu} title={t('Choose shape — currently {shape}', { shape: t(activeShape.label) })} aria-label={t('Shape ({shape})', { shape: t(activeShape.label) })} aria-pressed={closedShapeTool} aria-haspopup="dialog" aria-expanded={shapeMenuOpen} aria-controls="shape-picker"><b><ToolIcon tool={selectedShape} /></b><span className="desktop-tool-label">{t('Shapes')}</span><span className="mobile-tool-label">{t('Shape')}</span></button>
               <button type="button" className={tool === 'text' ? 'tool-button active' : 'tool-button'} data-tool-id="text" onClick={() => selectTool('text')} title={t('{tool} — key {key}', { tool: t(TEXT_TOOL.label), key: TEXT_TOOL.key })} aria-label={`${t(TEXT_TOOL.label)} (${TEXT_TOOL.key})`} aria-pressed={tool === 'text'}><b><ToolIcon tool="text" /></b><span className="desktop-tool-label">{t(TEXT_TOOL.label)}</span><span className="mobile-tool-label">{t('Text')}</span></button>
+              <button type="button" className="tool-button mobile-color-tool" onClick={(event) => { if (mobileInspectorOpen) closeMobileInspector(); else { mobileInspectorTriggerRef.current = event.currentTarget; setMobileInspectorOpen(true); } }} aria-label={t('Color and tool settings')} aria-expanded={mobileInspectorOpen} aria-controls="tool-properties"><b><i style={{ background: color }} /></b><span className="mobile-tool-label">{t('Color')}</span></button>
+              <button type="button" className="tool-button mobile-undo-tool" onClick={undo} disabled={!history.past.length} aria-label={t('Undo')}><b>↶</b><span className="mobile-tool-label">{t('Undo')}</span></button>
               <button type="button" ref={moreToolsButtonRef} className={MORE_TOOLS.some((item) => item.id === tool) ? 'tool-button more-tools-button active' : 'tool-button more-tools-button'} onClick={toggleMoreTools} aria-label={t('More tools')} aria-haspopup="dialog" aria-expanded={moreToolsOpen} aria-controls="more-tools-sheet"><b><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true"><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></svg></b><span className="mobile-tool-label">{t('More')}</span></button>
             </aside>
           </div>
@@ -1478,24 +1748,24 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
             <div className="more-tools-dismiss" aria-hidden="true" onPointerDown={() => { setMoreToolsOpen(false); moreToolsButtonRef.current?.focus(); }} />
             <section ref={moreToolsSheetRef} id="more-tools-sheet" className="more-tools-sheet" role="dialog" aria-modal="false" aria-labelledby="more-tools-title">
               <header><div><small>Nét Studio</small><strong id="more-tools-title">{t('More Tools')}</strong></div><button type="button" onClick={() => { setMoreToolsOpen(false); moreToolsButtonRef.current?.focus(); }} aria-label={t('Close more tools')}>×</button></header>
-              <div>{MORE_TOOLS.map((item) => <button type="button" key={item.id} data-more-tool className={tool === item.id ? 'active' : ''} onClick={() => selectTool(item.id)} aria-label={`${t(item.label)} (${item.key})`} aria-pressed={tool === item.id}><ToolIcon tool={item.id} /><span><strong>{t(item.label)}</strong><small>{t('Key {key}', { key: item.key })}</small></span></button>)}</div>
+              <div>{MOBILE_MORE_TOOLS.map((item) => <button type="button" key={item.id} data-more-tool className={tool === item.id ? 'active' : ''} onClick={() => selectTool(item.id)} aria-label={`${t(item.label)} (${item.key})`} aria-pressed={tool === item.id}><ToolIcon tool={item.id} /><span><strong>{t(item.label)}</strong><small>{t('Key {key}', { key: item.key })}</small></span></button>)}<button type="button" data-more-tool className={closedShapeTool ? 'active' : ''} onClick={() => { setMoreToolsOpen(false); requestAnimationFrame(toggleShapeMenu); }} aria-label={t('Choose a Shape')}><ToolIcon tool={selectedShape} /><span><strong>{t('Shapes')}</strong><small>{t(activeShape.label)}</small></span></button><button type="button" data-more-tool className={tool === 'text' ? 'active' : ''} onClick={() => selectTool('text')} aria-label={t('Text')}><ToolIcon tool="text" /><span><strong>{t('Text')}</strong><small>{t('Place movable text')}</small></span></button></div>
             </section>
           </> : null}
 
           {shapeMenuOpen ? <>
-            <div className="shape-popover-dismiss" aria-hidden="true" onPointerDown={() => { setShapeMenuOpen(false); shapeButtonRef.current?.focus(); }} />
+            <div className="shape-popover-dismiss" aria-hidden="true" onPointerDown={() => { setShapeMenuOpen(false); focusShapeTrigger(); }} />
             <section id="shape-picker" className="shape-popover" role="dialog" aria-modal="false" aria-labelledby="shape-picker-title" style={shapeMenuPosition}>
-              <header><div><small>{t('Geometry')}</small><strong id="shape-picker-title">{t('Choose a Shape')}</strong></div><button type="button" onClick={() => { setShapeMenuOpen(false); shapeButtonRef.current?.focus(); }} aria-label={t('Close shape picker')} data-tooltip={t('Close')} data-tooltip-placement="below">×</button></header>
+              <header><div><small>{t('Geometry')}</small><strong id="shape-picker-title">{t('Choose a Shape')}</strong></div><button type="button" onClick={() => { setShapeMenuOpen(false); focusShapeTrigger(); }} aria-label={t('Close shape picker')} data-tooltip={t('Close')} data-tooltip-placement="below">×</button></header>
               <div className="shape-options" role="group" aria-label={t('Choose shape type')}>{SHAPE_TOOLS.map((item) => <button type="button" key={item.id} className={selectedShape === item.id ? 'active' : ''} onClick={() => selectTool(item.id)} aria-label={t(item.label)} aria-pressed={selectedShape === item.id}><ToolIcon tool={item.id} /><span>{t(item.label)}</span><kbd>{item.key}</kbd></button>)}</div>
               <p className="shape-tool-help">{t('Draw immediately after choosing. Hold')} <kbd>Shift</kbd> {t('while dragging to keep both dimensions even.')}</p>
             </section>
           </> : null}
 
-          <div className="canvas-panel">
+          <div className="canvas-panel" inert={mobileInspectorOpen ? true : undefined}>
             <div className="canvas-commandbar">
               <div><button type="button" onClick={undo} disabled={!history.past.length} aria-label={t('Undo')} data-tooltip={t('Undo')} data-tooltip-placement="below">↶</button><button type="button" onClick={redo} disabled={!history.future.length} aria-label={t('Redo')} data-tooltip={t('Redo')} data-tooltip-placement="below">↷</button><button type="button" onClick={clear} disabled={!actions.length} aria-label={t('Clear new marks')} data-tooltip={t('Clear new marks')} data-tooltip-placement="below">⌫</button></div>
               <span><strong>{t(activeTool.label)}</strong><kbd>{activeTool.key}</kbd><i aria-hidden="true">·</i>{t('{count} actions', { count: actions.length })}</span>
-              <div className="zoom-control"><button type="button" onClick={() => setZoom((value) => Math.max(50, value - 10))} aria-label={t('Zoom out')} data-tooltip={t('Zoom out')} data-tooltip-placement="below">−</button><output>{zoom}%</output><button type="button" onClick={() => setZoom((value) => Math.min(180, value + 10))} aria-label={t('Zoom in')} data-tooltip={t('Zoom in')} data-tooltip-placement="below">＋</button></div>
+              <div className="zoom-control"><button type="button" onClick={() => setZoom((value) => { const next = clampZoom(value - 10); zoomRef.current = next; return next; })} aria-label={t('Zoom out')} data-tooltip={t('Zoom out')} data-tooltip-placement="below">−</button><output ref={zoomOutputRef} aria-label={t('Zoom level')}>{zoom}%</output><button type="button" onClick={() => setZoom((value) => { const next = clampZoom(value + 10); zoomRef.current = next; return next; })} aria-label={t('Zoom in')} data-tooltip={t('Zoom in')} data-tooltip-placement="below">＋</button></div>
             </div>
             <div ref={viewportRef} className="canvas-viewport" style={zoomStyle}>
               <div className="canvas-board">
@@ -1505,10 +1775,12 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
                 {sourceError ? <span className="canvas-loading canvas-error">{t('The original could not be loaded. Close Studio and try again.')}</span> : null}
               </div>
             </div>
-            <div className="canvas-status"><span role="status" aria-live="polite"><i /> {hint}</span><span>⌘Z {t('undo')} · Shift⌘Z {t('redo')}</span></div>
+            <div className="canvas-status"><span role="status" aria-live="polite"><i /> {hint}{draftStatus !== 'idle' ? <b className="draft-status"> · {draftStatus === 'saving' ? t('Saving draft…') : draftStatus === 'restored' ? t('Draft restored') : t('Draft saved')}</b> : null}</span><span className="canvas-shortcuts">⌘Z {t('undo')} · Shift⌘Z {t('redo')}</span><span className="canvas-gesture-help">{t('One finger draws · two fingers zoom and pan')}</span></div>
           </div>
 
-          <aside className="tool-inspector" aria-label={t('Tool properties')}>
+          {mobileInspectorOpen && <button type="button" tabIndex={-1} className="mobile-inspector-dismiss" onClick={closeMobileInspector} aria-label={t('Close tool settings')} />}
+          <aside id="tool-properties" className={mobileInspectorOpen ? 'tool-inspector mobile-open' : 'tool-inspector'} role={mobileInspectorOpen ? 'dialog' : undefined} aria-modal={mobileInspectorOpen ? true : undefined} aria-labelledby={mobileInspectorOpen ? 'mobile-tool-settings-title' : undefined} aria-label={mobileInspectorOpen ? undefined : t('Tool properties')}>
+            <header className="mobile-inspector-header"><span><small>{t(activeTool.label)}</small><strong id="mobile-tool-settings-title">{t('Tool Settings')}</strong></span><button type="button" onClick={closeMobileInspector} aria-label={t('Close tool settings')}>×</button></header>
             {editingTool ? <>
               {tool !== 'eraser' ? <section><div className="inspector-title"><span>{t('Color')}</span><output>{color.toUpperCase()}</output></div><div className="advanced-color-row">{COLORS.map((item) => <button type="button" key={item} className={color.toUpperCase() === item.toUpperCase() ? 'color active' : 'color'} style={{ background: item }} onClick={() => setColor(item)} aria-label={t('Choose color {color}', { color: item })} aria-pressed={color.toUpperCase() === item.toUpperCase()} />)}<label className="custom-color" title={t('Custom color')}>＋<input type="color" name="custom-color" value={color} onChange={(event) => setColor(event.target.value.toUpperCase())} aria-label={t('Choose a custom color')} /></label></div>{paletteAvailable ? <button type="button" ref={mixerToggleRef} className="mixer-toggle" onClick={() => { setMixerOpen((open) => !open); setPaletteError(''); }} aria-label={mixerOpen ? t('Close advanced color mixing') : t('Open advanced color mixing')} aria-expanded={mixerOpen} aria-controls="pigment-mixer"><span aria-hidden="true">◒</span>{mixerOpen ? t('Close Mixer') : t('Advanced Color Mixing')}</button> : null}</section> : null}
               {paletteAvailable && mixerOpen ? (
@@ -1575,7 +1847,7 @@ export default function DrawingStudio({ sourceUrl, version, paletteColors, palet
           </aside>
         </div>
 
-        <footer className="studio-footer"><label><span>{t('Message')}</span><input name="drawing-caption" autoComplete="off" value={caption} onChange={(event) => setCaption(event.target.value)} placeholder={t('Add context for this drawing…')} maxLength={2000} aria-label={t('Drawing message')} /></label><div><span>{sourceUrl ? `${t('Original remains unchanged')} · ` : ''}PNG 1200 × 720</span><button type="button" className="primary-button" onClick={() => void send()} disabled={!canSendCanvas || paletteMutating || sending || sourceLoading || sourceError} title={!canSendCanvas ? t('Draw at least one mark or choose a paper before sending') : undefined}>{sendLabel}</button>{!canSendCanvas ? <small className="studio-send-help">{t('Draw or add text to enable Send')}</small> : null}</div></footer>
+        <footer className="studio-footer" inert={mobileInspectorOpen ? true : undefined}><label><span>{t('Message')}</span><input name="drawing-caption" autoComplete="off" value={caption} onChange={(event) => setCaption(event.target.value)} placeholder={t('Add context for this drawing…')} maxLength={2000} aria-label={t('Drawing message')} /></label><div><span>{sourceUrl && !sourceIsDraft ? `${t('Original remains unchanged')} · ` : ''}PNG 1200 × 720</span><button type="button" className="primary-button" onClick={() => void send()} disabled={!canSendCanvas || paletteMutating || sending || sourceLoading || sourceError} title={!canSendCanvas ? t('Draw at least one mark or choose a paper before sending') : undefined}>{sendLabel}</button>{!canSendCanvas ? <small className="studio-send-help">{t('Draw or add text to enable Send')}</small> : null}</div></footer>
       </section>
       <AppDialog open={Boolean(paletteDeleteTarget)} onClose={() => setPaletteDeleteTarget(null)} labelledBy="delete-palette-title" describedBy="delete-palette-description" className="confirmation-backdrop">
         <section className="dialog-card confirmation-dialog">
