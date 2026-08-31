@@ -21,6 +21,8 @@ export const messageType = pgEnum('message_type', ['system', 'text', 'image', 'c
 export const assetStatus = pgEnum('asset_status', ['pending', 'attached', 'deleting']);
 export const imagePurpose = pgEnum('image_purpose', ['creative', 'reference']);
 export const visualStatus = pgEnum('visual_status', ['exploring', 'needs_changes', 'selected']);
+export const guestAdmissionPolicy = pgEnum('guest_admission_policy', ['off', 'approval', 'link']);
+export const guestRequestStatus = pgEnum('guest_request_status', ['pending', 'approved', 'claimed', 'rejected', 'cancelled', 'expired']);
 
 export const users = pgTable('users', {
   id: text('id').primaryKey(),
@@ -49,6 +51,7 @@ export const rooms = pgTable('rooms', {
   inviteMaxUses: integer('invite_max_uses'),
   inviteUseCount: integer('invite_use_count').notNull().default(0),
   allowGuests: boolean('allow_guests').notNull().default(true),
+  guestAdmissionPolicy: guestAdmissionPolicy('guest_admission_policy').notNull().default('link'),
   createdAt: bigint('created_at', { mode: 'number' }).notNull(),
 }, (table) => [
   uniqueIndex('rooms_invite_code_unique').on(table.inviteCode),
@@ -80,6 +83,30 @@ export const guestSessions = pgTable('guest_sessions', {
 }, (table) => [
   index('guest_sessions_room_expiry_idx').on(table.roomId, table.expiresAt),
   index('guest_sessions_expiry_idx').on(table.expiresAt),
+]);
+
+export const guestRequests = pgTable('guest_requests', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  roomId: uuid('room_id').notNull().references(() => rooms.id, { onDelete: 'cascade' }),
+  inviteCode: text('invite_code').notNull(),
+  displayName: text('display_name').notNull(),
+  introduction: text('introduction'),
+  requesterTokenHash: text('requester_token_hash').notNull(),
+  status: guestRequestStatus('status').notNull().default('pending'),
+  createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+  expiresAt: bigint('expires_at', { mode: 'number' }).notNull(),
+  decidedAt: bigint('decided_at', { mode: 'number' }),
+  decidedBy: text('decided_by').references(() => users.id, { onDelete: 'set null' }),
+  decisionReason: text('decision_reason'),
+  grantTokenHash: text('grant_token_hash'),
+  grantExpiresAt: bigint('grant_expires_at', { mode: 'number' }),
+  inviteUseReserved: boolean('invite_use_reserved').notNull().default(false),
+  claimedGuestSessionId: uuid('claimed_guest_session_id').references(() => guestSessions.id, { onDelete: 'set null' }),
+}, (table) => [
+  uniqueIndex('guest_requests_requester_token_unique').on(table.requesterTokenHash),
+  uniqueIndex('guest_requests_grant_token_unique').on(table.grantTokenHash),
+  index('guest_requests_room_status_created_idx').on(table.roomId, table.status, table.createdAt),
+  index('guest_requests_expiry_idx').on(table.status, table.expiresAt, table.grantExpiresAt),
 ]);
 
 export type PaletteComponentData = { color: string; weight: number };

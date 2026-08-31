@@ -3,8 +3,23 @@ import { createHmac } from 'node:crypto';
 import { io, type Socket } from 'socket.io-client';
 import { createDatabase, eq, inArray, rooms, users } from '@net/database';
 import { e2eApiOrigin, e2eWebOrigin } from './e2e-environment';
+import { shouldDeliverRealtimeEnvelope } from '../../apps/web/app/api/ws/realtime-routing';
 
 const apiOrigin = e2eApiOrigin;
+
+test('production realtime routes admission events only to the owner actor channel @critical', () => {
+  const roomId = 'admission-room';
+  const envelope = { event: 'guest.requested', payload: { roomId, requestId: 'request-1' } };
+  const owner = { authenticated: true, roomId, actorKey: 'user:owner-1' };
+  const member = { authenticated: true, roomId, actorKey: 'user:member-1' };
+  const guest = { authenticated: true, roomId, actorKey: 'guest:guest-1' };
+
+  expect(shouldDeliverRealtimeEnvelope(owner, 'net:actor:user:owner-1', envelope)).toBe(true);
+  expect(shouldDeliverRealtimeEnvelope(member, 'net:actor:user:owner-1', envelope)).toBe(false);
+  expect(shouldDeliverRealtimeEnvelope(guest, 'net:actor:user:owner-1', envelope)).toBe(false);
+  expect(shouldDeliverRealtimeEnvelope(owner, `net:room:${roomId}`, envelope)).toBe(false);
+  expect(shouldDeliverRealtimeEnvelope(owner, 'net:actor:user:owner-1', { ...envelope, payload: { ...envelope.payload, roomId: 'background-room' } })).toBe(true);
+});
 
 function userToken(userId: string) {
   const secret = process.env.AUTH_JWT_SECRET;

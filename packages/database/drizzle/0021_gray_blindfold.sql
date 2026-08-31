@@ -1,0 +1,1 @@
+ALTER TABLE "guest_requests" ADD COLUMN "decision_reason" text;

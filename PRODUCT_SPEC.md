@@ -7,7 +7,8 @@ Nét is a responsive, installable web messenger where people can express an idea
 ## Users and retention
 
 - Authenticated users sign in through Neon Auth. Their rooms, messages, reactions, read state, images, drawing versions, and personal palette are stored permanently.
-- Guests join with a display name through an invite link or start a temporary room. A guest session expires after two hours of inactivity or immediately when the guest chooses **End session**.
+- Guests join with a display name through an invite link or start a temporary room. A room owner chooses whether guest admission is off, immediate for anyone with the link, or requires approval. A guest session expires after two hours of inactivity or immediately when the guest chooses **End session**.
+- Under approval admission, submitting a name creates a private 24-hour join request rather than a guest session. Room content remains hidden; owners review separate pending and approved queues, may include an optional reason when declining, and may revoke an unclaimed approval. An approved grant lasts 24 hours and the two-hour guest timer starts only when the requester explicitly enters the room.
 - When a guest session ends, the guest loses access but sent messages and attached assets remain in the room. Guest reactions, palette data, and unattached temporary uploads are removed.
 - The drawing studio mixes 2–12 display colors simultaneously with a Kubelka–Munk-based sRGB/D65 approximation. Each component has an integer model-concentration parts value from 1–100; the UI shows normalized percentages and preserves duplicate component provenance. It must be described as an approximation because real results depend on measured pigment K/S spectra, binders, substrate, and lighting.
 - A person can name and save up to 24 mixed-color formulas, reuse the result, reload the full component formula for further mixing, and delete it. An authenticated user's palette is persistent; a guest palette belongs to the guest session and is cascade-deleted when that session ends.
@@ -18,10 +19,10 @@ Nét is a responsive, installable web messenger where people can express an idea
 2. An invite preview identifies the room, inviter, participant count, participant display names/avatars, and recent activity type without exposing message bodies, email addresses, or private assets.
 3. An authenticated user chooses people in one picker: one selected person opens a direct message; two or more creates a group and then reveals group options.
 4. In a room, **Draw** is the primary composer action while Text and Photo remain immediately available. Every drawing message exposes **Continue this drawing** as its primary follow-up.
-5. A guest can join an invite-enabled room, send content, react, reply, and see new messages during the session.
+5. A guest can join an invite-enabled room immediately or request owner approval, according to the room policy. Pending guests can safely return using their device-held request credential but cannot see room content.
 6. After a guest contributes a drawing, the UI offers account creation to keep access to the room and drawing history.
 7. A recipient can reply to a message, add or remove a reaction, and see whether an outgoing message has been read.
-8. A recipient can open the complete lineage of a drawing independently of paginated chat history, compare any two versions, select any historical or branched version, and continue it as a new immutable child.
+8. A recipient opens an artwork-first Visual History independently of paginated chat history, selects from a horizontal version filmstrip, optionally compares any two versions, and continues any historical or branched version as a new immutable child.
 9. On mobile, Studio prioritizes the canvas, keeps Pencil, Eraser, Color, Undo, and More in the bottom dock, and opens tool settings in a contextual sheet.
 10. Studio uses one finger or stylus for marks and reserves two-finger gestures for focal-point pinch zoom and canvas pan without committing an accidental mark.
 11. The UI supports desktop and mobile navigation, keyboard/touch input, and PWA installation.
@@ -32,6 +33,9 @@ Nét is a responsive, installable web messenger where people can express an idea
 - Room name and guest name: 2–60 characters.
 - Images: PNG, JPEG, GIF, or WebP, maximum 8 MB.
 - Invalid or expired invite links show a recoverable error in the selected language.
+- A join request is idempotent for its device credential. Approval reserves exactly one invite use; decline, cancellation, revocation, or grant expiry releases that reservation. Claiming a grant is idempotent and creates exactly one guest session.
+- Changing guest policy, rotating/revoking the invite, or reducing access cancels incompatible open requests without exposing room content to requesters.
+- Concurrent approve/decline actions use first-decision-wins semantics; revoking an approved, unclaimed grant is a separate owner action. Increasing invite capacity preserves consumed uses and open grants, while a reduction releases only the newest excess unclaimed reservations and never resets consumed uses.
 - An expired guest session returns to onboarding and does not expose previous guest content.
 - Every server write checks authenticated membership or a valid guest session.
 
@@ -59,6 +63,10 @@ Nét is a responsive, installable web messenger where people can express an idea
 | High | Reply/react/read | UI and server state remain consistent after reload |
 | High | WebSocket room isolation | A client receives events only for the currently authorized room |
 | High | Open invite before joining | Social context is visible, while message content and participant emails remain private |
+| High | Approval-required invite | Submitting a name creates no guest session and reveals no room content; the owner sees the request in People & Safety and can approve or decline it |
+| High | Claim approved request | The guest timer starts on explicit entry, repeated claims return the same session, and an expired/revoked grant cannot enter |
+| High | Concurrent owner decision | A request reaches one terminal decision, invite capacity is reserved at most once, and releasing a grant restores capacity |
+| High | Change guest policy | Turning guest access off cancels pending/unclaimed approvals while signed-in invite behavior remains explicit |
 | High | First-time landing contribution | A visitor can draw before entering a name, then continue that mark in Studio |
 | High | Mobile Studio | Canvas occupies most of the workspace; five primary dock controls and contextual settings remain reachable with 44 px touch targets |
 | High | Mobile canvas gestures | Pinch zoom follows the midpoint of two fingers, two-finger movement pans the enlarged paper, and neither gesture creates or commits a drawing action |

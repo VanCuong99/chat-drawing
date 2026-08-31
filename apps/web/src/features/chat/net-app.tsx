@@ -14,7 +14,7 @@ import {
   useState,
 } from 'react';
 import Image from 'next/image';
-import type { ActorView, CanvasLineageItem, MessageView, PaletteColorView, RoomPeopleView, RoomPersonView, RoomView, UserSummary } from '@/src/shared/chat.types';
+import type { ActorView, CanvasLineageItem, GuestRequestStatusView, GuestRequestView, MessageView, PaletteColorView, RoomPeopleView, RoomPersonView, RoomView, UserSummary } from '@/src/shared/chat.types';
 import { io, type Socket } from 'socket.io-client';
 import AppDialog from '@/src/shared/app-dialog';
 import LandingDoodle from '@/src/features/chat/landing-doodle';
@@ -31,7 +31,7 @@ const DrawingLineage = lazy(() => import('@/src/features/chat/drawing-lineage'))
 
 type InitialUser = { id: string; displayName: string; email: string } | null;
 type Phase = 'loading' | 'landing' | 'app';
-type InviteStatus = 'none' | 'checking' | 'guest' | 'auth-only' | 'invalid' | 'unavailable';
+type InviteStatus = 'none' | 'checking' | 'guest' | 'approval' | 'auth-only' | 'invalid' | 'unavailable';
 type InvitePreview = {
   name: string;
   hostedBy: string | null;
@@ -41,6 +41,39 @@ type InvitePreview = {
   createdAt: number;
 };
 type InstallPromptEvent = Event & { prompt: () => Promise<void>; userChoice: Promise<{ outcome: string }> };
+type StoredGuestRequest = { id: string; requestToken: string };
+type ActiveGuestRequest = GuestRequestStatusView & { requestToken: string };
+type GovernanceConfirmation = {
+  patch: Record<string, unknown>;
+  title: string;
+  description: string;
+  confirmLabel: string;
+};
+
+function relativeTime(timestamp: number, locale: Locale, now = Date.now()) {
+  const seconds = Math.round((timestamp - now) / 1000);
+  const formatter = new Intl.RelativeTimeFormat(localeTag(locale), { numeric: 'auto' });
+  if (Math.abs(seconds) < 60) return formatter.format(0, 'minute');
+  const minutes = Math.round(seconds / 60);
+  if (Math.abs(minutes) < 60) return formatter.format(minutes, 'minute');
+  const hours = Math.round(minutes / 60);
+  if (Math.abs(hours) < 24) return formatter.format(hours, 'hour');
+  return formatter.format(Math.round(hours / 24), 'day');
+}
+
+function guestRequestStorageKey(inviteCode: string) {
+  return `net_guest_request:v1:${inviteCode}`;
+}
+
+function readStoredGuestRequest(inviteCode: string): StoredGuestRequest | null {
+  if (!inviteCode || typeof window === 'undefined') return null;
+  try {
+    const value = JSON.parse(localStorage.getItem(guestRequestStorageKey(inviteCode)) ?? 'null') as Partial<StoredGuestRequest> | null;
+    return value && typeof value.id === 'string' && typeof value.requestToken === 'string' ? { id: value.id, requestToken: value.requestToken } : null;
+  } catch {
+    return null;
+  }
+}
 
 class ApiRequestError extends Error {
   constructor(public status: number, message: string, public requestId: string | null = null) {
@@ -169,6 +202,7 @@ const EMOJIS = ['❤️', '👍', '✨', '😂', '👀'];
 type UiIconName = 'arrow' | 'check' | 'close' | 'download' | 'draw' | 'external' | 'group' | 'history' | 'info' | 'install' | 'link' | 'lock' | 'menu' | 'message' | 'more' | 'plus' | 'reply' | 'search' | 'send' | 'user';
 
 function UiIcon({ name, size = 20 }: { name: UiIconName; size?: number }) {
+  const normalizedSize = ([14, 16, 18, 20, 24] as const).reduce((closest, token) => Math.abs(token - size) < Math.abs(closest - size) ? token : closest, 20);
   const paths = {
     arrow: <><path d="M5 12h14" /><path d="m13 6 6 6-6 6" /></>,
     check: <path d="m5 12 4 4L19 6" />,
@@ -191,7 +225,7 @@ function UiIcon({ name, size = 20 }: { name: UiIconName; size?: number }) {
     send: <><path d="m4 4 17 8-17 8 3-8-3-8Z" /><path d="M7 12h14" /></>,
     user: <><circle cx="12" cy="8" r="4" /><path d="M4 21a8 8 0 0 1 16 0" /></>,
   };
-  return <svg aria-hidden="true" viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
+  return <svg aria-hidden="true" viewBox="0 0 24 24" width={normalizedSize} height={normalizedSize} fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
 
 function extractInviteCode(value: string) {
@@ -364,12 +398,15 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const [guestModal, setGuestModal] = useState(false);
   const [guestEndConfirmOpen, setGuestEndConfirmOpen] = useState(false);
   const [guestName, setGuestName] = useState('');
+  const [guestIntroduction, setGuestIntroduction] = useState('');
   const [guestFormError, setGuestFormError] = useState('');
   const [guestErrorField, setGuestErrorField] = useState<'name' | 'form' | null>(null);
   const [guestRecovery, setGuestRecovery] = useState<GuestRecovery | null>(null);
   const [inviteCode, setInviteCode] = useState(() => typeof window === 'undefined' ? '' : new URLSearchParams(window.location.search).get('room') ?? '');
   const [inviteStatus, setInviteStatus] = useState<InviteStatus>(() => typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('room') ? 'checking' : 'none');
   const [invitePreview, setInvitePreview] = useState<InvitePreview | null>(null);
+  const [guestRequest, setGuestRequest] = useState<ActiveGuestRequest | null>(null);
+  const [guestRequestBusy, setGuestRequestBusy] = useState(false);
   const [createRoomOpen, setCreateRoomOpen] = useState(false);
   const [roomName, setRoomName] = useState('');
   const [contactQuery, setContactQuery] = useState('');
@@ -392,6 +429,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   });
   const [viewingMedia, setViewingMedia] = useState<MessageView | null>(null);
   const [photoDraft, setPhotoDraft] = useState<{ file: File; url: string; rotation: 0 | 90 | 180 | 270; crop: PhotoCrop; prompt: string; description: string; purpose: 'creative' | 'reference'; replyToId: string | null } | null>(null);
+  const [photoStep, setPhotoStep] = useState<1 | 2>(1);
   const [lineageViewer, setLineageViewer] = useState<{ messageId: string; lineage: CanvasLineageItem[]; loading: boolean; error: string; truncated: boolean; canDecide: boolean; decisionOwners: Array<{ id: string; displayName: string }> } | null>(null);
   const [downloadingAssetKey, setDownloadingAssetKey] = useState<string | null>(null);
   const [paletteColors, setPaletteColors] = useState<PaletteColorView[]>([]);
@@ -416,6 +454,15 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const [roomPeople, setRoomPeople] = useState<RoomPeopleView | null>(null);
   const [roomPeopleLoading, setRoomPeopleLoading] = useState(false);
   const [peopleSafetyOpen, setPeopleSafetyOpen] = useState(false);
+  const [peopleSafetySection, setPeopleSafetySection] = useState<'people' | 'requests' | 'access' | 'safety'>('people');
+  const [guestRequests, setGuestRequests] = useState<GuestRequestView[]>([]);
+  const [guestRequestsLoading, setGuestRequestsLoading] = useState(false);
+  const [guestRequestActionId, setGuestRequestActionId] = useState<string | null>(null);
+  const [highlightedGuestRequestId, setHighlightedGuestRequestId] = useState<string | null>(null);
+  const [requestClock, setRequestClock] = useState(() => Date.now());
+  const [decliningGuestRequest, setDecliningGuestRequest] = useState<GuestRequestView | null>(null);
+  const [declineReason, setDeclineReason] = useState('');
+  const [governanceConfirmation, setGovernanceConfirmation] = useState<GovernanceConfirmation | null>(null);
   const [reportTarget, setReportTarget] = useState<RoomPersonView | null>(null);
   const [reportMessage, setReportMessage] = useState<MessageView | null>(null);
   const [reportOpen, setReportOpen] = useState(false);
@@ -467,6 +514,12 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const pendingLandingSketchRef = useRef(pendingLandingSketch);
   const skipNextOutboxPersistenceRef = useRef(false);
   const outboxStoragePrefixRef = useRef<string | null>(null);
+  const peopleSafetyOpenRef = useRef(peopleSafetyOpen);
+  const roomCanManageRef = useRef(Boolean(roomPeople?.canManage));
+  const guestRequestHighlightByRoomRef = useRef(new Map<string, string>());
+
+  peopleSafetyOpenRef.current = peopleSafetyOpen;
+  roomCanManageRef.current = Boolean(roomPeople?.canManage);
 
   const activeRoom = rooms.find((room) => room.id === activeRoomId) ?? null;
   const activeRoomUnreadCount = activeRoom?.unreadCount ?? 0;
@@ -629,9 +682,25 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           setPhase('loading');
           setInviteStatus('checking');
           try {
-            const invitation = await api<{ valid: true; guestAllowed: boolean; room?: InvitePreview }>(`/api/invites/${encodeURIComponent(queryInvite)}`, {}, null);
+            const invitation = await api<{ valid: true; guestAllowed: boolean; guestAdmissionPolicy: 'off' | 'approval' | 'link'; room?: InvitePreview }>(`/api/invites/${encodeURIComponent(queryInvite)}`, {}, null);
             setInvitePreview(invitation.room ?? null);
-            setInviteStatus(invitation.guestAllowed ? 'guest' : 'auth-only');
+            const nextInviteStatus = !invitation.guestAllowed || invitation.guestAdmissionPolicy === 'off'
+              ? 'auth-only'
+              : invitation.guestAdmissionPolicy === 'approval' ? 'approval' : 'guest';
+            setInviteStatus(nextInviteStatus);
+            if (nextInviteStatus === 'approval') {
+              const storedRequest = readStoredGuestRequest(queryInvite);
+              if (storedRequest) {
+                try {
+                  const status = await api<GuestRequestStatusView>(`/api/guest-requests/${encodeURIComponent(storedRequest.id)}/status`, { headers: { 'x-net-guest-request': storedRequest.requestToken } }, null);
+                  setGuestName(status.displayName);
+                  setGuestIntroduction(status.introduction ?? '');
+                  setGuestRequest({ ...status, requestToken: storedRequest.requestToken });
+                } catch (requestError) {
+                  if (requestError instanceof ApiRequestError && requestError.status === 404) localStorage.removeItem(guestRequestStorageKey(queryInvite));
+                }
+              }
+            }
           } catch (inviteError) {
             setInvitePreview(null);
             setInviteStatus(inviteError instanceof ApiRequestError && [400, 404].includes(inviteError.status) ? 'invalid' : 'unavailable');
@@ -940,7 +1009,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           socket.send(JSON.stringify({ type: 'authenticate', token: credentials.token }));
         });
         socket.addEventListener('message', (event) => {
-          let frame: { type?: string; event?: string; roomId?: string; payload?: { roomId?: string; guestSessionId?: string; retained?: boolean } };
+          let frame: { type?: string; event?: string; roomId?: string; payload?: { roomId?: string; requestId?: string; guestSessionId?: string; retained?: boolean } };
           try {
             frame = JSON.parse(String(event.data)) as typeof frame;
           } catch {
@@ -957,7 +1026,22 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
             void loadMessages(activeRoomId, true);
             return;
           }
-          if (frame.type !== 'event' || frame.payload?.roomId !== activeRoomRef.current) return;
+          if (frame.type !== 'event' || !frame.payload?.roomId) return;
+          if (frame.event === 'guest.requested' || frame.event === 'guest.request.updated') {
+            if (frame.payload.requestId) guestRequestHighlightByRoomRef.current.set(frame.payload.roomId, frame.payload.requestId);
+            void loadBootstrap();
+            const currentRoom = activeRoomRef.current;
+            if (frame.payload.roomId === currentRoom && currentRoom && peopleSafetyOpenRef.current && roomCanManageRef.current) {
+              void api<{ requests: GuestRequestView[] }>(`/api/rooms/${currentRoom}/guest-requests`)
+                .then((data) => {
+                  setGuestRequests(data.requests);
+                  if (frame.payload?.requestId) setHighlightedGuestRequestId(frame.payload.requestId);
+                })
+                .catch(() => undefined);
+            }
+            return;
+          }
+          if (frame.payload.roomId !== activeRoomRef.current) return;
           if (frame.event === 'guest.ended' && actor?.kind === 'guest' && frame.payload.guestSessionId === actorId) {
             endingGuestRef.current = true;
             clearGuestSession('');
@@ -1158,6 +1242,20 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           if (payload?.roomId === activeRoomRef.current) refreshActiveRoom(payload);
           void loadBootstrap();
         });
+        const refreshGuestAdmission = (payload: { roomId?: string; requestId?: string }) => {
+          if (payload.roomId && payload.requestId) guestRequestHighlightByRoomRef.current.set(payload.roomId, payload.requestId);
+          void loadBootstrap();
+          const currentRoom = activeRoomRef.current;
+          if (!payload?.roomId || payload.roomId !== currentRoom || !currentRoom || !peopleSafetyOpenRef.current || !roomCanManageRef.current) return;
+          void api<{ requests: GuestRequestView[] }>(`/api/rooms/${currentRoom}/guest-requests`)
+            .then((data) => {
+              setGuestRequests(data.requests);
+              if (payload.requestId) setHighlightedGuestRequestId(payload.requestId);
+            })
+            .catch(() => undefined);
+        };
+        socket.on('guest.requested', refreshGuestAdmission);
+        socket.on('guest.request.updated', refreshGuestAdmission);
         socket.on('room.activity', (payload: { roomId?: string }) => {
           if (payload?.roomId === activeRoomRef.current) refreshActiveRoom(payload);
           void loadBootstrap();
@@ -1222,11 +1320,11 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   }, [undoMessage]);
 
   useEffect(() => {
-    if (phase !== 'landing' || (!guestModal && inviteStatus !== 'guest')) return;
+    if (phase !== 'landing' || (!guestModal && !['guest', 'approval'].includes(inviteStatus)) || guestRequest) return;
     if (window.matchMedia('(max-width: 720px)').matches) return;
     const frame = window.requestAnimationFrame(() => guestNameRef.current?.focus());
     return () => window.cancelAnimationFrame(frame);
-  }, [guestModal, inviteStatus, phase]);
+  }, [guestModal, guestRequest, inviteStatus, phase]);
 
   useEffect(() => {
     const generation = ++messageSearchGeneration.current;
@@ -1294,6 +1392,23 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     setBusy(true); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null);
     let sessionId = guestBootstrapSessionRef.current;
     try {
+      if (inviteStatus === 'approval') {
+        const normalizedInviteCode = extractInviteCode(inviteCode);
+        const data = await api<GuestRequestStatusView & { requestToken: string }>(`/api/invites/${encodeURIComponent(normalizedInviteCode)}/guest-requests`, {
+          method: 'POST',
+          body: JSON.stringify({
+            displayName,
+            introduction: guestIntroduction.trim() || undefined,
+            requestToken: guestRequest?.requestToken,
+          }),
+        }, null);
+        const nextRequest = { ...data, requestToken: data.requestToken };
+        setGuestRequest(nextRequest);
+        localStorage.setItem(guestRequestStorageKey(normalizedInviteCode), JSON.stringify({ id: data.id, requestToken: data.requestToken } satisfies StoredGuestRequest));
+        setNotice(t('Request sent. The room owner can now review it.'));
+        setBusy(false);
+        return;
+      }
       if (!sessionId) {
         const normalizedInviteCode = extractInviteCode(inviteCode);
         const data = await api<{ sessionId: string }>('/api/guest', { method: 'POST', body: JSON.stringify({ displayName, inviteCode: normalizedInviteCode || undefined }) }, null);
@@ -1336,6 +1451,65 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       setGuestErrorField('form');
     }
     setBusy(false);
+  };
+
+  const checkGuestRequest = useCallback(async (request: ActiveGuestRequest, announce = false) => {
+    try {
+      const status = await api<GuestRequestStatusView>(`/api/guest-requests/${encodeURIComponent(request.id)}/status`, { headers: { 'x-net-guest-request': request.requestToken } }, null);
+      setGuestRequest({ ...status, requestToken: request.requestToken });
+      if (announce) setNotice(status.status === 'pending' ? t('Your request is still waiting for an owner.') : t('Your join request was updated.'));
+      return status;
+    } catch (requestError) {
+      if (announce) setError(requestError instanceof Error ? requestError.message : t('The join request could not be checked.'));
+      return null;
+    }
+  }, [api, t]);
+
+  useEffect(() => {
+    if (phase !== 'landing' || inviteStatus !== 'approval' || guestRequest?.status !== 'pending') return;
+    const poll = window.setInterval(() => void checkGuestRequest(guestRequest), realtimeConnected ? 20_000 : 12_000);
+    return () => window.clearInterval(poll);
+  }, [checkGuestRequest, guestRequest, inviteStatus, phase, realtimeConnected]);
+
+  const claimApprovedGuestRequest = async () => {
+    if (!guestRequest || guestRequestBusy) return;
+    setGuestRequestBusy(true); setGuestFormError('');
+    try {
+      const data = await api<{ sessionId: string }>(`/api/guest-requests/${encodeURIComponent(guestRequest.id)}/claim`, { method: 'POST', headers: { 'x-net-guest-request': guestRequest.requestToken } }, null);
+      sessionStorage.setItem('net_guest_session', data.sessionId);
+      endingGuestRef.current = false;
+      await loadBootstrap(data.sessionId);
+      setGuestSession(data.sessionId);
+      localStorage.removeItem(guestRequestStorageKey(inviteCode));
+      setGuestRequest(null);
+      consumeInvite();
+      if (pendingLandingSketch) {
+        setStudio({ sourceUrl: pendingLandingSketch, draftSource: true, sourceKind: 'draft' });
+        pendingLandingSketchRef.current = null;
+        setPendingLandingSketch(null);
+      }
+      setNotice(t('You are in. Your 2-hour guest session starts now.'));
+    } catch (claimError) {
+      setGuestFormError(claimError instanceof Error ? claimError.message : t('The approved request could not be claimed.'));
+    } finally {
+      setGuestRequestBusy(false);
+    }
+  };
+
+  const cancelActiveGuestRequest = async () => {
+    if (!guestRequest || guestRequestBusy) return;
+    setGuestRequestBusy(true);
+    try {
+      await api(`/api/guest-requests/${encodeURIComponent(guestRequest.id)}`, { method: 'DELETE', headers: { 'x-net-guest-request': guestRequest.requestToken } }, null);
+      localStorage.removeItem(guestRequestStorageKey(inviteCode));
+      setGuestRequest(null);
+      setGuestIntroduction('');
+      setNotice(t('Join request cancelled.'));
+    } catch (cancelError) {
+      setError(cancelError instanceof Error ? cancelError.message : t('The join request could not be cancelled.'));
+    } finally {
+      setGuestRequestBusy(false);
+    }
   };
 
   const endGuest = async () => {
@@ -1554,6 +1728,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     const file = event.target.files?.[0];
     event.target.value = '';
     if (!file || !activeRoomId) return;
+    setPhotoStep(1);
     setPhotoDraft({ file, url: URL.createObjectURL(file), rotation: 0, crop: 'original', prompt: '', description: '', purpose: 'creative', replyToId: replyTo?.id ?? null });
   };
 
@@ -1562,6 +1737,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       if (current) URL.revokeObjectURL(current.url);
       return null;
     });
+    setPhotoStep(1);
   };
 
   const sendPreparedPhoto = async () => {
@@ -2020,16 +2196,89 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     } catch { setError(t('Your browser blocked clipboard access. Select the invite link and copy it manually.')); }
   };
 
-  const openPeopleSafety = async () => {
-    if (!activeRoomId) return;
+  const openPeopleSafety = async (
+    section: 'people' | 'requests' | 'access' | 'safety' = 'people',
+    targetRoomId = activeRoomId,
+    requestedHighlightId?: string | null,
+  ) => {
+    if (!targetRoomId) return;
+    setInfoOpen(false);
+    setMobileHeaderMenuOpen(false);
     setPeopleSafetyOpen(true);
+    setPeopleSafetySection(section);
+    setHighlightedGuestRequestId(requestedHighlightId ?? guestRequestHighlightByRoomRef.current.get(targetRoomId) ?? null);
     setRoomPeopleLoading(true);
     try {
-      setRoomPeople(await api<RoomPeopleView>(`/api/rooms/${activeRoomId}/people`));
+      const people = await api<RoomPeopleView>(`/api/rooms/${targetRoomId}/people`);
+      setRoomPeople(people);
+      if (people.canManage) {
+        setGuestRequestsLoading(true);
+        const data = await api<{ requests: GuestRequestView[] }>(`/api/rooms/${targetRoomId}/guest-requests`);
+        setGuestRequests(data.requests);
+        if (section === 'requests' && !requestedHighlightId) {
+          setHighlightedGuestRequestId(guestRequestHighlightByRoomRef.current.get(targetRoomId) ?? data.requests.find((request) => request.status === 'pending')?.id ?? data.requests[0]?.id ?? null);
+        }
+      } else setGuestRequests([]);
     } catch (peopleError) {
       setError(peopleError instanceof Error ? peopleError.message : t('People and safety settings could not be loaded.'));
     } finally {
       setRoomPeopleLoading(false);
+      setGuestRequestsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!peopleSafetyOpen || peopleSafetySection !== 'requests') return;
+    const timer = window.setInterval(() => setRequestClock(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, [peopleSafetyOpen, peopleSafetySection]);
+
+  useEffect(() => {
+    if (!peopleSafetyOpen || peopleSafetySection !== 'requests' || !highlightedGuestRequestId || guestRequestsLoading) return;
+    const frame = requestAnimationFrame(() => {
+      const requestCard = document.getElementById(`guest-request-${highlightedGuestRequestId}`);
+      requestCard?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      requestCard?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [guestRequests, guestRequestsLoading, highlightedGuestRequestId, peopleSafetyOpen, peopleSafetySection]);
+
+  const refreshRoomGuestRequests = useCallback(async () => {
+    if (!activeRoomId || !peopleSafetyOpen || !roomPeople?.canManage) return;
+    try {
+      const data = await api<{ requests: GuestRequestView[] }>(`/api/rooms/${activeRoomId}/guest-requests`);
+      setGuestRequests(data.requests);
+    } catch {
+      // The visible queue keeps its last durable state until the next manual action.
+    }
+  }, [activeRoomId, api, peopleSafetyOpen, roomPeople?.canManage]);
+
+  useEffect(() => {
+    if (!peopleSafetyOpen || !roomPeople?.canManage) return;
+    const poll = window.setInterval(() => void refreshRoomGuestRequests(), 12_000);
+    return () => window.clearInterval(poll);
+  }, [peopleSafetyOpen, refreshRoomGuestRequests, roomPeople?.canManage]);
+
+  const decideRoomGuestRequest = async (request: GuestRequestView, decision: 'approve' | 'reject' | 'revoke', reason = '') => {
+    if (!activeRoomId || guestRequestActionId) return;
+    setGuestRequestActionId(request.id);
+    try {
+      await api(`/api/rooms/${activeRoomId}/guest-requests/${encodeURIComponent(request.id)}/${decision}`, {
+        method: 'POST',
+        body: decision === 'reject' ? JSON.stringify({ reason }) : undefined,
+      });
+      if (request.status === 'pending') setRooms((current) => current.map((room) => room.id === activeRoomId ? { ...room, pendingRequestCount: Math.max(0, room.pendingRequestCount - 1) } : room));
+      await refreshRoomGuestRequests();
+      setDecliningGuestRequest(null);
+      setDeclineReason('');
+      setNotice(decision === 'approve'
+        ? t('{name} can now enter the conversation.', { name: request.displayName })
+        : decision === 'revoke' ? t('The admission grant was revoked.') : t('The join request was declined.'));
+    } catch (decisionError) {
+      setError(decisionError instanceof Error ? decisionError.message : t('The join request could not be updated.'));
+      await refreshRoomGuestRequests();
+    } finally {
+      setGuestRequestActionId(null);
     }
   };
 
@@ -2042,18 +2291,6 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       setNotice(result.muted ? t('Conversation muted.') : t('Conversation notifications restored.'));
     } catch (muteError) {
       setError(muteError instanceof Error ? muteError.message : t('The notification preference could not be updated.'));
-    }
-  };
-
-  const revokeRoomInvite = async () => {
-    if (!activeRoomId) return;
-    try {
-      await api(`/api/rooms/${activeRoomId}/invite/revoke`, { method: 'POST' });
-      setRooms((current) => current.map((room) => room.id === activeRoomId ? { ...room, inviteActive: false } : room));
-      setRoomPeople((current) => current ? { ...current, inviteActive: false } : current);
-      setNotice(t('The invite link was revoked. No replacement link is active.'));
-    } catch (revokeError) {
-      setError(revokeError instanceof Error ? revokeError.message : t('The invite link could not be revoked.'));
     }
   };
 
@@ -2108,11 +2345,27 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const updateGovernance = async (patch: Record<string, unknown>) => {
     if (!activeRoomId) return;
     try {
-      const updated = await api<RoomView>(`/api/rooms/${activeRoomId}/governance`, { method: 'PATCH', body: JSON.stringify(patch) });
+      const updated = await api<RoomView & { cancelledRequestCount?: number }>(`/api/rooms/${activeRoomId}/governance`, { method: 'PATCH', body: JSON.stringify(patch) });
       setRooms((current) => current.map((room) => room.id === activeRoomId ? { ...room, ...updated } : room));
-      setRoomPeople((current) => current ? { ...current, allowGuests: updated.allowGuests, inviteActive: updated.inviteActive, inviteExpiresAt: updated.inviteExpiresAt, inviteMaxUses: updated.inviteMaxUses, inviteUseCount: updated.inviteUseCount } : current);
-      setNotice(updated.inviteActive ? t('Guest and invite settings updated.') : t('Guest access is closed.'));
+      setRoomPeople((current) => current ? { ...current, allowGuests: updated.allowGuests, guestAdmissionPolicy: updated.guestAdmissionPolicy, inviteActive: updated.inviteActive, inviteExpiresAt: updated.inviteExpiresAt, inviteMaxUses: updated.inviteMaxUses, inviteUseCount: updated.inviteUseCount } : current);
+      if (updated.cancelledRequestCount) setGuestRequests([]);
+      setNotice(updated.cancelledRequestCount
+        ? t('Settings updated. {count} open requests were cancelled.', { count: updated.cancelledRequestCount })
+        : updated.inviteActive ? t('Guest and invite settings updated.') : t('Guest access is closed.'));
     } catch (governanceError) { setError(governanceError instanceof Error ? governanceError.message : t('Conversation settings could not be updated.')); }
+  };
+
+  const confirmGovernanceChange = (patch: Record<string, unknown>, title: string, confirmLabel: string) => {
+    const pendingCount = guestRequests.filter((request) => request.status === 'pending').length;
+    const approvedCount = guestRequests.filter((request) => request.status === 'approved').length;
+    setGovernanceConfirmation({
+      patch,
+      title,
+      confirmLabel,
+      description: pendingCount || approvedCount
+        ? t('This will cancel {pending} pending requests and revoke {approved} unused approvals.', { pending: pendingCount, approved: approvedCount })
+        : t('This changes how new guests can enter. Existing room content is not removed.'),
+    });
   };
 
   const transferOwnership = async (person: RoomPersonView) => {
@@ -2164,6 +2417,8 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   };
 
   const filteredRooms = rooms.filter((room) => `${room.name} ${room.preview}`.toLocaleLowerCase(localeTag(locale)).includes(roomQuery.trim().toLocaleLowerCase(localeTag(locale))));
+  const pendingGuestRequests = guestRequests.filter((request) => request.status === 'pending');
+  const approvedGuestRequests = guestRequests.filter((request) => request.status === 'approved');
   const selectedContactIds = new Set(selectedContacts.map((contact) => contact.id));
   const normalizedInviteCode = extractInviteCode(inviteCode);
   const inviteSignInPath = normalizedInviteCode
@@ -2181,7 +2436,8 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     && !normalizedMessageQuery
     && (activeRoom?.messageCount ?? messages.length) <= 1
     && messages.every((message) => message.type === 'system');
-  const inviteReady = inviteStatus === 'guest';
+  const inviteApproval = inviteStatus === 'approval';
+  const inviteReady = inviteStatus === 'guest' || inviteApproval;
   const showGuestConversion = actor?.kind === 'guest'
     && messages.some((message) => message.type === 'canvas' && message.guestSessionId === actor.id);
   const guestConversionPath = activeRoom
@@ -2194,22 +2450,31 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     return (
       <><a className="skip-link" href="#main-content">{t('Skip to main content')}</a><main id="main-content" className="landing-page">
         <nav className="landing-nav"><Logo /><div><a href="#how">{t('How It Works')}</a><LanguageSwitcher compact /><a href={inviteStatus === 'invalid' ? homeSignInPath : inviteSignInPath} className="nav-signin">{t('Sign In')}</a></div></nav>
-        <section className={inviteStatus === 'none' ? 'hero first-mark-hero' : 'hero'}>
+        <section className={inviteStatus === 'none' ? 'hero first-mark-hero' : 'hero invite-hero'}>
           <div className="hero-copy">
-            <span className="eyebrow">{inviteReady ? t('Your Invite Is Ready') : inviteStatus === 'auth-only' ? t('Members-Only Invite') : inviteStatus === 'invalid' ? t('Invite Unavailable') : inviteStatus === 'unavailable' ? t('Connection Interrupted') : t('Message with words. Continue with a line.')}</span>
-            <h1>{inviteReady ? <><span>{t('Enter the room,')}</span>{' '}<em>{t('just choose a name.')}</em></> : inviteStatus === 'auth-only' ? <><span>{t('Sign in,')}</span>{' '}<em>{t('then join instantly.')}</em></> : inviteStatus === 'invalid' ? <><span>{t('This invite link')}</span>{' '}<em>{t('is no longer active.')}</em></> : inviteStatus === 'unavailable' ? <><span>{t('We cannot check')}</span>{' '}<em>{t('your invite yet.')}</em></> : <><span>{t('Some things are')}</span>{' '}<em>{t('easier to draw than say.')}</em></>}</h1>
-            <p>{inviteReady ? t('No room search or code entry. Choose a display name, then start chatting and drawing together.') : inviteStatus === 'auth-only' ? t('This room does not accept guests. After you sign in, Nét will take you directly to the conversation.') : inviteStatus === 'invalid' ? t('The invite may have expired or the room may no longer exist. Ask the sender for a new link.') : inviteStatus === 'unavailable' ? t('Nét cannot verify this link while the connection is interrupted. Your invite stays intact so you can try again.') : t('Nét is a messenger for unfinished ideas—send text, images, or a canvas that someone else can continue as a new version.')}</p>
+            <span className="eyebrow">{inviteApproval ? t('Private Room Invite') : inviteReady ? t('Your Invite Is Ready') : inviteStatus === 'auth-only' ? t('Members-Only Invite') : inviteStatus === 'invalid' ? t('Invite Unavailable') : inviteStatus === 'unavailable' ? t('Connection Interrupted') : t('Message with words. Continue with a line.')}</span>
+            <h1>{inviteApproval ? <><span>{guestRequest?.status === 'approved' ? t('You are approved,') : t('Ask to join,')}</span>{' '}<em>{guestRequest?.status === 'approved' ? t('then enter when ready.') : t('keep creating while you wait.')}</em></> : inviteReady ? <><span>{t('Enter the room,')}</span>{' '}<em>{t('just choose a name.')}</em></> : inviteStatus === 'auth-only' ? <><span>{t('Sign in,')}</span>{' '}<em>{t('then join instantly.')}</em></> : inviteStatus === 'invalid' ? <><span>{t('This invite link')}</span>{' '}<em>{t('is no longer active.')}</em></> : inviteStatus === 'unavailable' ? <><span>{t('We cannot check')}</span>{' '}<em>{t('your invite yet.')}</em></> : <><span>{t('Some things are')}</span>{' '}<em>{t('easier to draw than say.')}</em></>}</h1>
+            <p>{inviteApproval ? guestRequest?.status === 'approved' ? t('Enter when you are ready. Your guest timer has not started yet.') : t('The room stays private until an owner approves you. Your 2-hour guest session starts only when you enter.') : inviteReady ? t('No room search or code entry. Choose a display name, then start chatting and drawing together.') : inviteStatus === 'auth-only' ? t('This room does not accept guests. After you sign in, Nét will take you directly to the conversation.') : inviteStatus === 'invalid' ? t('The invite may have expired or the room may no longer exist. Ask the sender for a new link.') : inviteStatus === 'unavailable' ? t('Nét cannot verify this link while the connection is interrupted. Your invite stays intact so you can try again.') : t('Nét is a messenger for unfinished ideas—send text, images, or a canvas that someone else can continue as a new version.')}</p>
             {inviteReady ? <section className="invite-join-panel" aria-labelledby="invite-join-title">
               <InviteContext preview={invitePreview} />
-              <div className="invite-join-status"><span><UiIcon name="check" /></span><div><strong id="invite-join-title">{t('Join the creative thread')}</strong><small>{t('Your invite link has been verified.')}</small></div></div>
-              <form className="invite-join-form" onSubmit={startGuest} noValidate>
-                <label>{t('Display Name')}<input ref={guestNameRef} name="guest-invite-name" autoComplete="nickname" value={guestName} onChange={(event) => { setGuestName(event.target.value); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null); }} placeholder={t('For example, Alex…')} maxLength={60} aria-invalid={guestErrorField === 'name'} aria-describedby={guestFormError ? 'guest-form-error' : undefined} /></label>
-                <button type="submit" className="hero-primary" disabled={busy}>{busy ? t('Joining…') : <>{guestRecovery ? t('Try Again') : t('Join Room')} <UiIcon name="arrow" size={18} /></>}</button>
-              </form>
+              {inviteApproval && guestRequest ? <div className={`guest-request-state ${guestRequest.status}`}>
+                <div className="invite-join-status"><span><UiIcon name={guestRequest.status === 'approved' ? 'check' : guestRequest.status === 'pending' ? 'history' : 'info'} /></span><div><strong id="invite-join-title">{guestRequest.status === 'approved' ? t('Your Request Was Approved') : guestRequest.status === 'pending' ? t('Request Sent') : guestRequest.status === 'rejected' ? t('Your Request Was Not Approved') : t('This Request Is No Longer Active')}</strong><small>{guestRequest.status === 'approved' ? t('Enter when you are ready. Your guest timer has not started yet.') : guestRequest.status === 'pending' ? t('An owner must approve your request before room content becomes visible.') : t('Ask the sender for a new invitation or sign in.')}</small></div></div>
+                <dl><div><dt>{t('Requested')}</dt><dd>{new Intl.DateTimeFormat(localeTag(locale), { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(guestRequest.requestedAt))}</dd></div><div><dt>{guestRequest.status === 'approved' ? t('Enter Before') : t('Request Expires')}</dt><dd>{new Intl.DateTimeFormat(localeTag(locale), { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(guestRequest.grantExpiresAt ?? guestRequest.expiresAt))}</dd></div></dl>
+                {guestRequest.status === 'rejected' && guestRequest.decisionReason ? <p className="guest-decision-reason"><strong>{t('A note from the owner')}</strong>{guestRequest.decisionReason}</p> : null}
+                {guestRequest.status === 'approved' ? <button type="button" className="hero-primary" onClick={() => void claimApprovedGuestRequest()} disabled={guestRequestBusy}>{guestRequestBusy ? t('Entering…') : <>{pendingLandingSketch ? t('Enter Room & Continue Drawing') : t('Enter {room}', { room: guestRequest.room.name })} <UiIcon name="arrow" size={18} /></>}</button> : null}
+                {guestRequest.status === 'pending' ? <div className="guest-request-actions"><button type="button" className="hero-primary" onClick={() => void checkGuestRequest(guestRequest, true)} disabled={guestRequestBusy}>{t('Check Again')}</button><button type="button" onClick={() => void cancelActiveGuestRequest()} disabled={guestRequestBusy}>{t('Cancel Request')}</button></div> : guestRequest.status === 'approved' ? <div className="invite-join-alternatives"><a href={inviteSignInPath}>{t('Sign In')}</a><button type="button" onClick={() => void cancelActiveGuestRequest()} disabled={guestRequestBusy}>{t('Cancel Request')}</button></div> : <div className="invite-join-alternatives"><a href={inviteSignInPath}>{t('Sign In')}</a><button type="button" onClick={() => { localStorage.removeItem(guestRequestStorageKey(inviteCode)); setGuestRequest(null); }}>{t('Request Again')}</button></div>}
+              </div> : <>
+                <div className="invite-join-status"><span><UiIcon name={inviteApproval ? 'lock' : 'check'} /></span><div><strong id="invite-join-title">{inviteApproval ? t('Request to Join') : t('Join the creative thread')}</strong><small>{inviteApproval ? t('No messages or artwork are shared before approval.') : t('Your invite link has been verified.')}</small></div></div>
+                <form className="invite-join-form" onSubmit={startGuest} noValidate>
+                  <label>{t('Display Name')}<input ref={guestNameRef} name="guest-invite-name" autoComplete="nickname" value={guestName} onChange={(event) => { setGuestName(event.target.value); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null); }} placeholder={t('For example, Alex…')} maxLength={60} aria-invalid={guestErrorField === 'name'} aria-describedby={guestFormError ? 'guest-form-error' : undefined} /></label>
+                  {inviteApproval ? <label>{t('Short Introduction')} <small>{t('(optional)')}</small><textarea name="guest-introduction" autoComplete="off" value={guestIntroduction} onChange={(event) => setGuestIntroduction(event.target.value)} maxLength={280} placeholder={t('How do you know the team, or what would you like to contribute?')} /></label> : null}
+                  <button type="submit" className="hero-primary" disabled={busy}>{busy ? t(inviteApproval ? 'Sending Request…' : 'Joining…') : <>{guestRecovery ? t('Try Again') : t(inviteApproval ? 'Request to Join' : 'Join Room')} <UiIcon name="arrow" size={18} /></>}</button>
+                </form>
+              </>}
               {guestFormError && <p id="guest-form-error" className="form-error" role="alert" aria-live="polite">{guestFormError}</p>}
               {guestRecovery ? <GuestRecoveryPanel recovery={guestRecovery} hasDrawing={false} /> : null}
-              <div className="invite-join-alternatives"><a href={inviteSignInPath}>{t('Sign In to Join')}</a><button type="button" onClick={() => { consumeInvite(); setGuestFormError(''); setGuestErrorField(null); }}>{t('Back Home')}</button></div>
-              <small>{t('Guests lose access when their session ends. Messages and attached images remain in the room.')}</small>
+              {!guestRequest ? <div className="invite-join-alternatives"><a href={inviteSignInPath}>{inviteApproval ? t('Sign In to Join Directly') : t('Sign In to Join')}</a><button type="button" onClick={() => { consumeInvite(); setGuestFormError(''); setGuestErrorField(null); }}>{t('Back Home')}</button></div> : null}
+              <small>{inviteApproval ? t('Signed-in people join directly. Guest approval applies only to this temporary session.') : t('Guests lose access when their session ends. Messages and attached images remain in the room.')}</small>
             </section> : inviteStatus === 'auth-only' ? <section className="invite-join-panel invite-state-panel" aria-labelledby="invite-auth-title">
               <InviteContext preview={invitePreview} />
               <div className="invite-join-status"><span><UiIcon name="user" /></span><div><strong id="invite-auth-title">{t('This Room Is for Signed-In Members')}</strong><small>{t('The invite is valid and ready.')}</small></div></div>
@@ -2227,7 +2492,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
               <small>{t('Draw first · choose a name only when you are ready to send')}</small>
             </>}
           </div>
-          {inviteStatus === 'none' ? <LandingDoodle onUse={(dataUrl) => { setPendingLandingSketch(dataUrl); setError(''); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null); setGuestModal(true); }} /> : <div className="hero-demo" aria-label={t('Example conversation with messages and drawings')}>
+          {inviteStatus === 'none' || (inviteApproval && guestRequest?.status === 'pending') ? <LandingDoodle onUse={(dataUrl) => { setPendingLandingSketch(dataUrl); setNotice(t('Your drawing is saved on this device while you wait.')); if (inviteStatus === 'none') { setError(''); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null); setGuestModal(true); } }} /> : <div className="hero-demo" aria-label={t('Example conversation with messages and drawings')}>
             <div className="demo-top"><span className="avatar" style={avatarStyle('minh')}>M</span><div><strong>Minh Anh</strong><small><i /> {t('drawing with you')}</small></div><b>•••</b></div>
             <div className="demo-canvas"><span className="demo-sun" /><span className="demo-line line-a" /><span className="demo-line line-b" /><strong>{t('Could we add')}<br />{t('a tree here?')}</strong><i>↙</i></div>
             <div className="demo-message">{t('I’ll continue this idea')} ✨</div>
@@ -2241,7 +2506,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
         </section>
         <AppDialog open={guestModal} onClose={() => { setGuestModal(false); if (!guestRecovery) setPendingLandingSketch(null); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null); }} labelledBy="guest-dialog-title" describedBy="guest-dialog-description">
             <form className="dialog-card guest-dialog" onSubmit={startGuest} noValidate>
-              <button type="button" className="dialog-close" onClick={() => { setGuestModal(false); if (!guestRecovery) setPendingLandingSketch(null); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null); }} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below">×</button>
+              <button type="button" className="dialog-close" onClick={() => { setGuestModal(false); if (!guestRecovery) setPendingLandingSketch(null); setGuestFormError(''); setGuestErrorField(null); setGuestRecovery(null); }} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below"><UiIcon name="close" size={18} /></button>
               <span className="eyebrow">{t('Guest Session')}</span><h2 id="guest-dialog-title">{t('What Should We Call You?')}</h2>
               <p id="guest-dialog-description">{t('Choose a name so people can recognize you in the conversation.')}</p>
               {pendingLandingSketch ? <figure className="guest-mark-preview"><Image src={pendingLandingSketch} width={900} height={540} unoptimized alt={t('Preview of your first mark')} /><figcaption><UiIcon name="draw" size={16} /><span><strong>{t('Your first mark is ready')}</strong><small>{t('Choose a name, then continue it in Studio.')}</small></span></figcaption></figure> : null}
@@ -2266,7 +2531,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
         <label className="product-search"><UiIcon name="search" size={17} /><input name="room-search" type="search" autoComplete="off" value={roomQuery} onChange={(event) => setRoomQuery(event.target.value)} placeholder={t('Search conversations…')} aria-label={t('Search conversations')} /></label>
         <div className="sidebar-label"><span>{t('Recent')}</span><small>{t('{count} conversations', { count: rooms.length })}</small></div>
         <div className="room-list">
-          {filteredRooms.map((room) => <button type="button" key={room.id} className={room.id === activeRoomId ? 'room-item active' : 'room-item'} onClick={() => selectRoom(room.id)}><span className="avatar" style={avatarStyle(room.name)}>{room.name.slice(0, 1)}</span><span><strong>{room.name}</strong><small>{room.preview}</small></span><span className="room-meta"><time>{timeLabel(room.lastActivity, locale)}</time>{room.unreadCount > 0 && <b aria-label={t('{count} unread messages', { count: room.unreadCount })}>{Math.min(room.unreadCount, 99)}</b>}</span></button>)}
+          {filteredRooms.map((room) => <div key={room.id} className={room.id === activeRoomId ? 'room-item-row active' : 'room-item-row'}><button type="button" className="room-item" onClick={() => selectRoom(room.id)}><span className="avatar" style={avatarStyle(room.name)}>{room.name.slice(0, 1)}</span><span><strong>{room.name}</strong><small>{room.preview}</small></span><span className="room-meta"><time>{timeLabel(room.lastActivity, locale)}</time>{room.unreadCount > 0 ? <b aria-label={t('{count} unread messages', { count: room.unreadCount })}>{Math.min(room.unreadCount, 99)}</b> : null}</span></button>{room.pendingRequestCount > 0 ? <button type="button" className="room-request-shortcut" aria-label={t('Open {count} join requests for {room}', { count: room.pendingRequestCount, room: room.name })} onClick={() => { selectRoom(room.id); setSidebarOpen(false); void openPeopleSafety('requests', room.id, guestRequestHighlightByRoomRef.current.get(room.id)); }}><UiIcon name="group" size={15} /><span>{Math.min(room.pendingRequestCount, 99)}</span></button> : null}</div>)}
           {!filteredRooms.length && !roomQuery.trim() && <p className="empty-copy">{t('No conversations yet.')}</p>}
           {!filteredRooms.length && roomQuery.trim() && <p className="empty-copy">{t('No conversations found. Start a new conversation to find people.')}</p>}
         </div>
@@ -2287,6 +2552,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
                 {activeRoom.kind !== 'direct' && <button type="button" className={showInviteOnboarding ? 'invite-header-action contextual' : 'invite-header-action'} onClick={() => void copyInvite()} aria-label={t('Copy invite link')} data-tooltip={t('Invite by Link')} data-tooltip-placement="below"><UiIcon name="link" size={17} /><span>{t('Invite')}</span></button>}
                 {installPrompt && <button type="button" className="install-header-action" onClick={() => { void installPrompt.prompt(); setInstallPrompt(null); }} aria-label={t('Install App')} data-tooltip={t('Install App')} data-tooltip-placement="below"><UiIcon name="install" size={18} /></button>}
                 <button type="button" className="desktop-header-action" onClick={() => setMessageQuery((value) => value ? '' : ' ')} aria-label={t('Search messages')} data-tooltip={t('Search Messages')} data-tooltip-placement="below"><UiIcon name="search" size={18} /></button>
+                {activeRoom.pendingRequestCount > 0 ? <button type="button" className="request-queue-action request-aware-action" onClick={() => void openPeopleSafety('requests', activeRoom.id, guestRequestHighlightByRoomRef.current.get(activeRoom.id))} aria-label={t('Open {count} join requests', { count: activeRoom.pendingRequestCount })} data-tooltip={t('Join Requests')} data-tooltip-placement="below"><UiIcon name="group" size={17} /><span className="header-request-badge" aria-hidden="true">{Math.min(activeRoom.pendingRequestCount, 99)}</span></button> : null}
                 <button type="button" className="desktop-header-action" onClick={() => setInfoOpen((value) => !value)} aria-label={t('Conversation details')} data-tooltip={t('Details')} data-tooltip-placement="below"><UiIcon name="info" size={18} /></button>
                 <button ref={mobileHeaderMenuTriggerRef} type="button" className="mobile-header-overflow-trigger" onClick={() => setMobileHeaderMenuOpen((value) => !value)} aria-label={t('More conversation actions')} aria-expanded={mobileHeaderMenuOpen} aria-controls="mobile-header-actions"><UiIcon name="more" size={20} /></button>
               </div>
@@ -2372,14 +2638,14 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
               <input ref={replaceFileRef} hidden name="replace-outbox-image" aria-label={t('Replacement image file')} type="file" accept="image/png,image/jpeg,image/gif,image/webp" onChange={(event) => void replacePendingMedia(event)} />
               <p><kbd>Enter</kbd> {t('send')} · <kbd>Shift</kbd> + <kbd>Enter</kbd> {t('new line')} · {t('images up to 8 MB')}</p>
             </footer>
-            <AppDialog open={infoOpen} onClose={() => setInfoOpen(false)} labelledBy="conversation-details-title" describedBy="conversation-details-description" className="details-backdrop"><aside className="info-drawer"><button type="button" className="dialog-close" onClick={() => setInfoOpen(false)} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below">×</button><span className="avatar info-avatar" style={avatarStyle(activeRoom.name)}>{activeRoom.name.slice(0, 1)}</span><h2 id="conversation-details-title">{activeRoom.name}</h2><p id="conversation-details-description">{t('A space to continue ideas with words and drawings.')}</p><div className="info-stats"><span><strong>{activeRoom.messageCount ?? messages.length}</strong><small>{t('Messages')}</small></span><span><strong>{activeRoom.mediaCount ?? messages.filter((item) => item.assetKey).length}</strong><small>{t('Images & Drawings')}</small></span></div>{activeRoom.kind !== 'direct' && <><label>{t('Invite Link')}<input name="invite-link" readOnly value={`${typeof window !== 'undefined' ? window.location.origin : ''}/?room=${activeRoom.inviteCode}`} /></label><button type="button" className="primary-button wide" onClick={() => void copyInvite()}>{t('Copy Invite Link')}</button></>}<button type="button" className="secondary-button wide people-safety-entry" onClick={() => void openPeopleSafety()}><UiIcon name="group" size={18} /> {t('People & Safety')}</button><small className="privacy-note"><UiIcon name="lock" size={15} /> {t('Signed-in members keep access long term. Guest messages and attached images remain after they leave.')}</small></aside></AppDialog>
+            <AppDialog open={infoOpen} onClose={() => setInfoOpen(false)} labelledBy="conversation-details-title" describedBy="conversation-details-description" className="details-backdrop"><aside className="info-drawer"><button type="button" className="dialog-close" onClick={() => setInfoOpen(false)} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below"><UiIcon name="close" size={18} /></button><span className="avatar info-avatar" style={avatarStyle(activeRoom.name)}>{activeRoom.name.slice(0, 1)}</span><h2 id="conversation-details-title">{activeRoom.name}</h2><p id="conversation-details-description">{t('A space to continue ideas with words and drawings.')}</p><div className="info-stats"><span><strong>{activeRoom.messageCount ?? messages.length}</strong><small>{t('Messages')}</small></span><span><strong>{activeRoom.mediaCount ?? messages.filter((item) => item.assetKey).length}</strong><small>{t('Images & Drawings')}</small></span></div>{activeRoom.kind !== 'direct' && (activeRoom.inviteActive ? <><label>{t('Invite Link')}<input name="invite-link" readOnly value={`${typeof window !== 'undefined' ? window.location.origin : ''}/?room=${activeRoom.inviteCode}`} /></label><button type="button" className="primary-button wide" onClick={() => void copyInvite()}>{t('Copy Invite Link')}</button></> : <div className="invite-revoked-state"><UiIcon name="link" size={20} /><div><strong>{t('Invite Revoked')}</strong><small>{t('This old link cannot admit anyone. Create a new invite from Access settings.')}</small></div><button type="button" onClick={() => void openPeopleSafety('access')}>{t('Open Access Settings')}</button></div>)}<button type="button" className="secondary-button wide people-safety-entry" onClick={() => void openPeopleSafety()}><UiIcon name="group" size={18} /> {t('People & Safety')}{activeRoom.pendingRequestCount ? <span>{t('{count} requests', { count: activeRoom.pendingRequestCount })}</span> : null}</button><small className="privacy-note"><UiIcon name="lock" size={15} /> {t('Signed-in members keep access long term. Guest messages and attached images remain after they leave.')}</small></aside></AppDialog>
           </>
         ) : <div className="no-room"><Logo /><h1>{t('No Conversations Yet')}</h1><p>{actor?.kind === 'user' ? t('Find someone to message or create a new group.') : t('This invite link is no longer active.')}</p>{actor?.kind === 'user' && <button type="button" className="primary-button" onClick={() => openConversationStarter()}>{t('Start a Conversation')}</button>}</div>}
       </main>
 
       <AppDialog open={createRoomOpen} onClose={resetConversationStarter} labelledBy="create-room-title" describedBy="create-room-description">
         <section className="dialog-card conversation-starter">
-          <button type="button" className="dialog-close" onClick={resetConversationStarter} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below">×</button>
+          <button type="button" className="dialog-close" onClick={resetConversationStarter} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below"><UiIcon name="close" size={18} /></button>
           <span className="eyebrow">{t('Quick Connect')}</span>
           <h2 id="create-room-title">{t('Start a Conversation')}</h2>
           <p id="create-room-description">{t('Choose people first. One person starts a direct chat; two or more creates a group.')}</p>
@@ -2395,50 +2661,108 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           </form>
         </section>
       </AppDialog>
-      <AppDialog open={Boolean(photoDraft)} onClose={closePhotoDraft} labelledBy="photo-preparation-title" describedBy="photo-preparation-description">
+      <AppDialog open={Boolean(photoDraft)} onClose={closePhotoDraft} labelledBy="photo-preparation-title" describedBy="photo-preparation-description" className="photo-workspace-backdrop">
         <section className="dialog-card photo-preparation-dialog">
-          <button type="button" className="dialog-close" onClick={closePhotoDraft} aria-label={t('Close')}>×</button>
-          <span className="eyebrow">{t('Prepare Photo')}</span>
-          <h2 id="photo-preparation-title">{t('Frame the idea before sharing')}</h2>
-          <p id="photo-preparation-description">{t('Preview the photo, choose how the team should use it, then send when it is ready.')}</p>
+          <div className="photo-preparation-content">
+          <button type="button" className="dialog-close" onClick={closePhotoDraft} aria-label={t('Close')}><UiIcon name="close" size={18} /></button>
+          <h2 id="photo-preparation-title">{t('Prepare Photo')}</h2>
+          <p id="photo-preparation-description">{t('Keep the artwork visible while choosing how teammates can use it.')}</p>
           {photoDraft ? <>
-            <div className={`photo-stage crop-${photoDraft.crop}`}>
-              {/* Local object URLs are intentionally previewed without optimization. */}
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={photoDraft.url} alt="" style={{ transform: `rotate(${photoDraft.rotation}deg)` }} />
+            <ol className="photo-progress" aria-label={t('Photo preparation progress')}><li className={photoStep === 1 ? 'active' : 'complete'}><span>1</span><strong>{t('Frame')}</strong></li><li className={photoStep === 2 ? 'active' : ''}><span>2</span><strong>{t('Share')}</strong></li></ol>
+            {photoStep === 1 ? <>
+              <div className="photo-step-heading"><strong>{t('Frame')}</strong><small>{t('Rotate or crop the photo.')}</small></div>
+              <div className={`photo-stage crop-${photoDraft.crop}`}>
+                {/* Local object URLs are intentionally previewed without optimization. */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={photoDraft.url} alt="" style={{ transform: `rotate(${photoDraft.rotation}deg)` }} />
+              </div>
+              <div className="photo-edit-controls" role="group" aria-label={t('Photo framing controls')}>
+                <button type="button" onClick={() => setPhotoDraft((current) => current ? { ...current, rotation: ((current.rotation + 270) % 360) as 0 | 90 | 180 | 270 } : current)}>{t('Rotate Left')}</button>
+                <button type="button" onClick={() => setPhotoDraft((current) => current ? { ...current, rotation: ((current.rotation + 90) % 360) as 0 | 90 | 180 | 270 } : current)}>{t('Rotate Right')}</button>
+                <label>{t('Crop')}<select value={photoDraft.crop} onChange={(event) => setPhotoDraft((current) => current ? { ...current, crop: event.target.value as PhotoCrop } : current)}><option value="original">{t('Original')}</option><option value="square">{t('Square')}</option><option value="landscape">{t('Landscape')}</option><option value="portrait">{t('Portrait')}</option></select></label>
+              </div>
+            </> : <>
+              <div className="photo-step-heading"><strong>{t('Share')}</strong><small>{t('Choose whether this starts a visual branch.')}</small></div>
+              <figure className={`photo-share-preview crop-${photoDraft.crop}`}>
+                {/* Local object URLs cannot be delegated to the Next image optimizer. */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={photoDraft.url} alt="" style={{ transform: `rotate(${photoDraft.rotation}deg)` }} /><figcaption>{photoDraft.file.name}</figcaption>
+              </figure>
+              <fieldset className="photo-purpose"><legend>{t('How should the team use this photo?')}</legend><label><input type="radio" name="photo-purpose" value="creative" checked={photoDraft.purpose === 'creative'} onChange={() => setPhotoDraft((current) => current ? { ...current, purpose: 'creative' } : current)} /><span><strong>{t('Use as Creative Source')}</strong><small>{t('Recommended · teammates can continue it as a new branch.')}</small></span></label><label><input type="radio" name="photo-purpose" value="reference" checked={photoDraft.purpose === 'reference'} onChange={() => setPhotoDraft((current) => current ? { ...current, purpose: 'reference' } : current)} /><span><strong>{t('Attach as Reference')}</strong><small>{t('Share it for context without starting a visual branch.')}</small></span></label></fieldset>
+              <details className="photo-details"><summary>{t('Details & Accessibility')} <span>{t('Optional')}</span></summary><div><label>{t('What should the team explore?')}<textarea value={photoDraft.prompt} onChange={(event) => setPhotoDraft((current) => current ? { ...current, prompt: event.target.value } : current)} maxLength={2000} placeholder={t('Example: explore a softer shape and warmer color palette…')} /></label><label>{t('Accessible Image Description')}<textarea value={photoDraft.description} onChange={(event) => setPhotoDraft((current) => current ? { ...current, description: event.target.value } : current)} maxLength={500} placeholder={t('Describe the important visual content for people who cannot see it.')} /></label></div></details>
+            </>}
+          </> : null}
+          </div>
+          {photoDraft ? <div className="confirmation-actions photo-send-actions">{photoStep === 1 ? <><button type="button" onClick={closePhotoDraft}>{t('Cancel')}</button><button type="button" className="primary-button" onClick={() => setPhotoStep(2)}>{t('Next: Share')}</button></> : <><button type="button" onClick={() => setPhotoStep(1)}>{t('Back to Frame')}</button><button type="button" className="primary-button" onClick={() => void sendPreparedPhoto()} disabled={busy}>{busy ? t('Preparing…') : t('Send Photo')}</button></>}</div> : null}
+        </section>
+      </AppDialog>
+      <AppDialog open={peopleSafetyOpen} onClose={() => { setPeopleSafetyOpen(false); setReportOpen(false); setReportTarget(null); }} labelledBy="people-safety-title" describedBy="people-safety-description" className="management-backdrop">
+        <section className="dialog-card people-safety-dialog">
+          <button type="button" className="dialog-close" onClick={() => setPeopleSafetyOpen(false)} aria-label={t('Close')}><UiIcon name="close" size={18} /></button>
+          <span className="eyebrow">{t('Conversation Controls')}</span>
+          <h2 id="people-safety-title">{t('People & Safety')}</h2>
+          <p id="people-safety-description">{t('See who is here, review access requests, and keep this conversation safe.')}</p>
+          {roomPeopleLoading ? <div className="people-safety-loading" role="status">{t('Loading people…')}</div> : null}
+          {roomPeople ? <>
+            <div className="people-safety-tabs" role="tablist" aria-label={t('Conversation control sections')}>
+              <button type="button" role="tab" aria-selected={peopleSafetySection === 'people'} onClick={() => setPeopleSafetySection('people')}>{t('People')} <span>{roomPeople.members.length}</span></button>
+              {roomPeople.canManage && roomPeople.kind !== 'direct' ? <button type="button" role="tab" aria-selected={peopleSafetySection === 'requests'} onClick={() => setPeopleSafetySection('requests')}>{t('Requests')} {guestRequests.length ? <span>{guestRequests.filter((request) => request.status === 'pending').length}</span> : null}</button> : null}
+              {roomPeople.kind !== 'direct' ? <button type="button" role="tab" aria-selected={peopleSafetySection === 'access'} onClick={() => setPeopleSafetySection('access')}>{t('Access & Invites')}</button> : null}
+              <button type="button" role="tab" aria-selected={peopleSafetySection === 'safety'} onClick={() => setPeopleSafetySection('safety')}>{t('Safety')}</button>
             </div>
-            <div className="photo-edit-controls" role="group" aria-label={t('Photo framing controls')}>
-              <button type="button" onClick={() => setPhotoDraft((current) => current ? { ...current, rotation: ((current.rotation + 270) % 360) as 0 | 90 | 180 | 270 } : current)}>{t('Rotate Left')}</button>
-              <button type="button" onClick={() => setPhotoDraft((current) => current ? { ...current, rotation: ((current.rotation + 90) % 360) as 0 | 90 | 180 | 270 } : current)}>{t('Rotate Right')}</button>
-              <label>{t('Crop')}<select value={photoDraft.crop} onChange={(event) => setPhotoDraft((current) => current ? { ...current, crop: event.target.value as PhotoCrop } : current)}><option value="original">{t('Original')}</option><option value="square">{t('Square')}</option><option value="landscape">{t('Landscape')}</option><option value="portrait">{t('Portrait')}</option></select></label>
-            </div>
-            <fieldset className="photo-purpose"><legend>{t('How should the team use this photo?')}</legend><label><input type="radio" name="photo-purpose" value="creative" checked={photoDraft.purpose === 'creative'} onChange={() => setPhotoDraft((current) => current ? { ...current, purpose: 'creative' } : current)} /><span><strong>{t('Use as Creative Source')}</strong><small>{t('Teammates can continue this photo in Studio.')}</small></span></label><label><input type="radio" name="photo-purpose" value="reference" checked={photoDraft.purpose === 'reference'} onChange={() => setPhotoDraft((current) => current ? { ...current, purpose: 'reference' } : current)} /><span><strong>{t('Attach as Reference')}</strong><small>{t('Share it for context without starting a visual branch.')}</small></span></label></fieldset>
-            <label>{t('What should the team explore?')} <small>{t('(optional)')}</small><textarea value={photoDraft.prompt} onChange={(event) => setPhotoDraft((current) => current ? { ...current, prompt: event.target.value } : current)} maxLength={2000} placeholder={t('Example: explore a softer shape and warmer color palette…')} /></label>
-            <label>{t('Accessible Image Description')} <small>{t('(optional)')}</small><textarea value={photoDraft.description} onChange={(event) => setPhotoDraft((current) => current ? { ...current, description: event.target.value } : current)} maxLength={500} placeholder={t('Describe the important visual content for people who cannot see it.')} /></label>
-            <div className="confirmation-actions photo-send-actions"><button type="button" onClick={closePhotoDraft}>{t('Cancel')}</button><button type="button" className="primary-button" onClick={() => void sendPreparedPhoto()} disabled={busy}>{busy ? t('Preparing…') : t('Send Photo')}</button></div>
+
+            {peopleSafetySection === 'people' ? <div className="people-safety-section" role="tabpanel">
+              <section className="people-list" aria-labelledby="people-list-title"><div className="people-list-heading"><h3 id="people-list-title">{t('People')}</h3><span>{roomPeople.members.length}</span></div>{roomPeople.members.map((person) => { const self = person.kind === actor?.kind && person.id === actor?.id; return <article key={`${person.kind}:${person.id}`}><span className="avatar" style={person.avatarColor ? { '--avatar': person.avatarColor } as CSSProperties : avatarStyle(person.displayName)}>{person.displayName.slice(0, 1)}</span><span><strong>{person.displayName}{self ? ` · ${t('You')}` : ''}</strong><small>{person.role === 'owner' ? t('Owner') : person.role === 'guest' ? t('Guest') : t('Member')}</small></span>{!self ? <details className="person-action-menu"><summary aria-label={t('Actions for {name}', { name: person.displayName })}><UiIcon name="more" size={19} /></summary><div><button type="button" onClick={() => { setReportTarget(person); setReportOpen(true); }}>{t('Report')}</button>{actor?.kind === 'user' && person.kind === 'user' ? <button type="button" onClick={() => setSafetyAction({ kind: 'block', person })}>{t('Block')}</button> : null}{roomPeople.canManage && person.kind === 'user' && person.role === 'member' ? <><button type="button" onClick={() => void transferOwnership(person)}>{t('Make Owner')}</button><button type="button" className="destructive-action" onClick={() => setSafetyAction({ kind: 'remove', person })}>{t('Remove')}</button></> : null}{roomPeople.canManage && person.kind === 'guest' ? <button type="button" className="destructive-action" onClick={() => void removeRoomGuest(person)}>{t('End Guest Access')}</button> : null}</div></details> : null}</article>; })}</section>
+            </div> : null}
+
+            {peopleSafetySection === 'requests' && roomPeople.canManage ? <section className="people-safety-section join-request-queue" role="tabpanel" aria-labelledby="join-requests-title">
+              <div className="section-heading"><div><span className="eyebrow">{t('Admission')}</span><h3 id="join-requests-title">{t('Join Requests')}</h3></div><small role="status" aria-live="polite">{t('{count} waiting for review', { count: pendingGuestRequests.length })}</small></div>
+              {guestRequestsLoading ? <div role="status">{t('Loading requests…')}</div> : guestRequests.length ? ([
+                { key: 'pending', title: t('Waiting for Review'), description: t('These people cannot see room content yet.'), items: pendingGuestRequests },
+                { key: 'approved', title: t('Approved · Waiting to Enter'), description: t('Their temporary session begins only when they enter.'), items: approvedGuestRequests },
+              ] as const).map((group) => group.items.length ? <section className="request-group" key={group.key} aria-labelledby={`request-group-${group.key}`}>
+                <div className="request-group-heading"><div><h4 id={`request-group-${group.key}`}>{group.title}</h4><p>{group.description}</p></div><span>{group.items.length}</span></div>
+                {group.items.map((request) => <article id={`guest-request-${request.id}`} tabIndex={-1} key={request.id} className={`join-request-card ${request.status}${highlightedGuestRequestId === request.id ? ' highlighted' : ''}`}>
+                  <span className="avatar" style={avatarStyle(request.displayName)}>{request.displayName.slice(0, 1)}</span>
+                  <div><strong>{request.displayName}</strong><small>{request.status === 'approved' ? t('Approved · requested {time}', { time: relativeTime(request.requestedAt, locale, requestClock) }) : t('Requested {time}', { time: relativeTime(request.requestedAt, locale, requestClock) })}</small><small>{t('Invite {code} · expires {time}', { code: request.inviteCodeHint, time: relativeTime(request.grantExpiresAt ?? request.expiresAt, locale, requestClock) })}</small>{request.introduction ? <p>{request.introduction}</p> : <p className="muted-copy">{t('No introduction provided.')}</p>}</div>
+                  <div className="join-request-card-actions">{request.status === 'pending' ? <><button type="button" className="primary-button" disabled={guestRequestActionId === request.id} onClick={() => void decideRoomGuestRequest(request, 'approve')}>{t('Approve')}</button><button type="button" disabled={guestRequestActionId === request.id} onClick={() => { setDecliningGuestRequest(request); setDeclineReason(''); }}>{t('Decline')}</button></> : <button type="button" className="destructive-action" disabled={guestRequestActionId === request.id} onClick={() => void decideRoomGuestRequest(request, 'revoke')}>{t('Revoke Approval')}</button>}</div>
+                </article>)}
+              </section> : null) : <div className="section-empty"><UiIcon name="check" size={24} /><strong>{t('No Open Requests')}</strong><small>{t('New requests will appear here without exposing room content.')}</small></div>}
+            </section> : null}
+
+            {peopleSafetySection === 'access' ? <section className="people-safety-section access-invite-section" role="tabpanel"><div className="section-heading"><div><span className="eyebrow">{t('Guest Admission')}</span><h3>{t('Who Can Enter by Link?')}</h3></div></div>{roomPeople.canManage ? <fieldset className="admission-policy"><legend>{t('Guest Access')}</legend>{(['off', 'approval', 'link'] as const).map((policy) => <label key={policy}><input type="radio" name="guest-admission-policy" value={policy} checked={roomPeople.guestAdmissionPolicy === policy} onChange={() => { if (roomPeople.guestAdmissionPolicy !== policy) confirmGovernanceChange({ guestAdmissionPolicy: policy }, t('Change guest access?'), t('Change Access')); }} /><span><strong>{policy === 'off' ? t('Guest Access Off') : policy === 'approval' ? t('Approval Required') : t('Anyone with the Link')}</strong><small>{policy === 'off' ? t('Only signed-in people can use this invite.') : policy === 'approval' ? t('Guests wait for an owner. Their 2-hour session starts only after entry.') : t('Guests enter immediately after choosing a display name.')}</small></span></label>)}</fieldset> : <p>{roomPeople.guestAdmissionPolicy === 'approval' ? t('Guests need owner approval before entering.') : roomPeople.guestAdmissionPolicy === 'link' ? t('Guests with the link can enter immediately.') : t('Guest access is off.')}</p>}
+              <div className="invite-policy-summary"><strong>{roomPeople.inviteActive ? t('Active Invite') : t('Invite Revoked')}</strong><span>{roomPeople.inviteExpiresAt ? t('Expires {date}', { date: new Intl.DateTimeFormat(localeTag(locale), { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(roomPeople.inviteExpiresAt)) }) : t('No expiration')}</span><span>{roomPeople.inviteMaxUses ? t('{used} of {max} uses', { used: roomPeople.inviteUseCount, max: roomPeople.inviteMaxUses }) : t('{used} uses · unlimited', { used: roomPeople.inviteUseCount })}</span></div>
+              {roomPeople.canManage ? <div className="access-actions">{roomPeople.inviteActive ? <button type="button" onClick={() => confirmGovernanceChange({ inviteActive: false }, t('Revoke this invite?'), t('Revoke Invite'))}>{t('Revoke Invite')}</button> : <button type="button" className="primary-button" onClick={() => void updateGovernance({ inviteActive: true })}>{t('Create New Invite')}</button>}<label className="governance-select">{t('Change Expiration')}<select value="" onChange={(event) => { if (event.target.value) void updateGovernance({ inviteExpiresInHours: Number(event.target.value) }); }}><option value="" disabled>{t('Choose a new expiration…')}</option><option value="0">{t('No Expiration')}</option><option value="1">{t('1 Hour from Now')}</option><option value="24">{t('24 Hours from Now')}</option><option value="168">{t('7 Days from Now')}</option></select></label><label className="governance-select">{t('Invite Uses')}<select value={roomPeople.inviteMaxUses ?? 0} onChange={(event) => { const value = Number(event.target.value); const reducesBelowReserved = value > 0 && value < roomPeople.inviteUseCount; if (reducesBelowReserved) confirmGovernanceChange({ inviteMaxUses: value }, t('Reduce invite capacity?'), t('Reduce Capacity')); else void updateGovernance({ inviteMaxUses: value }); }}><option value="0">{t('Unlimited')}</option><option value="1">{t('One Time')}</option><option value="5">{t('5 People')}</option><option value="20">{t('20 People')}</option></select></label></div> : null}
+              <small className="signed-in-policy-note"><UiIcon name="info" size={15} /> {t('Signed-in people still join directly from a valid invite. Approval currently applies to guests.')}</small>
+            </section> : null}
+
+            {peopleSafetySection === 'safety' ? <section className="people-safety-section safety-zone" role="tabpanel"><section className="notification-section" aria-labelledby="notification-section-title"><h3 id="notification-section-title">{t('Notifications')}</h3><button type="button" className="notification-setting" onClick={() => void toggleRoomMute()} aria-pressed={roomPeople.muted}><UiIcon name="message" size={18} /><span><strong>{roomPeople.muted ? t('Unmute Conversation') : t('Mute Conversation')}</strong><small>{roomPeople.muted ? t('Resume in-app notifications for new activity.') : t('Pause conversation activity notifications. Join requests remain visible to owners.')}</small></span></button></section><button type="button" className="wide" onClick={() => { setReportTarget(null); setReportOpen(true); }}>{t('Report Conversation')}</button>{(roomPeople.blockedAccounts ?? []).length ? <section className="blocked-accounts" aria-labelledby="blocked-accounts-title"><h3 id="blocked-accounts-title">{t('Blocked Accounts')}</h3>{(roomPeople.blockedAccounts ?? []).map((account) => <div key={account.id}><span className="avatar" style={{ '--avatar': account.avatarColor } as CSSProperties}>{account.displayName.slice(0, 1)}</span><strong>{account.displayName}</strong><button type="button" onClick={() => void unblockAccount(account.id)}>{t('Unblock')}</button></div>)}</section> : null}<div className="danger-zone"><span className="eyebrow destructive">{t('Danger Zone')}</span>{actor?.kind === 'user' ? <button type="button" onClick={() => void archiveConversation()}>{t('Archive for Me')}</button> : null}{actor?.kind === 'user' && roomPeople.currentRole !== 'owner' ? <button type="button" className="danger-button" onClick={() => setSafetyAction({ kind: 'leave' })}>{t('Leave Conversation')}</button> : null}{roomPeople.canManage ? <button type="button" className="danger-button" onClick={() => setDeleteRoomConfirmOpen(true)}>{t('Delete Conversation')}</button> : null}</div></section> : null}
           </> : null}
         </section>
       </AppDialog>
-      <AppDialog open={peopleSafetyOpen} onClose={() => { setPeopleSafetyOpen(false); setReportOpen(false); setReportTarget(null); }} labelledBy="people-safety-title" describedBy="people-safety-description">
-        <section className="dialog-card people-safety-dialog">
-          <button type="button" className="dialog-close" onClick={() => setPeopleSafetyOpen(false)} aria-label={t('Close')}>×</button>
-          <span className="eyebrow">{t('Conversation Controls')}</span>
-          <h2 id="people-safety-title">{t('People & Safety')}</h2>
-          <p id="people-safety-description">{t('Know who is here, control interruptions, and act when something feels unsafe.')}</p>
-          {roomPeopleLoading ? <div className="people-safety-loading" role="status">{t('Loading people…')}</div> : null}
-          {roomPeople ? <>
-            <div className="safety-preferences"><button type="button" onClick={() => void toggleRoomMute()} aria-pressed={roomPeople.muted}><UiIcon name="message" size={18} /><span><strong>{roomPeople.muted ? t('Unmute Conversation') : t('Mute Conversation')}</strong><small>{roomPeople.muted ? t('Resume push and in-app notifications for new activity.') : t('Suppress push and in-app notifications until you unmute. Mentions are also muted.')}</small></span></button>{roomPeople.canManage && roomPeople.kind !== 'direct' ? <><button type="button" onClick={() => void updateGovernance({ allowGuests: !roomPeople.allowGuests })} aria-pressed={roomPeople.allowGuests}><UiIcon name="group" size={18} /><span><strong>{roomPeople.allowGuests ? t('Guest Access On') : t('Guest Access Off')}</strong><small>{roomPeople.allowGuests ? t('People with an active invite may join as guests.') : t('Guests cannot join, even with an old link.')}</small></span></button>{roomPeople.inviteActive !== false ? <button type="button" onClick={() => void revokeRoomInvite()}><UiIcon name="link" size={18} /><span><strong>{t('Revoke Invite Link')}</strong><small>{t('The current link stops working. A replacement is not created automatically.')}</small></span></button> : <button type="button" onClick={() => void updateGovernance({ inviteActive: true })}><UiIcon name="link" size={18} /><span><strong>{t('Create New Invite Link')}</strong><small>{t('Creates a fresh link and resets its use count.')}</small></span></button>}<label className="governance-select">{t('Invite Expiration')}<select value={roomPeople.inviteExpiresAt ? '24' : '0'} onChange={(event) => void updateGovernance({ inviteExpiresInHours: Number(event.target.value) })}><option value="0">{t('No Expiration')}</option><option value="1">{t('1 Hour')}</option><option value="24">{t('24 Hours')}</option><option value="168">{t('7 Days')}</option></select></label><label className="governance-select">{t('Invite Uses')}<select value={roomPeople.inviteMaxUses ?? 0} onChange={(event) => void updateGovernance({ inviteMaxUses: Number(event.target.value) })}><option value="0">{t('Unlimited')}</option><option value="1">{t('One Time')}</option><option value="5">{t('5 People')}</option><option value="20">{t('20 People')}</option></select></label></> : null}</div>
-            <section className="people-list" aria-labelledby="people-list-title"><div className="people-list-heading"><h3 id="people-list-title">{t('People')}</h3><span>{roomPeople.members.length}</span></div>{roomPeople.members.map((person) => { const self = person.kind === actor?.kind && person.id === actor?.id; return <article key={`${person.kind}:${person.id}`}><span className="avatar" style={person.avatarColor ? { '--avatar': person.avatarColor } as CSSProperties : avatarStyle(person.displayName)}>{person.displayName.slice(0, 1)}</span><span><strong>{person.displayName}{self ? ` · ${t('You')}` : ''}</strong><small>{person.role === 'owner' ? t('Owner') : person.role === 'guest' ? t('Guest') : t('Member')}</small></span>{!self ? <div><button type="button" onClick={() => { setReportTarget(person); setReportOpen(true); }}>{t('Report')}</button>{actor?.kind === 'user' && person.kind === 'user' ? <button type="button" onClick={() => setSafetyAction({ kind: 'block', person })}>{t('Block')}</button> : null}{roomPeople.canManage && person.kind === 'user' && person.role === 'member' ? <><button type="button" onClick={() => void transferOwnership(person)}>{t('Make Owner')}</button><button type="button" className="destructive-action" onClick={() => setSafetyAction({ kind: 'remove', person })}>{t('Remove')}</button></> : null}{roomPeople.canManage && person.kind === 'guest' ? <button type="button" className="destructive-action" onClick={() => void removeRoomGuest(person)}>{t('End Guest Access')}</button> : null}</div> : null}</article>; })}</section>
-            {(roomPeople.blockedAccounts ?? []).length ? <section className="blocked-accounts" aria-labelledby="blocked-accounts-title"><h3 id="blocked-accounts-title">{t('Blocked Accounts')}</h3>{(roomPeople.blockedAccounts ?? []).map((account) => <div key={account.id}><span className="avatar" style={{ '--avatar': account.avatarColor } as CSSProperties}>{account.displayName.slice(0, 1)}</span><strong>{account.displayName}</strong><button type="button" onClick={() => void unblockAccount(account.id)}>{t('Unblock')}</button></div>)}</section> : null}
-            <div className="safety-footer-actions"><button type="button" onClick={() => { setReportTarget(null); setReportOpen(true); }}>{t('Report Conversation')}</button>{actor?.kind === 'user' ? <button type="button" onClick={() => void archiveConversation()}>{t('Archive for Me')}</button> : null}{actor?.kind === 'user' && roomPeople.currentRole !== 'owner' ? <button type="button" className="danger-button" onClick={() => setSafetyAction({ kind: 'leave' })}>{t('Leave Conversation')}</button> : null}{roomPeople.canManage ? <button type="button" className="danger-button" onClick={() => setDeleteRoomConfirmOpen(true)}>{t('Delete Conversation')}</button> : null}</div>
-          </> : null}
+      <AppDialog open={Boolean(decliningGuestRequest)} onClose={() => { setDecliningGuestRequest(null); setDeclineReason(''); }} labelledBy="decline-request-title" describedBy="decline-request-description" className="confirmation-backdrop">
+        <form className="dialog-card confirmation-dialog decline-request-dialog" onSubmit={(event) => { event.preventDefault(); if (decliningGuestRequest) void decideRoomGuestRequest(decliningGuestRequest, 'reject', declineReason); }}>
+          <span className="eyebrow destructive">{t('Decline Request')}</span>
+          <h2 id="decline-request-title">{t('Decline {name}?', { name: decliningGuestRequest?.displayName ?? '' })}</h2>
+          <p id="decline-request-description">{t('They will not be able to enter or see room content. You can add a short, respectful note to help them understand.')}</p>
+          <label>{t('Reason')} <small>{t('(optional)')}</small><textarea value={declineReason} onChange={(event) => setDeclineReason(event.target.value)} maxLength={500} placeholder={t('For example: please ask the project owner for a new invite.')} autoFocus /></label>
+          <div className="confirmation-actions"><button type="button" onClick={() => { setDecliningGuestRequest(null); setDeclineReason(''); }}>{t('Keep Waiting')}</button><button type="submit" className="danger-button" disabled={Boolean(guestRequestActionId)}>{t('Decline Request')}</button></div>
+        </form>
+      </AppDialog>
+      <AppDialog open={Boolean(governanceConfirmation)} onClose={() => setGovernanceConfirmation(null)} labelledBy="governance-confirmation-title" describedBy="governance-confirmation-description" className="confirmation-backdrop">
+        <section className="dialog-card confirmation-dialog">
+          <span className="eyebrow destructive">{t('Review Impact')}</span>
+          <h2 id="governance-confirmation-title">{governanceConfirmation?.title}</h2>
+          <p id="governance-confirmation-description">{governanceConfirmation?.description}</p>
+          <div className="impact-preview"><strong>{t('What stays safe')}</strong><span>{t('Messages, drawings, and current members are not removed.')}</span></div>
+          <div className="confirmation-actions"><button type="button" onClick={() => setGovernanceConfirmation(null)}>{t('Cancel')}</button><button type="button" className="danger-button" onClick={() => { const confirmation = governanceConfirmation; setGovernanceConfirmation(null); if (confirmation) void updateGovernance(confirmation.patch); }}>{governanceConfirmation?.confirmLabel}</button></div>
         </section>
       </AppDialog>
       <AppDialog open={Boolean(safetyAction)} onClose={() => setSafetyAction(null)} labelledBy="safety-action-title" describedBy="safety-action-description" className="confirmation-backdrop"><section className="dialog-card confirmation-dialog"><span className="eyebrow destructive">{safetyAction?.kind === 'block' ? t('Block Member') : safetyAction?.kind === 'remove' ? t('Remove Member') : t('Leave Conversation')}</span><h2 id="safety-action-title">{safetyAction?.kind === 'block' ? t('Block {name}?', { name: safetyAction.person?.displayName ?? '' }) : safetyAction?.kind === 'remove' ? t('Remove {name}?', { name: safetyAction.person?.displayName ?? '' }) : t('Leave this conversation?')}</h2><p id="safety-action-description">{safetyAction?.kind === 'block' ? t('They cannot start a direct conversation with you or appear in your people search. Their existing shared-room content will be hidden by default.') : safetyAction?.kind === 'remove' ? t('They lose access immediately. Their earlier contributions remain so the conversation and visual history stay understandable.') : t('You will lose access and need a new active invite to return. Your contributions remain.')}</p><div className="confirmation-actions"><button type="button" onClick={() => setSafetyAction(null)}>{t('Cancel')}</button><button type="button" className="danger-button" onClick={() => { const action = safetyAction; setSafetyAction(null); if (action?.kind === 'block' && action.person) void blockRoomMember(action.person); else if (action?.kind === 'remove' && action.person) void removeRoomMember(action.person); else if (action?.kind === 'leave') void leaveConversation(); }}>{safetyAction?.kind === 'block' ? t('Block') : safetyAction?.kind === 'remove' ? t('Remove') : t('Leave')}</button></div></section></AppDialog>
       <AppDialog open={deleteRoomConfirmOpen} onClose={() => setDeleteRoomConfirmOpen(false)} labelledBy="delete-room-title" describedBy="delete-room-description" className="confirmation-backdrop"><section className="dialog-card confirmation-dialog"><span className="eyebrow destructive">{t('Permanent Deletion')}</span><h2 id="delete-room-title">{t('Delete this conversation?')}</h2><p id="delete-room-description">{t('Every message, drawing, version, report, reaction, and stored image in this conversation will be permanently deleted for everyone. This cannot be undone.')}</p><div className="impact-preview"><strong>{t('Impact')}</strong><span>{t('{messages} messages · {media} images and drawings · all members lose access', { messages: activeRoom?.messageCount ?? messages.length, media: activeRoom?.mediaCount ?? 0 })}</span></div><div className="confirmation-actions"><button type="button" onClick={() => setDeleteRoomConfirmOpen(false)}>{t('Cancel')}</button><button type="button" className="danger-button" onClick={() => void deleteConversation()}>{t('Delete for Everyone')}</button></div></section></AppDialog>
       <AppDialog open={reportOpen} onClose={() => { setReportOpen(false); setReportTarget(null); setReportMessage(null); }} labelledBy="report-title" describedBy="report-description" className="confirmation-backdrop">
         <form className="dialog-card report-dialog" onSubmit={submitReport}>
-          <button type="button" className="dialog-close" onClick={() => { setReportOpen(false); setReportTarget(null); setReportMessage(null); }} aria-label={t('Close')}>×</button>
+          <button type="button" className="dialog-close" onClick={() => { setReportOpen(false); setReportTarget(null); setReportMessage(null); }} aria-label={t('Close')}><UiIcon name="close" size={18} /></button>
           <span className="eyebrow destructive">{t('Safety Report')}</span><h2 id="report-title">{reportMessage ? t('Report Message') : reportTarget ? t('Report {name}', { name: reportTarget.displayName }) : t('Report Conversation')}</h2><p id="report-description">{t('Reports are private. Include only the context needed to understand what happened.')}</p>
           {reportMessage ? <blockquote className="report-evidence"><strong>{reportMessage.senderName}</strong><p>{reportMessage.body || (reportMessage.type === 'canvas' ? t('Drawing contribution') : t('Photo contribution'))}</p><small>{t('This message and its room context will be attached automatically.')}</small></blockquote> : null}
           <label>{t('Reason')}<select value={reportReason} onChange={(event) => setReportReason(event.target.value)}><option value="harassment">{t('Harassment')}</option><option value="spam">{t('Spam')}</option><option value="unsafe-content">{t('Unsafe Content')}</option><option value="impersonation">{t('Impersonation')}</option><option value="other">{t('Other')}</option></select></label>
@@ -2447,10 +2771,10 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
         </form>
       </AppDialog>
       <AppDialog open={Boolean(editingMessage)} onClose={() => setEditingMessage(null)} labelledBy="edit-message-title" describedBy="edit-message-description">
-        <form className="dialog-card edit-message-dialog" onSubmit={saveMessageEdit}><button type="button" className="dialog-close" onClick={() => setEditingMessage(null)} aria-label={t('Close')}>×</button><span className="eyebrow">{t('Edit Contribution')}</span><h2 id="edit-message-title">{editingMessage?.type === 'text' ? t('Edit Message') : t('Edit Caption')}</h2><p id="edit-message-description">{t('The conversation will show that this contribution was edited.')}</p><label>{editingMessage?.type === 'text' ? t('Message') : t('Caption')}<textarea value={editingText} onChange={(event) => setEditingText(event.target.value)} maxLength={2000} autoFocus /></label><div className="confirmation-actions"><button type="button" onClick={() => setEditingMessage(null)}>{t('Cancel')}</button><button type="submit" className="primary-button" disabled={busy || (editingMessage?.type === 'text' && !editingText.trim())}>{t('Save Changes')}</button></div></form>
+        <form className="dialog-card edit-message-dialog" onSubmit={saveMessageEdit}><button type="button" className="dialog-close" onClick={() => setEditingMessage(null)} aria-label={t('Close')}><UiIcon name="close" size={18} /></button><span className="eyebrow">{t('Edit Contribution')}</span><h2 id="edit-message-title">{editingMessage?.type === 'text' ? t('Edit Message') : t('Edit Caption')}</h2><p id="edit-message-description">{t('The conversation will show that this contribution was edited.')}</p><label>{editingMessage?.type === 'text' ? t('Message') : t('Caption')}<textarea value={editingText} onChange={(event) => setEditingText(event.target.value)} maxLength={2000} autoFocus /></label><div className="confirmation-actions"><button type="button" onClick={() => setEditingMessage(null)}>{t('Cancel')}</button><button type="submit" className="primary-button" disabled={busy || (editingMessage?.type === 'text' && !editingText.trim())}>{t('Save Changes')}</button></div></form>
       </AppDialog>
       <AppDialog open={Boolean(deletingMessage)} onClose={() => setDeletingMessage(null)} labelledBy="delete-message-title" describedBy="delete-message-description" className="confirmation-backdrop"><section className="dialog-card confirmation-dialog"><span className="eyebrow destructive">{t('Remove Contribution')}</span><h2 id="delete-message-title">{t('Remove this contribution?')}</h2><p id="delete-message-description">{deletingMessage?.type === 'canvas' || deletingMessage?.type === 'image' ? t('The image is removed, but a safe placeholder keeps replies and visual branches understandable.') : t('A placeholder will remain so replies keep their context.')}</p><div className="confirmation-actions"><button type="button" onClick={() => setDeletingMessage(null)}>{t('Keep It')}</button><button type="button" className="danger-button" onClick={() => deletingMessage && void deleteContribution(deletingMessage)} disabled={busy}>{t('Remove')}</button></div></section></AppDialog>
-      <AppDialog open={Boolean(pendingPreview)} onClose={closePendingPreview} labelledBy="pending-preview-title" describedBy="pending-preview-description"><section className="dialog-card pending-preview-dialog"><button type="button" className="dialog-close" onClick={closePendingPreview} aria-label={t('Close')}>×</button><span className="eyebrow">{t('Saved on This Device')}</span><h2 id="pending-preview-title">{pendingPreview?.message.fileName || t('Queued Artwork')}</h2><p id="pending-preview-description">{t('Preview this attachment before deciding whether to retry, replace, save, or remove it.')}</p>{pendingPreview ? <Image unoptimized src={pendingPreview.url} width="1200" height="720" alt={t('Preview of queued attachment')} /> : null}<div className="confirmation-actions"><button type="button" onClick={closePendingPreview}>{t('Close')}</button>{pendingPreview ? <button type="button" className="primary-button" onClick={() => void savePendingMedia(pendingPreview.message)}>{t('Save to Device')}</button> : null}</div></section></AppDialog>
+      <AppDialog open={Boolean(pendingPreview)} onClose={closePendingPreview} labelledBy="pending-preview-title" describedBy="pending-preview-description"><section className="dialog-card pending-preview-dialog"><button type="button" className="dialog-close" onClick={closePendingPreview} aria-label={t('Close')}><UiIcon name="close" size={18} /></button><span className="eyebrow">{t('Saved on This Device')}</span><h2 id="pending-preview-title">{pendingPreview?.message.fileName || t('Queued Artwork')}</h2><p id="pending-preview-description">{t('Preview this attachment before deciding whether to retry, replace, save, or remove it.')}</p>{pendingPreview ? <Image unoptimized src={pendingPreview.url} width="1200" height="720" alt={t('Preview of queued attachment')} /> : null}<div className="confirmation-actions"><button type="button" onClick={closePendingPreview}>{t('Close')}</button>{pendingPreview ? <button type="button" className="primary-button" onClick={() => void savePendingMedia(pendingPreview.message)}>{t('Save to Device')}</button> : null}</div></section></AppDialog>
       <AppDialog open={Boolean(pendingRemoval)} onClose={() => setPendingRemoval(null)} labelledBy="remove-pending-title" describedBy="remove-pending-description" className="confirmation-backdrop"><section className="dialog-card confirmation-dialog"><span className="eyebrow destructive">{t('Remove Saved Item')}</span><h2 id="remove-pending-title">{t('Remove this unsent item?')}</h2><p id="remove-pending-description">{t('Save it to your device first if you may need it later. Removal deletes the local recovery copy.')}</p><div className="confirmation-actions"><button type="button" onClick={() => setPendingRemoval(null)}>{t('Keep Item')}</button><button type="button" className="danger-button" onClick={() => { const pending = pendingRemoval; setPendingRemoval(null); if (pending) removePendingMessage(pending.id); }}>{t('Remove')}</button></div></section></AppDialog>
       <AppDialog open={guestEndConfirmOpen} onClose={() => setGuestEndConfirmOpen(false)} labelledBy="end-guest-title" describedBy="end-guest-description" className="confirmation-backdrop">
         <section className="dialog-card confirmation-dialog">

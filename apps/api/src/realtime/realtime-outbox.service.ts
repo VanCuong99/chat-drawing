@@ -127,16 +127,23 @@ export class RealtimeOutboxService {
     try {
       const now = Date.now();
       const [members, guests] = await Promise.all([
-        this.db.select({ userId: roomMembers.userId }).from(roomMembers).where(eq(roomMembers.roomId, event.roomId)),
+        this.db.select({ userId: roomMembers.userId, role: roomMembers.role }).from(roomMembers).where(eq(roomMembers.roomId, event.roomId)),
         this.db.select({ id: guestSessions.id }).from(guestSessions).where(and(eq(guestSessions.roomId, event.roomId), gt(guestSessions.expiresAt, now))),
       ]);
       const payload = { ...event.payload, eventId: event.id };
-      this.realtime.publish(event.roomId, event.event as RealtimeEvent, payload);
-      this.realtime.publishRoomActivity(event.roomId, [
-        ...members.map((member) => `user:${member.userId}`),
-        ...guests.map((guest) => `guest:${guest.id}`),
-      ], event.event as RealtimeEvent, payload);
-      await this.broker.publish(event.roomId, event.event as RealtimeEvent, payload);
+      const admissionEvent = event.event === 'guest.requested' || event.event === 'guest.request.updated';
+      if (admissionEvent) {
+        const ownerActorKeys = members.filter((member) => member.role === 'owner').map((owner) => `user:${owner.userId}`);
+        for (const actorKey of ownerActorKeys) this.realtime.publishActor(actorKey, event.event as RealtimeEvent, { roomId: event.roomId, ...payload });
+        await this.broker.publishActors(ownerActorKeys, event.roomId, event.event as RealtimeEvent, payload);
+      } else {
+        this.realtime.publish(event.roomId, event.event as RealtimeEvent, payload);
+        this.realtime.publishRoomActivity(event.roomId, [
+          ...members.map((member) => `user:${member.userId}`),
+          ...guests.map((guest) => `guest:${guest.id}`),
+        ], event.event as RealtimeEvent, payload);
+      }
+      if (!admissionEvent) await this.broker.publish(event.roomId, event.event as RealtimeEvent, payload);
       await this.db.update(realtimeOutbox).set({
         publishedAt: Date.now(),
         lockedUntil: null,

@@ -24,6 +24,30 @@ export class ChatController {
     return this.chat.inspectInvite(code);
   }
 
+  @Post('invites/:code/guest-requests')
+  @HttpCode(200)
+  async requestGuestAccess(@Req() request: Request, @Param('code') code: string, @Body() body: { displayName?: unknown; introduction?: unknown; requestToken?: unknown }) {
+    const limit = configInteger(this.config, 'GUEST_CREATE_LIMIT', 30, { min: 1, max: 10_000 });
+    await this.limits.consume('guest:request', this.guestCreateSubject(request), limit, 15 * 60 * 1000);
+    return this.chat.createGuestRequest(code, body);
+  }
+
+  @Get('guest-requests/:id/status')
+  async guestRequestStatus(@Req() request: Request, @Param('id') requestId: string) {
+    return this.chat.getGuestRequestStatus(requestId, request.header('x-net-guest-request'));
+  }
+
+  @Delete('guest-requests/:id')
+  async cancelGuestRequest(@Req() request: Request, @Param('id') requestId: string) {
+    return this.chat.cancelGuestRequest(requestId, request.header('x-net-guest-request'));
+  }
+
+  @Post('guest-requests/:id/claim')
+  @HttpCode(200)
+  async claimGuestRequest(@Req() request: Request, @Param('id') requestId: string) {
+    return this.chat.claimGuestRequest(requestId, request.header('x-net-guest-request'));
+  }
+
   @Post('guest')
   @HttpCode(200)
   async createGuest(@Req() request: Request, @Body() body: { displayName?: unknown; inviteCode?: unknown }) {
@@ -124,13 +148,36 @@ export class ChatController {
     return this.chat.listPeople(roomId, await this.actors.require(request));
   }
 
+  @Get('rooms/:id/guest-requests')
+  async roomGuestRequests(@Req() request: Request, @Param('id') roomId: string) {
+    return this.chat.listGuestRequests(roomId, await this.actors.require(request));
+  }
+
+  @Post('rooms/:id/guest-requests/:requestId/approve')
+  @HttpCode(200)
+  async approveGuestRequest(@Req() request: Request, @Param('id') roomId: string, @Param('requestId') requestId: string) {
+    return this.chat.decideGuestRequest(roomId, requestId, await this.actors.require(request), 'approve');
+  }
+
+  @Post('rooms/:id/guest-requests/:requestId/reject')
+  @HttpCode(200)
+  async rejectGuestRequest(@Req() request: Request, @Param('id') roomId: string, @Param('requestId') requestId: string, @Body() body?: { reason?: unknown }) {
+    return this.chat.decideGuestRequest(roomId, requestId, await this.actors.require(request), 'reject', body?.reason);
+  }
+
+  @Post('rooms/:id/guest-requests/:requestId/revoke')
+  @HttpCode(200)
+  async revokeGuestRequest(@Req() request: Request, @Param('id') roomId: string, @Param('requestId') requestId: string) {
+    return this.chat.revokeGuestRequest(roomId, requestId, await this.actors.require(request));
+  }
+
   @Patch('rooms/:id/preferences')
   async roomPreferences(@Req() request: Request, @Param('id') roomId: string, @Body() body: { muted?: unknown }) {
     return this.chat.updateRoomPreferences(roomId, await this.actors.require(request, true), body);
   }
 
   @Patch('rooms/:id/governance')
-  async roomGovernance(@Req() request: Request, @Param('id') roomId: string, @Body() body: { allowGuests?: unknown; inviteActive?: unknown; inviteExpiresInHours?: unknown; inviteMaxUses?: unknown }) {
+  async roomGovernance(@Req() request: Request, @Param('id') roomId: string, @Body() body: { allowGuests?: unknown; guestAdmissionPolicy?: unknown; inviteActive?: unknown; inviteExpiresInHours?: unknown; inviteMaxUses?: unknown }) {
     return this.chat.updateRoomGovernance(roomId, await this.actors.require(request), body);
   }
 

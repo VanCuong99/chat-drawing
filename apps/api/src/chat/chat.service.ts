@@ -6,12 +6,14 @@ import {
   desc,
   eq,
   gt,
+  guestRequests,
   guestSessions,
   ilike,
   inArray,
   isNotNull,
   isNull,
   lt,
+  lte,
   messages,
   ne,
   or,
@@ -26,6 +28,7 @@ import {
   visualVotes,
   type NetDatabase,
 } from '@net/database';
+import { createHash, randomBytes } from 'node:crypto';
 import type { Actor } from '../auth/actor.types';
 import { DATABASE } from '../database/database.module';
 import { ActorService } from '../auth/actor.service';
@@ -36,6 +39,8 @@ import { RealtimeOutboxService } from '../realtime/realtime-outbox.service';
 const EMOJIS = ['❤️', '👍', '✨', '😂', '👀'];
 const EMPTY_GUEST_ROOM_GRACE_MS = 5 * 60 * 1000;
 const ABANDONED_GUEST_ROOM_BATCH = 10;
+const GUEST_REQUEST_TTL_MS = 24 * 60 * 60 * 1000;
+const GUEST_GRANT_TTL_MS = 24 * 60 * 60 * 1000;
 
 @Injectable()
 export class ChatService {
@@ -58,8 +63,8 @@ export class ChatService {
 
   async listRooms(actor: Actor) {
     const accessRows = actor.kind === 'user'
-      ? await this.db.select({ roomId: roomMembers.roomId, lastReadSequence: roomMembers.lastReadSequence, mutedAt: roomMembers.mutedAt }).from(roomMembers).where(and(eq(roomMembers.userId, actor.id), isNull(roomMembers.archivedAt)))
-      : await this.db.select({ roomId: guestSessions.roomId, lastReadSequence: guestSessions.lastReadSequence, mutedAt: guestSessions.mutedAt }).from(guestSessions).where(eq(guestSessions.id, actor.id));
+      ? await this.db.select({ roomId: roomMembers.roomId, lastReadSequence: roomMembers.lastReadSequence, mutedAt: roomMembers.mutedAt, role: roomMembers.role }).from(roomMembers).where(and(eq(roomMembers.userId, actor.id), isNull(roomMembers.archivedAt)))
+      : await this.db.select({ roomId: guestSessions.roomId, lastReadSequence: guestSessions.lastReadSequence, mutedAt: guestSessions.mutedAt, role: sql<null>`null` }).from(guestSessions).where(eq(guestSessions.id, actor.id));
     const roomIds = accessRows.map((row) => row.roomId);
     if (!roomIds.length) return [];
     const activeMessageCondition = or(isNull(messages.expiresAt), gt(messages.expiresAt, Date.now()));
@@ -90,7 +95,7 @@ export class ChatService {
         ))
         .where(and(inArray(messages.roomId, roomIds), activeMessageCondition, ownMessageCondition))
         .groupBy(messages.roomId);
-    const [roomRows, latest, unreadRows, statisticRows, counterpartRows] = await Promise.all([
+    const [roomRows, latest, unreadRows, statisticRows, counterpartRows, pendingRequestRows] = await Promise.all([
       this.db.select().from(rooms).where(inArray(rooms.id, roomIds)),
       this.db.selectDistinctOn([messages.roomId], {
         roomId: messages.roomId,
@@ -113,6 +118,12 @@ export class ChatService {
           .innerJoin(users, eq(users.id, roomMembers.userId))
           .where(and(inArray(roomMembers.roomId, roomIds), ne(roomMembers.userId, actor.id)))
         : Promise.resolve([]),
+      actor.kind === 'user'
+        ? this.db.select({ roomId: guestRequests.roomId, count: sql<number>`count(*)::int` })
+          .from(guestRequests)
+          .where(and(inArray(guestRequests.roomId, roomIds), eq(guestRequests.status, 'pending'), gt(guestRequests.expiresAt, Date.now())))
+          .groupBy(guestRequests.roomId)
+        : Promise.resolve([]),
     ]);
     const latestByRoom = new Map(latest.map((message) => [message.roomId, message]));
     const unreadByRoom = new Map(unreadRows.map((row) => [row.roomId, row.count]));
@@ -120,6 +131,7 @@ export class ChatService {
     const accessByRoom = new Map(accessRows.map((row) => [row.roomId, row]));
     const statisticsByRoom = new Map(statisticRows.map((row) => [row.roomId, row]));
     const counterpartByRoom = new Map(counterpartRows.map((row) => [row.roomId, row.displayName]));
+    const pendingRequestsByRoom = new Map(pendingRequestRows.map((row) => [row.roomId, row.count]));
     return roomRows.map((room) => {
       const last = latestByRoom.get(room.id);
       const preview = !last ? 'Start a new conversation'
@@ -138,6 +150,7 @@ export class ChatService {
         muted: Boolean(accessByRoom.get(room.id)?.mutedAt),
         messageCount: statistics?.messageCount ?? 0,
         mediaCount: statistics?.mediaCount ?? 0,
+        pendingRequestCount: accessByRoom.get(room.id)?.role === 'owner' ? pendingRequestsByRoom.get(room.id) ?? 0 : 0,
       };
     }).sort((a, b) => b.lastActivity - a.lastActivity);
   }
@@ -155,8 +168,14 @@ export class ChatService {
       inviteExpiresAt: rooms.inviteExpiresAt,
       inviteMaxUses: rooms.inviteMaxUses,
       inviteUseCount: rooms.inviteUseCount,
+      guestAdmissionPolicy: rooms.guestAdmissionPolicy,
     }).from(rooms)
       .where(eq(rooms.inviteCode, inviteCode)).limit(1);
+    if (room) {
+      await this.expireRoomGuestRequests(room.id);
+      const [freshCapacity] = await this.db.select({ inviteUseCount: rooms.inviteUseCount }).from(rooms).where(eq(rooms.id, room.id)).limit(1);
+      if (freshCapacity) room.inviteUseCount = freshCapacity.inviteUseCount;
+    }
     if (!room || room.kind === 'direct' || !room.inviteActive || (room.inviteExpiresAt !== null && room.inviteExpiresAt <= Date.now()) || (room.inviteMaxUses !== null && room.inviteUseCount >= room.inviteMaxUses)) throw new NotFoundException('The invite link is invalid or has expired.');
     const now = Date.now();
     const [memberRows, memberCounts, hostRows, activeGuests, activeGuestCounts, recentMessages] = await Promise.all([
@@ -199,6 +218,9 @@ export class ChatService {
     return {
       valid: true,
       guestAllowed: room.allowGuests,
+      guestAdmissionPolicy: room.allowGuests ? room.guestAdmissionPolicy : 'off',
+      requestExpiresInHours: room.guestAdmissionPolicy === 'approval' ? 24 : null,
+      signedInUsersJoinDirectly: true,
       room: {
         name: room.name,
         hostedBy: hostRows[0]?.displayName ?? null,
@@ -228,6 +250,7 @@ export class ChatService {
             eq(rooms.id, candidate.id),
             eq(rooms.inviteCode, inviteCode),
             eq(rooms.allowGuests, true),
+            eq(rooms.guestAdmissionPolicy, 'link'),
             eq(rooms.inviteActive, true),
             or(isNull(rooms.inviteExpiresAt), gt(rooms.inviteExpiresAt, now)),
             or(isNull(rooms.inviteMaxUses), sql`${rooms.inviteUseCount} < ${rooms.inviteMaxUses}`),
@@ -237,7 +260,7 @@ export class ChatService {
         room = availableRoom;
         await tx.update(rooms).set({ inviteUseCount: sql`${rooms.inviteUseCount} + 1` }).where(eq(rooms.id, room.id));
       } else {
-        [room] = await tx.insert(rooms).values({ name: `${displayName}'s Session`, kind: 'guest', inviteCode: this.makeCode(), allowGuests: true, createdAt: now }).returning();
+        [room] = await tx.insert(rooms).values({ name: `${displayName}'s Session`, kind: 'guest', inviteCode: this.makeCode(), allowGuests: true, guestAdmissionPolicy: 'link', createdAt: now }).returning();
       }
       const [session] = await tx.insert(guestSessions).values({ roomId: room.id, displayName, createdAt: now, lastSeenAt: now, expiresAt }).returning();
       const [firstMessage] = await tx.select({ id: messages.id }).from(messages).where(eq(messages.roomId, room.id)).limit(1);
@@ -254,6 +277,307 @@ export class ChatService {
       }
       return { sessionId: session.id, expiresAt, roomId: room.id, roomName: room.name };
     });
+  }
+
+  async createGuestRequest(inviteCodeInput: unknown, body: { displayName?: unknown; introduction?: unknown; requestToken?: unknown }) {
+    const inviteCode = this.requireText(inviteCodeInput, 'Invite code', 4, 60);
+    const displayName = this.requireText(body.displayName, 'Display name', 2, 60);
+    const introduction = typeof body.introduction === 'string' ? body.introduction.trim() : '';
+    if (introduction.length > 280) throw new BadRequestException('Introduction must be 280 characters or fewer.');
+    const suppliedToken = typeof body.requestToken === 'string' ? body.requestToken.trim() : '';
+    if (suppliedToken) {
+      const [existing] = await this.db.select({ id: guestRequests.id }).from(guestRequests).where(and(
+        eq(guestRequests.inviteCode, inviteCode),
+        eq(guestRequests.requesterTokenHash, this.hashGuestRequestToken(suppliedToken)),
+      )).limit(1);
+      if (existing) return { ...(await this.getGuestRequestStatus(existing.id, suppliedToken)), requestToken: suppliedToken, duplicate: true };
+    }
+    const [room] = await this.db.select({
+      id: rooms.id,
+      kind: rooms.kind,
+      allowGuests: rooms.allowGuests,
+      guestAdmissionPolicy: rooms.guestAdmissionPolicy,
+      inviteActive: rooms.inviteActive,
+      inviteExpiresAt: rooms.inviteExpiresAt,
+      inviteMaxUses: rooms.inviteMaxUses,
+      inviteUseCount: rooms.inviteUseCount,
+    }).from(rooms).where(eq(rooms.inviteCode, inviteCode)).limit(1);
+    const now = Date.now();
+    if (room) {
+      await this.expireRoomGuestRequests(room.id);
+      const [freshCapacity] = await this.db.select({ inviteUseCount: rooms.inviteUseCount }).from(rooms).where(eq(rooms.id, room.id)).limit(1);
+      if (freshCapacity) room.inviteUseCount = freshCapacity.inviteUseCount;
+    }
+    if (!room || room.kind === 'direct' || !room.allowGuests || room.guestAdmissionPolicy !== 'approval' || !room.inviteActive
+      || (room.inviteExpiresAt !== null && room.inviteExpiresAt <= now)
+      || (room.inviteMaxUses !== null && room.inviteUseCount >= room.inviteMaxUses)) {
+      throw new NotFoundException('The invite link is invalid or is not accepting join requests.');
+    }
+    const requestToken = randomBytes(32).toString('base64url');
+    const created = await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${room.id}, 0))`);
+      const [availableRoom] = await tx.select({ id: rooms.id }).from(rooms).where(and(
+        eq(rooms.id, room.id),
+        eq(rooms.inviteCode, inviteCode),
+        eq(rooms.allowGuests, true),
+        eq(rooms.guestAdmissionPolicy, 'approval'),
+        eq(rooms.inviteActive, true),
+        or(isNull(rooms.inviteExpiresAt), gt(rooms.inviteExpiresAt, now)),
+        or(isNull(rooms.inviteMaxUses), sql`${rooms.inviteUseCount} < ${rooms.inviteMaxUses}`),
+      )).limit(1);
+      if (!availableRoom) throw new NotFoundException('The invite link is no longer accepting join requests.');
+      const [request] = await tx.insert(guestRequests).values({
+        roomId: room.id,
+        inviteCode,
+        displayName,
+        introduction: introduction || null,
+        requesterTokenHash: this.hashGuestRequestToken(requestToken),
+        status: 'pending',
+        createdAt: now,
+        expiresAt: now + GUEST_REQUEST_TTL_MS,
+      }).returning();
+      const outboxId = await this.outbox.enqueue(tx, room.id, 'guest.requested', { requestId: request.id });
+      return { request, outboxId };
+    });
+    await this.outbox.deliverIds([created.outboxId]);
+    return { ...(await this.getGuestRequestStatus(created.request.id, requestToken)), requestToken, duplicate: false };
+  }
+
+  async getGuestRequestStatus(requestId: string, requestTokenInput: unknown) {
+    const requestToken = this.requireGuestRequestToken(requestTokenInput);
+    const tokenHash = this.hashGuestRequestToken(requestToken);
+    const [candidate] = await this.db.select({ roomId: guestRequests.roomId }).from(guestRequests).where(and(
+      eq(guestRequests.id, requestId),
+      eq(guestRequests.requesterTokenHash, tokenHash),
+    )).limit(1);
+    if (!candidate) throw new NotFoundException('The join request is no longer available.');
+    await this.expireRoomGuestRequests(candidate.roomId);
+    const [request] = await this.db.select({
+      id: guestRequests.id,
+      displayName: guestRequests.displayName,
+      introduction: guestRequests.introduction,
+      status: guestRequests.status,
+      createdAt: guestRequests.createdAt,
+      expiresAt: guestRequests.expiresAt,
+      grantExpiresAt: guestRequests.grantExpiresAt,
+      decisionReason: guestRequests.decisionReason,
+      roomName: rooms.name,
+      hostId: rooms.createdBy,
+    }).from(guestRequests).innerJoin(rooms, eq(rooms.id, guestRequests.roomId)).where(and(
+      eq(guestRequests.id, requestId),
+      eq(guestRequests.requesterTokenHash, tokenHash),
+    )).limit(1);
+    if (!request) throw new NotFoundException('The join request is no longer available.');
+    const [host] = request.hostId
+      ? await this.db.select({ displayName: users.displayName }).from(users).where(eq(users.id, request.hostId)).limit(1)
+      : [];
+    return {
+      id: request.id,
+      status: request.status,
+      displayName: request.displayName,
+      introduction: request.introduction,
+      requestedAt: request.createdAt,
+      expiresAt: request.expiresAt,
+      grantExpiresAt: request.grantExpiresAt,
+      decisionReason: request.decisionReason,
+      room: { name: request.roomName, hostedBy: host?.displayName ?? null },
+      canClaim: request.status === 'approved' && Boolean(request.grantExpiresAt && request.grantExpiresAt > Date.now()),
+    };
+  }
+
+  async cancelGuestRequest(requestId: string, requestTokenInput: unknown) {
+    const requestToken = this.requireGuestRequestToken(requestTokenInput);
+    const tokenHash = this.hashGuestRequestToken(requestToken);
+    const [candidate] = await this.db.select({ roomId: guestRequests.roomId }).from(guestRequests).where(and(
+      eq(guestRequests.id, requestId),
+      eq(guestRequests.requesterTokenHash, tokenHash),
+    )).limit(1);
+    if (!candidate) throw new NotFoundException('The join request is no longer available.');
+    const result = await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${candidate.roomId}, 0))`);
+      const [request] = await tx.select().from(guestRequests).where(and(
+        eq(guestRequests.id, requestId),
+        eq(guestRequests.requesterTokenHash, tokenHash),
+      )).for('update').limit(1);
+      if (!request) throw new NotFoundException('The join request is no longer available.');
+      if (!['pending', 'approved'].includes(request.status)) return { status: request.status, outboxId: null };
+      if (request.inviteUseReserved) {
+        await tx.update(rooms).set({ inviteUseCount: sql`greatest(0, ${rooms.inviteUseCount} - 1)` }).where(eq(rooms.id, request.roomId));
+      }
+      await tx.update(guestRequests).set({ status: 'cancelled', inviteUseReserved: false, grantTokenHash: null, grantExpiresAt: null }).where(eq(guestRequests.id, request.id));
+      const outboxId = await this.outbox.enqueue(tx, request.roomId, 'guest.request.updated', { requestId: request.id, status: 'cancelled' });
+      return { status: 'cancelled' as const, outboxId };
+    });
+    if (result.outboxId) await this.outbox.deliverIds([result.outboxId]);
+    return { id: requestId, status: result.status };
+  }
+
+  async listGuestRequests(roomId: string, actor: Actor) {
+    await this.requireRoomOwner(roomId, actor);
+    await this.expireRoomGuestRequests(roomId);
+    const requests = await this.db.select({
+      id: guestRequests.id,
+      displayName: guestRequests.displayName,
+      introduction: guestRequests.introduction,
+      status: guestRequests.status,
+      requestedAt: guestRequests.createdAt,
+      expiresAt: guestRequests.expiresAt,
+      grantExpiresAt: guestRequests.grantExpiresAt,
+      decisionReason: guestRequests.decisionReason,
+      inviteCode: guestRequests.inviteCode,
+    }).from(guestRequests).where(and(
+      eq(guestRequests.roomId, roomId),
+      inArray(guestRequests.status, ['pending', 'approved']),
+    )).orderBy(asc(guestRequests.createdAt)).limit(100);
+    return {
+      requests: requests.map(({ inviteCode, ...request }) => ({
+        ...request,
+        inviteCodeHint: inviteCode.slice(-6).toUpperCase(),
+      })),
+      pendingCount: requests.filter((request) => request.status === 'pending').length,
+    };
+  }
+
+  async decideGuestRequest(roomId: string, requestId: string, actor: Actor, decisionInput: unknown, reasonInput?: unknown) {
+    await this.requireRoomOwner(roomId, actor);
+    const decision = decisionInput === 'approve' ? 'approved' : decisionInput === 'reject' ? 'rejected' : null;
+    if (!decision) throw new BadRequestException('Choose approve or decline.');
+    const decisionReason = typeof reasonInput === 'string' ? reasonInput.trim() : '';
+    if (decisionReason.length > 500) throw new BadRequestException('The decline reason must be 500 characters or fewer.');
+    await this.expireRoomGuestRequests(roomId);
+    const now = Date.now();
+    const result = await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${roomId}, 0))`);
+      if (actor.kind !== 'user') throw new UnauthorizedException('Only the current owner can review join requests.');
+      const [owner] = await tx.select({ userId: roomMembers.userId }).from(roomMembers).where(and(
+        eq(roomMembers.roomId, roomId),
+        eq(roomMembers.userId, actor.id),
+        eq(roomMembers.role, 'owner'),
+      )).for('update').limit(1);
+      if (!owner) throw new UnauthorizedException('Only the current owner can review join requests.');
+      const [request] = await tx.select().from(guestRequests).where(and(eq(guestRequests.id, requestId), eq(guestRequests.roomId, roomId))).for('update').limit(1);
+      if (!request) throw new NotFoundException('That join request no longer exists.');
+      if (request.status !== 'pending') {
+        if (request.status === decision) return { status: request.status, outboxId: null };
+        throw new ConflictException('Another owner already decided this request.');
+      }
+      if (decision === 'approved') {
+        const [room] = await tx.select().from(rooms).where(and(
+          eq(rooms.id, roomId),
+          eq(rooms.inviteCode, request.inviteCode),
+          eq(rooms.allowGuests, true),
+          eq(rooms.guestAdmissionPolicy, 'approval'),
+          eq(rooms.inviteActive, true),
+          or(isNull(rooms.inviteExpiresAt), gt(rooms.inviteExpiresAt, now)),
+          or(isNull(rooms.inviteMaxUses), sql`${rooms.inviteUseCount} < ${rooms.inviteMaxUses}`),
+        )).limit(1);
+        if (!room) throw new ConflictException('This invite no longer has capacity for another guest.');
+        await tx.update(rooms).set({ inviteUseCount: sql`${rooms.inviteUseCount} + 1` }).where(eq(rooms.id, roomId));
+        await tx.update(guestRequests).set({
+          status: 'approved',
+          decidedAt: now,
+          decidedBy: actor.id,
+          grantTokenHash: request.requesterTokenHash,
+          grantExpiresAt: now + GUEST_GRANT_TTL_MS,
+          inviteUseReserved: true,
+          decisionReason: null,
+        }).where(eq(guestRequests.id, request.id));
+      } else {
+        await tx.update(guestRequests).set({ status: 'rejected', decidedAt: now, decidedBy: actor.id, decisionReason: decisionReason || null }).where(eq(guestRequests.id, request.id));
+      }
+      const outboxId = await this.outbox.enqueue(tx, roomId, 'guest.request.updated', { requestId: request.id, status: decision });
+      return { status: decision, outboxId };
+    });
+    if (result.outboxId) await this.outbox.deliverIds([result.outboxId]);
+    return { id: requestId, status: result.status };
+  }
+
+  async revokeGuestRequest(roomId: string, requestId: string, actor: Actor) {
+    await this.requireRoomOwner(roomId, actor);
+    const now = Date.now();
+    const result = await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${roomId}, 0))`);
+      if (actor.kind !== 'user') throw new UnauthorizedException('Only the current owner can revoke admission grants.');
+      const [owner] = await tx.select({ userId: roomMembers.userId }).from(roomMembers).where(and(
+        eq(roomMembers.roomId, roomId),
+        eq(roomMembers.userId, actor.id),
+        eq(roomMembers.role, 'owner'),
+      )).for('update').limit(1);
+      if (!owner) throw new UnauthorizedException('Only the current owner can revoke admission grants.');
+      const [request] = await tx.select().from(guestRequests).where(and(
+        eq(guestRequests.id, requestId),
+        eq(guestRequests.roomId, roomId),
+      )).for('update').limit(1);
+      if (!request) throw new NotFoundException('That join request no longer exists.');
+      if (request.status !== 'approved') {
+        if (request.status === 'rejected') return { status: request.status, outboxId: null };
+        throw new ConflictException('Only an unclaimed admission grant can be revoked.');
+      }
+      if (request.inviteUseReserved) {
+        await tx.update(rooms).set({ inviteUseCount: sql`greatest(0, ${rooms.inviteUseCount} - 1)` }).where(eq(rooms.id, roomId));
+      }
+      await tx.update(guestRequests).set({
+        status: 'rejected',
+        decidedAt: now,
+        decidedBy: actor.id,
+        inviteUseReserved: false,
+        grantTokenHash: null,
+        grantExpiresAt: null,
+      }).where(eq(guestRequests.id, request.id));
+      const outboxId = await this.outbox.enqueue(tx, roomId, 'guest.request.updated', { requestId: request.id, status: 'rejected' });
+      return { status: 'rejected' as const, outboxId };
+    });
+    if (result.outboxId) await this.outbox.deliverIds([result.outboxId]);
+    return { id: requestId, status: result.status };
+  }
+
+  async claimGuestRequest(requestId: string, requestTokenInput: unknown) {
+    const requestToken = this.requireGuestRequestToken(requestTokenInput);
+    const tokenHash = this.hashGuestRequestToken(requestToken);
+    const [candidate] = await this.db.select({ roomId: guestRequests.roomId }).from(guestRequests).where(and(
+      eq(guestRequests.id, requestId),
+      eq(guestRequests.requesterTokenHash, tokenHash),
+    )).limit(1);
+    if (!candidate) throw new NotFoundException('The admission grant is no longer available.');
+    await this.expireRoomGuestRequests(candidate.roomId);
+    const now = Date.now();
+    const expiresAt = this.actors.guestTtl();
+    const result = await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${candidate.roomId}, 0))`);
+      const [request] = await tx.select().from(guestRequests).where(and(
+        eq(guestRequests.id, requestId),
+        eq(guestRequests.requesterTokenHash, tokenHash),
+      )).for('update').limit(1);
+      if (!request) throw new NotFoundException('The admission grant is no longer available.');
+      if (request.status === 'claimed' && request.claimedGuestSessionId) {
+        const [session] = await tx.select().from(guestSessions).where(and(eq(guestSessions.id, request.claimedGuestSessionId), gt(guestSessions.expiresAt, now))).limit(1);
+        if (session) return { session, outboxId: null };
+      }
+      if (request.status !== 'approved' || request.grantTokenHash !== tokenHash || !request.inviteUseReserved || !request.grantExpiresAt || request.grantExpiresAt <= now) {
+        throw new ConflictException('The admission grant is not ready or has expired.');
+      }
+      const [room] = await tx.select().from(rooms).where(and(
+        eq(rooms.id, request.roomId),
+        eq(rooms.inviteCode, request.inviteCode),
+        eq(rooms.allowGuests, true),
+        eq(rooms.guestAdmissionPolicy, 'approval'),
+        eq(rooms.inviteActive, true),
+      )).limit(1);
+      if (!room) throw new ConflictException('Guest access changed before this grant was claimed.');
+      const [session] = await tx.insert(guestSessions).values({
+        roomId: request.roomId,
+        displayName: request.displayName,
+        createdAt: now,
+        lastSeenAt: now,
+        expiresAt,
+      }).returning();
+      await tx.update(guestRequests).set({ status: 'claimed', claimedGuestSessionId: session.id, inviteUseReserved: false }).where(eq(guestRequests.id, request.id));
+      const outboxId = await this.outbox.enqueue(tx, request.roomId, 'room.updated', { guestSessionId: session.id, joinedFromRequestId: request.id });
+      return { session, outboxId };
+    });
+    if (result.outboxId) await this.outbox.deliverIds([result.outboxId]);
+    const [room] = await this.db.select({ name: rooms.name }).from(rooms).where(eq(rooms.id, result.session.roomId)).limit(1);
+    return { sessionId: result.session.id, expiresAt: result.session.expiresAt, roomId: result.session.roomId, roomName: room?.name ?? '' };
   }
 
   async endGuest(actor: Actor) {
@@ -357,13 +681,14 @@ export class ChatService {
           const memberCountByRoom = new Map(memberCounts.map((row) => [row.roomId, row.count]));
           const existing = directRooms.find((room) => memberCountByRoom.get(room.id) === 2);
           if (existing) {
-            await tx.update(rooms).set({ allowGuests: false }).where(eq(rooms.id, existing.id));
+            await tx.update(rooms).set({ allowGuests: false, guestAdmissionPolicy: 'off' }).where(eq(rooms.id, existing.id));
             return { roomId: existing.id, inviteCode: existing.inviteCode, outboxId: null, reused: true };
           }
         }
       }
       const kind = memberIds.length === 1 ? 'direct' : 'group';
-      const [room] = await tx.insert(rooms).values({ name, kind, createdBy: actor.id, inviteCode, allowGuests: kind === 'direct' ? false : body.allowGuests !== false, createdAt: now }).returning({ id: rooms.id });
+      const guestAccess = kind !== 'direct' && body.allowGuests !== false;
+      const [room] = await tx.insert(rooms).values({ name, kind, createdBy: actor.id, inviteCode, allowGuests: guestAccess, guestAdmissionPolicy: guestAccess ? 'link' : 'off', createdAt: now }).returning({ id: rooms.id });
       await tx.insert(roomMembers).values([
         { roomId: room.id, userId: actor.id, role: 'owner', joinedAt: now },
         ...memberIds.map((userId) => ({ roomId: room.id, userId, role: 'member' as const, joinedAt: now })),
@@ -833,7 +1158,7 @@ export class ChatService {
     await this.actors.assertRoomAccess(roomId, actor);
     const now = Date.now();
     const [room, memberRows, guestRows, ownMembership, blockedAccounts] = await Promise.all([
-      this.db.select({ id: rooms.id, kind: rooms.kind, createdBy: rooms.createdBy, allowGuests: rooms.allowGuests, inviteActive: rooms.inviteActive, inviteExpiresAt: rooms.inviteExpiresAt, inviteMaxUses: rooms.inviteMaxUses, inviteUseCount: rooms.inviteUseCount }).from(rooms).where(eq(rooms.id, roomId)).limit(1),
+      this.db.select({ id: rooms.id, kind: rooms.kind, createdBy: rooms.createdBy, allowGuests: rooms.allowGuests, guestAdmissionPolicy: rooms.guestAdmissionPolicy, inviteActive: rooms.inviteActive, inviteExpiresAt: rooms.inviteExpiresAt, inviteMaxUses: rooms.inviteMaxUses, inviteUseCount: rooms.inviteUseCount }).from(rooms).where(eq(rooms.id, roomId)).limit(1),
       this.db.select({ id: users.id, displayName: users.displayName, avatarColor: users.avatarColor, role: roomMembers.role, joinedAt: roomMembers.joinedAt })
         .from(roomMembers).innerJoin(users, eq(users.id, roomMembers.userId)).where(eq(roomMembers.roomId, roomId)).orderBy(asc(roomMembers.joinedAt)),
       this.db.select({ id: guestSessions.id, displayName: guestSessions.displayName, joinedAt: guestSessions.createdAt })
@@ -852,6 +1177,7 @@ export class ChatService {
       currentRole: actor.kind === 'user' ? ownMembership[0] && 'role' in ownMembership[0] ? ownMembership[0].role : null : 'guest',
       muted: Boolean(ownMembership[0]?.mutedAt),
       allowGuests: room[0].allowGuests,
+      guestAdmissionPolicy: room[0].allowGuests ? room[0].guestAdmissionPolicy : 'off',
       canManage: actor.kind === 'user' && ownMembership[0] && 'role' in ownMembership[0] && ownMembership[0].role === 'owner',
       kind: room[0].kind,
       inviteActive: room[0].inviteActive,
@@ -862,11 +1188,18 @@ export class ChatService {
     };
   }
 
-  async updateRoomGovernance(roomId: string, actor: Actor, body: { allowGuests?: unknown; inviteActive?: unknown; inviteExpiresInHours?: unknown; inviteMaxUses?: unknown }) {
+  async updateRoomGovernance(roomId: string, actor: Actor, body: { allowGuests?: unknown; guestAdmissionPolicy?: unknown; inviteActive?: unknown; inviteExpiresInHours?: unknown; inviteMaxUses?: unknown }) {
     const membership = await this.requireRoomOwner(roomId, actor);
     if (membership.kind === 'direct') throw new BadRequestException('Direct conversations do not use guest invites.');
     const patch: Partial<typeof rooms.$inferInsert> = {};
-    if (typeof body.allowGuests === 'boolean') patch.allowGuests = body.allowGuests;
+    if (body.guestAdmissionPolicy !== undefined) {
+      if (!['off', 'approval', 'link'].includes(String(body.guestAdmissionPolicy))) throw new BadRequestException('The guest admission policy is invalid.');
+      patch.guestAdmissionPolicy = body.guestAdmissionPolicy as 'off' | 'approval' | 'link';
+      patch.allowGuests = body.guestAdmissionPolicy !== 'off';
+    } else if (typeof body.allowGuests === 'boolean') {
+      patch.allowGuests = body.allowGuests;
+      patch.guestAdmissionPolicy = body.allowGuests ? 'link' : 'off';
+    }
     if (typeof body.inviteActive === 'boolean') patch.inviteActive = body.inviteActive;
     if (body.inviteExpiresInHours !== undefined) {
       const hours = Number(body.inviteExpiresInHours);
@@ -875,15 +1208,60 @@ export class ChatService {
     if (body.inviteMaxUses !== undefined) {
       const maxUses = Number(body.inviteMaxUses);
       patch.inviteMaxUses = Number.isInteger(maxUses) && maxUses > 0 ? Math.min(maxUses, 1000) : null;
-      patch.inviteUseCount = 0;
     }
     if (!Object.keys(patch).length) throw new BadRequestException('No conversation setting was changed.');
     if (body.inviteActive === true) {
       patch.inviteCode = this.makeCode();
       patch.inviteUseCount = 0;
     }
-    const [updated] = await this.db.update(rooms).set(patch).where(eq(rooms.id, roomId)).returning();
-    return updated;
+    const result = await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${roomId}, 0))`);
+      const [currentRoom] = await tx.select().from(rooms).where(eq(rooms.id, roomId)).for('update').limit(1);
+      if (!currentRoom) throw new NotFoundException('The conversation no longer exists.');
+      let cancelledRequestCount = 0;
+      let reservedToRelease = 0;
+      const targetPolicy = patch.guestAdmissionPolicy ?? currentRoom.guestAdmissionPolicy;
+      const targetAllowsGuests = patch.allowGuests ?? currentRoom.allowGuests;
+      const targetInviteActive = patch.inviteActive ?? currentRoom.inviteActive;
+      const invalidatesAllOpenRequests = Boolean(
+        patch.inviteCode
+        || targetPolicy !== currentRoom.guestAdmissionPolicy
+        || targetAllowsGuests !== currentRoom.allowGuests
+        || targetInviteActive !== currentRoom.inviteActive,
+      );
+      let requestsToCancel: Array<{ id: string; inviteUseReserved: boolean }> = [];
+      if (invalidatesAllOpenRequests) {
+        requestsToCancel = await tx.select({ id: guestRequests.id, inviteUseReserved: guestRequests.inviteUseReserved }).from(guestRequests).where(and(
+          eq(guestRequests.roomId, roomId),
+          inArray(guestRequests.status, ['pending', 'approved']),
+        )).for('update');
+      } else if (patch.inviteMaxUses !== undefined && patch.inviteMaxUses !== null) {
+        const excessReservations = Math.max(0, currentRoom.inviteUseCount - patch.inviteMaxUses);
+        if (excessReservations) {
+          requestsToCancel = await tx.select({ id: guestRequests.id, inviteUseReserved: guestRequests.inviteUseReserved }).from(guestRequests).where(and(
+            eq(guestRequests.roomId, roomId),
+            eq(guestRequests.status, 'approved'),
+            eq(guestRequests.inviteUseReserved, true),
+          )).orderBy(desc(guestRequests.createdAt)).limit(excessReservations).for('update');
+        }
+      }
+      cancelledRequestCount = requestsToCancel.length;
+      reservedToRelease = requestsToCancel.filter((request) => request.inviteUseReserved).length;
+      if (requestsToCancel.length) {
+        await tx.update(guestRequests).set({ status: 'cancelled', inviteUseReserved: false, grantTokenHash: null, grantExpiresAt: null })
+          .where(inArray(guestRequests.id, requestsToCancel.map((request) => request.id)));
+      }
+      const [updated] = await tx.update(rooms).set({
+        ...patch,
+        ...(reservedToRelease && patch.inviteUseCount === undefined
+          ? { inviteUseCount: sql`greatest(0, ${rooms.inviteUseCount} - ${reservedToRelease})` }
+          : {}),
+      }).where(eq(rooms.id, roomId)).returning();
+      const outboxId = await this.outbox.enqueue(tx, roomId, 'room.updated', { governance: true, cancelledRequestCount });
+      return { updated, cancelledRequestCount, outboxId };
+    });
+    await this.outbox.deliverIds([result.outboxId]);
+    return { ...result.updated, cancelledRequestCount: result.cancelledRequestCount };
   }
 
   async updateRoomPreferences(roomId: string, actor: Actor, body: { muted?: unknown }) {
@@ -898,14 +1276,8 @@ export class ChatService {
   }
 
   async revokeInvite(roomId: string, actor: Actor) {
-    const membership = await this.requireRoomOwner(roomId, actor);
-    if (membership.kind === 'direct') throw new BadRequestException('Direct conversations do not use public invite links.');
-    const outboxId = await this.db.transaction(async (tx) => {
-      await tx.update(rooms).set({ inviteActive: false }).where(eq(rooms.id, roomId));
-      return this.outbox.enqueue(tx, roomId, 'room.updated', { inviteRevoked: true });
-    });
-    await this.outbox.deliverIds([outboxId]);
-    return { inviteActive: false };
+    const updated = await this.updateRoomGovernance(roomId, actor, { inviteActive: false });
+    return { inviteActive: false, cancelledRequestCount: updated.cancelledRequestCount };
   }
 
   async transferOwnership(roomId: string, userId: string, actor: Actor) {
@@ -1103,13 +1475,50 @@ export class ChatService {
       const [existing] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers).where(eq(roomMembers.userId, actor.id)).limit(1);
       if (existing) return;
       const now = Date.now();
-      const [room] = await tx.insert(rooms).values({ name: 'Minh Anh', kind: 'direct', createdBy: actor.id, inviteCode: this.makeCode(), allowGuests: false, createdAt: now }).returning({ id: rooms.id });
+      const [room] = await tx.insert(rooms).values({ name: 'Minh Anh', kind: 'direct', createdBy: actor.id, inviteCode: this.makeCode(), allowGuests: false, guestAdmissionPolicy: 'off', createdAt: now }).returning({ id: rooms.id });
       await tx.insert(roomMembers).values({ roomId: room.id, userId: actor.id, role: 'owner', joinedAt: now });
       await tx.insert(messages).values([
         { roomId: room.id, senderName: 'Minh Anh', type: 'text', body: 'Welcome to Nét, where words and drawings can continue the same story.', createdAt: now + 1 },
         { roomId: room.id, senderId: actor.id, senderName: actor.displayName, type: 'text', body: 'I will start with a line ✨', createdAt: now + 2 },
       ]);
     });
+  }
+
+  private async expireRoomGuestRequests(roomId: string) {
+    const now = Date.now();
+    const result = await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${roomId}, 0))`);
+      const stale = await tx.select({ id: guestRequests.id, inviteUseReserved: guestRequests.inviteUseReserved }).from(guestRequests).where(and(
+        eq(guestRequests.roomId, roomId),
+        or(
+          and(eq(guestRequests.status, 'pending'), lte(guestRequests.expiresAt, now)),
+          and(eq(guestRequests.status, 'approved'), lte(guestRequests.grantExpiresAt, now)),
+        ),
+      )).for('update');
+      if (!stale.length) return null;
+      const reservedCount = stale.filter((request) => request.inviteUseReserved).length;
+      if (reservedCount) {
+        await tx.update(rooms).set({ inviteUseCount: sql`greatest(0, ${rooms.inviteUseCount} - ${reservedCount})` }).where(eq(rooms.id, roomId));
+      }
+      await tx.update(guestRequests).set({
+        status: 'expired',
+        inviteUseReserved: false,
+        grantTokenHash: null,
+        grantExpiresAt: null,
+      }).where(inArray(guestRequests.id, stale.map((request) => request.id)));
+      return this.outbox.enqueue(tx, roomId, 'guest.request.updated', { requestIds: stale.map((request) => request.id), status: 'expired' });
+    });
+    if (result) await this.outbox.deliverIds([result]);
+  }
+
+  private requireGuestRequestToken(value: unknown) {
+    const token = typeof value === 'string' ? value.trim() : '';
+    if (token.length < 32 || token.length > 200) throw new UnauthorizedException('The join request credential is invalid.');
+    return token;
+  }
+
+  private hashGuestRequestToken(token: string) {
+    return createHash('sha256').update(token).digest('hex');
   }
 
   private requireText(value: unknown, label: string, min: number, max: number) {

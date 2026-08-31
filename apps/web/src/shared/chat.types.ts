@@ -24,6 +24,8 @@ export type RoomView = {
   inviteExpiresAt: number | null;
   inviteMaxUses: number | null;
   inviteUseCount: number;
+  guestAdmissionPolicy: 'off' | 'approval' | 'link';
+  pendingRequestCount: number;
 };
 
 export type ReactionView = { emoji: string; count: number; reacted: boolean };
@@ -90,6 +92,7 @@ export type RoomPeopleView = {
   currentRole: 'owner' | 'member' | 'guest' | null;
   muted: boolean;
   allowGuests: boolean;
+  guestAdmissionPolicy: 'off' | 'approval' | 'link';
   canManage: boolean;
   kind: string;
   inviteActive: boolean;
@@ -97,4 +100,21 @@ export type RoomPeopleView = {
   inviteMaxUses: number | null;
   inviteUseCount: number;
   blockedAccounts?: Array<{ id: string; displayName: string; avatarColor: string }>;
+};
+
+export type GuestRequestView = {
+  id: string;
+  displayName: string;
+  introduction: string | null;
+  status: 'pending' | 'approved' | 'claimed' | 'rejected' | 'cancelled' | 'expired';
+  requestedAt: number;
+  expiresAt: number;
+  grantExpiresAt: number | null;
+  inviteCodeHint: string;
+  decisionReason: string | null;
+};
+
+export type GuestRequestStatusView = GuestRequestView & {
+  room: { name: string; hostedBy: string | null };
+  canClaim: boolean;
 };

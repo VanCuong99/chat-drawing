@@ -250,6 +250,26 @@ test('invite cho biết ai mời, tên phòng, người tham gia và hoạt đ�
   await expect(page.getByText(/Vừa có một bản vẽ được chia sẻ/)).toBeVisible();
 });
 
+test('form xin tham gia invite approval nằm trong viewport mobile đầu tiên @critical', async ({ page }) => {
+  const inviteCode = 'mobileApprovalInvite2026';
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.route(`**/api/invites/${inviteCode}`, (route) => route.fulfill({ json: {
+    valid: true,
+    guestAllowed: true,
+    guestAdmissionPolicy: 'approval',
+    requestExpiresInHours: 24,
+    room: { name: 'Nhóm phác thảo', hostedBy: 'Minh Anh', participants: [], participantCount: 1, recentActivity: null, createdAt: Date.now() },
+  } }));
+  await page.goto(`/?room=${inviteCode}`);
+  const form = page.locator('.invite-join-form');
+  const submit = form.getByRole('button', { name: /Xin tham gia/ });
+  await expect(form.getByRole('textbox', { name: 'Tên hiển thị' })).toBeVisible();
+  await expect(form.getByRole('textbox', { name: /giới thiệu ngắn/i })).toBeVisible();
+  const submitBox = await submit.boundingBox();
+  expect(submitBox).not.toBeNull();
+  expect((submitBox?.y ?? 844) + (submitBox?.height ?? 0)).toBeLessThanOrEqual(844);
+});
+
 test('khách có thể thử một nét trước khi chọn tên @critical', async ({ page }) => {
   await page.goto('/');
   const canvas = page.getByLabel('Canvas nhỏ để thử Nét');
@@ -657,6 +677,8 @@ test('mất phản hồi khi gửi không tạo mã mới hoặc tin nhắn trù
 });
 
 test('ảnh offline được giữ trong outbox và gửi lại sau khi mở tab mới @critical', async ({ page, context }) => {
+  test.setTimeout(60_000);
+  await page.setViewportSize({ width: 390, height: 844 });
   const mediaRoom = { ...room('media-outbox-room'), messageCount: 1 };
   let uploadCount = 0;
   let sendCount = 0;
@@ -688,6 +710,26 @@ test('ảnh offline được giữ trong outbox và gửi lại sau khi mở tab
   await expect(page.locator('.conversation-panel')).toBeVisible();
   await context.setOffline(true);
   await page.getByLabel('Tệp hình ảnh').setInputFiles({ name: 'ban-phac-thao.png', mimeType: 'image/png', buffer: Buffer.from('anh thu nghiem') });
+  const photoDialog = page.getByRole('dialog', { name: 'Chuẩn bị ảnh' });
+  const photoGeometry = await photoDialog.locator('.photo-preparation-dialog').evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    const title = element.querySelector('h2');
+    const close = element.querySelector<HTMLButtonElement>('.dialog-close');
+    return {
+      width: bounds.width,
+      height: bounds.height,
+      titleSize: title ? Number.parseFloat(getComputedStyle(title).fontSize) : 99,
+      closeWidth: close?.getBoundingClientRect().width ?? 0,
+      closeIconWidth: close?.querySelector('svg')?.getBoundingClientRect().width ?? 0,
+    };
+  });
+  expect(photoGeometry.width).toBe(390);
+  expect(photoGeometry.height).toBe(844);
+  expect(photoGeometry.titleSize).toBe(22);
+  expect(photoGeometry.closeWidth).toBeGreaterThanOrEqual(44);
+  expect(photoGeometry.closeIconWidth).toBe(18);
+  await expect(page.getByRole('button', { name: 'Gửi ảnh', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Tiếp: Chia sẻ' }).click();
   await page.getByRole('button', { name: 'Gửi ảnh', exact: true }).click();
   const outbox = page.locator('.message-outbox');
   await expect(outbox).toContainText('ban-phac-thao.png');
@@ -701,7 +743,8 @@ test('ảnh offline được giữ trong outbox và gửi lại sau khi mở tab
   await restoredOutbox.getByRole('button', { name: /Chưa thể gửi.*1 mục được lưu/ }).click();
   await expect(restoredOutbox).toContainText('ban-phac-thao.png');
   await restoredOutbox.getByRole('button', { name: 'Thử lại tất cả' }).click();
-  await expect(restoredOutbox).toHaveCount(0);
+  await expect.poll(() => ({ uploadCount, sendCount }), { timeout: 15_000 }).toEqual({ uploadCount: 1, sendCount: 1 });
+  await expect(restoredOutbox).toHaveCount(0, { timeout: 15_000 });
   expect(uploadCount).toBe(1);
   expect(sendCount).toBe(1);
   expect(uploadId).toBe(messageRequestId);
@@ -795,6 +838,7 @@ test('ảnh và bản vẽ lỗi vĩnh viễn vẫn có thể phục hồi từn
 
   await page.goto('/');
   await page.getByLabel('Tệp hình ảnh').setInputFiles({ name: 'anh-can-xu-ly.png', mimeType: 'image/png', buffer: Buffer.from('anh loi') });
+  await page.getByRole('button', { name: 'Tiếp: Chia sẻ' }).click();
   await page.getByRole('button', { name: 'Gửi ảnh', exact: true }).click();
   const outbox = page.locator('.message-outbox');
   await expect(outbox).toContainText('anh-can-xu-ly.png');
@@ -975,6 +1019,7 @@ test('kết thúc guest thắng race với attachment đang được ghi vào ou
     };
   });
   await page.getByLabel('Tệp hình ảnh').setInputFiles({ name: 'race-private.png', mimeType: 'image/png', buffer: Buffer.from('private race') });
+  await page.getByRole('button', { name: 'Tiếp: Chia sẻ' }).click();
   await page.getByRole('button', { name: 'Gửi ảnh', exact: true }).click();
   await expect.poll(() => page.evaluate(() => Boolean((window as unknown as { __outboxPutStarted?: boolean }).__outboxPutStarted))).toBe(true);
   await page.getByRole('button', { name: 'Kết thúc phiên khách' }).click();
@@ -1210,9 +1255,34 @@ test('lịch sử bản vẽ cho phép so sánh và tiếp tục từ bất kỳ
   await page.getByRole('button', { name: /Xem lịch sử 3 phiên bản|Xem lịch sử phiên bản/ }).click();
   const dialog = page.getByRole('dialog', { name: 'Lịch sử hình ảnh' });
   await expect(dialog).toBeVisible();
+  const lineageGeometry = await dialog.locator('.lineage-dialog').evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    const header = element.querySelector<HTMLElement>('.lineage-header');
+    const title = element.querySelector('h2');
+    const close = element.querySelector<HTMLButtonElement>('.dialog-close');
+    const metadata = element.querySelector<HTMLElement>('.lineage-filmstrip small');
+    return {
+      width: bounds.width,
+      height: bounds.height,
+      headerHeight: header?.getBoundingClientRect().height ?? 99,
+      titleSize: title ? Number.parseFloat(getComputedStyle(title).fontSize) : 99,
+      closeWidth: close?.getBoundingClientRect().width ?? 0,
+      closeIconWidth: close?.querySelector('svg')?.getBoundingClientRect().width ?? 0,
+      metadataSize: metadata ? Number.parseFloat(getComputedStyle(metadata).fontSize) : 0,
+    };
+  });
+  expect(lineageGeometry.width).toBe(390);
+  expect(lineageGeometry.height).toBe(844);
+  expect(lineageGeometry.headerHeight).toBeLessThanOrEqual(72);
+  expect(lineageGeometry.titleSize).toBeLessThanOrEqual(22);
+  expect(lineageGeometry.closeWidth).toBeGreaterThanOrEqual(44);
+  expect(lineageGeometry.closeIconWidth).toBe(18);
+  expect(lineageGeometry.metadataSize).toBeGreaterThanOrEqual(12);
   await expect(dialog.getByText('3 phiên bản')).toBeVisible();
-  await expect(dialog.getByRole('combobox', { name: 'Bản so sánh A' })).toHaveValue('canvas-v2');
-  await expect(dialog.getByRole('combobox', { name: 'Bản so sánh B' })).toHaveValue('canvas-v3');
+  await expect(dialog.getByRole('img', { name: 'Bản vẽ phiên bản 3 của Review User' })).toBeVisible();
+  await expect(dialog.getByRole('combobox', { name: 'So sánh với' })).toHaveCount(0);
+  await dialog.getByRole('button', { name: 'So sánh phiên bản' }).click();
+  await expect(dialog.getByRole('combobox', { name: 'So sánh với' })).toHaveValue('canvas-v2');
   await expect(dialog.getByRole('img', { name: 'Bản so sánh A · phiên bản 2' })).toBeHidden();
   await expect(dialog.getByRole('img', { name: 'Bản so sánh B · phiên bản 3' })).toBeVisible();
   const previewChoice = dialog.getByRole('group', { name: 'Chọn phiên bản để xem trước' });
@@ -1224,10 +1294,46 @@ test('lịch sử bản vẽ cho phép so sánh và tiếp tục từ bất kỳ
   const continueBox = await continueButton.boundingBox();
   expect(continueBox?.height).toBeGreaterThanOrEqual(44);
   await dialog.getByRole('button', { name: /Phiên bản 1.*Minh Anh/ }).click();
-  await expect(dialog.getByRole('combobox', { name: 'Bản so sánh B' })).toHaveValue('canvas-v1');
+  await expect(dialog.getByRole('heading', { name: 'So sánh với Phiên bản 1', exact: true })).toBeVisible();
+  await expect(dialog.getByRole('combobox', { name: 'So sánh với' })).toHaveValue('canvas-v2');
   await expect(dialog.getByRole('button', { name: /Vẽ tiếp từ phiên bản 1/ })).toBeVisible();
   await dialog.getByRole('button', { name: /Vẽ tiếp từ phiên bản 1/ }).click();
   await expect(page.getByRole('dialog', { name: /Nét Studio · V1/ })).toBeVisible();
+});
+
+test('lịch sử chỉ có một phiên bản không hiển thị hành động so sánh @critical', async ({ page }) => {
+  const canvasRoom = { ...room('single-lineage-room'), messageCount: 1, mediaCount: 1 };
+  const onlyVersion = {
+    ...message(1, ''),
+    id: 'single-canvas-v1',
+    roomId: canvasRoom.id,
+    senderName: 'Review User',
+    senderId: 'review-user',
+    type: 'canvas',
+    assetKey: 'single-canvas-asset',
+    assetUrl: '/api/assets/single-canvas-asset?access=review',
+    canvasVersion: 1,
+  };
+  await page.route('**/api/bootstrap', (route) => route.fulfill({ json: {
+    actor: { kind: 'user', id: 'review-user', displayName: 'Review User', email: 'review@example.test' },
+    rooms: [canvasRoom],
+  } }));
+  await page.route('**/api/realtime/token', (route) => route.fulfill({ status: 503, json: { error: 'Dùng polling trong test' } }));
+  await page.route('**/api/rooms/single-lineage-room/messages/single-canvas-v1/lineage', (route) => route.fulfill({ json: { lineage: [onlyVersion] } }));
+  await page.route('**/api/rooms/single-lineage-room/messages*', (route) => route.fulfill({ json: { messages: [onlyVersion], nextCursor: null } }));
+  await page.route('**/api/assets/single-canvas-asset*', (route) => route.fulfill({
+    status: 200,
+    contentType: 'image/svg+xml',
+    body: '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720"><rect width="100%" height="100%" fill="#f7f2ff"/></svg>',
+  }));
+
+  await page.goto('/');
+  await page.getByRole('button', { name: /Xem lịch sử phiên bản/ }).click();
+  const dialog = page.getByRole('dialog', { name: 'Lịch sử hình ảnh' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'So sánh phiên bản' })).toHaveCount(0);
+  await expect(dialog.getByRole('combobox', { name: 'So sánh với' })).toHaveCount(0);
+  await expect(dialog.getByRole('button', { name: /Vẽ tiếp từ phiên bản 1/ })).toBeVisible();
 });
 
 test('ảnh là nguồn sáng tạo với CTA 44px, source layer và lineage parent được giữ khi gửi @critical', async ({ page }) => {
@@ -1326,23 +1432,98 @@ test('People & Safety hiển thị vai trò, mute, report và thu hồi invite t
   await page.route('**/api/rooms/safety-room/people', (route) => route.fulfill({ json: { members: [
     { id: 'owner-user', kind: 'user', displayName: 'Chủ phòng', avatarColor: '#6f4ee8', role: 'owner', joinedAt: 1 },
     { id: 'member-user', kind: 'user', displayName: 'Bảo Nét', avatarColor: '#ef7668', role: 'member', joinedAt: 2 },
-  ], currentRole: 'owner', muted, allowGuests: true, canManage: true, kind: 'group' } }));
+  ], currentRole: 'owner', muted, allowGuests: true, guestAdmissionPolicy: 'approval', canManage: true, kind: 'group', inviteActive: true, inviteExpiresAt: null, inviteMaxUses: 5, inviteUseCount: 1, blockedAccounts: [] } }));
+  await page.route('**/api/rooms/safety-room/guest-requests', (route) => route.fulfill({ json: { requests: [], pendingCount: 0 } }));
   await page.route('**/api/rooms/safety-room/preferences', async (route) => { muted = Boolean((route.request().postDataJSON() as { muted: boolean }).muted); return route.fulfill({ json: { muted } }); });
-  await page.route('**/api/rooms/safety-room/invite/revoke', (route) => { inviteRevoked = true; return route.fulfill({ json: { inviteCode: 'new-safe-invite' } }); });
+  await page.route('**/api/rooms/safety-room/governance', async (route) => {
+    const payload = route.request().postDataJSON() as { inviteActive?: boolean };
+    inviteRevoked = payload.inviteActive === false;
+    return route.fulfill({ json: { ...safetyRoom, inviteActive: false, guestAdmissionPolicy: 'approval', allowGuests: true, inviteExpiresAt: null, inviteMaxUses: 5, inviteUseCount: 1, cancelledRequestCount: 0 } });
+  });
   await page.goto('/');
   await page.getByRole('button', { name: 'Thông tin cuộc trò chuyện' }).click();
   await page.getByRole('button', { name: 'Thành viên & An toàn' }).click();
   const dialog = page.getByRole('dialog', { name: 'Thành viên & An toàn' });
   await expect(dialog.getByText('Bảo Nét')).toBeVisible();
   await expect(dialog.getByText('Chủ phòng', { exact: true }).first()).toBeVisible();
+  const managementGeometry = await dialog.locator('.people-safety-dialog').evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    const title = element.querySelector('h2');
+    const close = element.querySelector<HTMLButtonElement>('.dialog-close');
+    const tabs = element.querySelector<HTMLElement>('.people-safety-tabs');
+    const people = element.querySelector<HTMLElement>('.people-list');
+    return {
+      width: bounds.width,
+      rightGap: window.innerWidth - bounds.right,
+      titleSize: title ? Number.parseFloat(getComputedStyle(title).fontSize) : 99,
+      closeWidth: close?.getBoundingClientRect().width ?? 0,
+      closeIconWidth: close?.querySelector('svg')?.getBoundingClientRect().width ?? 0,
+      tabWrap: tabs ? getComputedStyle(tabs).flexWrap : 'wrap',
+      peopleBorder: people ? getComputedStyle(people).borderTopWidth : '1px',
+    };
+  });
+  expect(managementGeometry.width).toBeLessThanOrEqual(720);
+  expect(managementGeometry.rightGap).toBeLessThanOrEqual(1);
+  expect(managementGeometry.titleSize).toBeLessThanOrEqual(24);
+  expect(managementGeometry.closeWidth).toBeGreaterThanOrEqual(44);
+  expect(managementGeometry.closeIconWidth).toBe(18);
+  expect(managementGeometry.tabWrap).toBe('nowrap');
+  expect(managementGeometry.peopleBorder).toBe('0px');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(async () => dialog.locator('.people-safety-dialog').evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    return [Math.round(bounds.width), Math.round(bounds.height)];
+  })).toEqual([390, 844]);
+  await dialog.getByRole('tab', { name: 'An toàn' }).click();
   const mute = dialog.getByRole('button', { name: /Tắt thông báo/ });
   expect((await mute.boundingBox())?.height).toBeGreaterThanOrEqual(44);
   await mute.click();
   await expect(dialog.getByRole('button', { name: /Bật lại thông báo/ })).toBeVisible();
-  await dialog.getByRole('button', { name: /Thu hồi link mời/ }).click();
-  await expect.poll(() => inviteRevoked).toBe(true);
+  await dialog.getByRole('tab', { name: /Mọi người/ }).click();
+  await dialog.locator('summary[aria-label="Thao tác với Bảo Nét"]').click();
   await expect(dialog.getByRole('button', { name: 'Báo cáo', exact: true })).toBeVisible();
   await expect(dialog.getByRole('button', { name: 'Xóa', exact: true })).toBeVisible();
+  await dialog.getByRole('tab', { name: 'Quyền truy cập & lời mời' }).click();
+  await dialog.getByRole('button', { name: 'Thu hồi lời mời' }).click();
+  const confirmation = page.getByRole('dialog', { name: 'Thu hồi lời mời này?' });
+  await expect(confirmation.getByText('Tin nhắn, bản vẽ và thành viên hiện tại không bị xóa.')).toBeVisible();
+  const confirmationGeometry = await confirmation.locator('.confirmation-dialog').evaluate((element) => ({
+    width: element.getBoundingClientRect().width,
+    titleSize: Number.parseFloat(getComputedStyle(element.querySelector('h2')!).fontSize),
+    bodySize: Number.parseFloat(getComputedStyle(element.querySelector('p')!).fontSize),
+    eyebrowDisplay: getComputedStyle(element.querySelector<HTMLElement>('.eyebrow')!).display,
+  }));
+  expect(confirmationGeometry.width).toBeLessThanOrEqual(440);
+  expect(confirmationGeometry.titleSize).toBe(20);
+  expect(confirmationGeometry.bodySize).toBeGreaterThanOrEqual(15);
+  expect(confirmationGeometry.eyebrowDisplay).toBe('none');
+  await confirmation.getByRole('button', { name: 'Thu hồi lời mời' }).click();
+  await expect.poll(() => inviteRevoked).toBe(true);
+  await dialog.getByRole('tab', { name: 'An toàn' }).click();
+  await expect(dialog.getByRole('button', { name: 'Báo cáo cuộc trò chuyện' })).toBeVisible();
+});
+
+test('badge yêu cầu mở thẳng hàng đợi và tách trạng thái đang chờ với đã duyệt @critical', async ({ page }) => {
+  const admissionRoom = { ...room('admission-ui-room'), pendingRequestCount: 2 };
+  const requestedAt = Date.now() - 3 * 60_000;
+  const requests = [
+    { id: 'pending-request', displayName: 'Lan Guest', introduction: 'Mình muốn tiếp tục bản phác.', status: 'pending', requestedAt, expiresAt: Date.now() + 23 * 60 * 60_000, grantExpiresAt: null, inviteCodeHint: 'ABC123', decisionReason: null },
+    { id: 'approved-request', displayName: 'Mai Guest', introduction: null, status: 'approved', requestedAt: requestedAt - 60_000, expiresAt: Date.now() + 23 * 60 * 60_000, grantExpiresAt: Date.now() + 60 * 60_000, inviteCodeHint: 'ABC123', decisionReason: null },
+  ];
+  await page.route('**/api/bootstrap', (route) => route.fulfill({ json: { actor: { kind: 'user', id: 'owner-user', displayName: 'Chủ phòng', email: 'owner@example.test' }, rooms: [admissionRoom] } }));
+  await page.route('**/api/realtime/token', (route) => route.fulfill({ status: 503, json: { error: 'polling' } }));
+  await page.route('**/api/rooms/admission-ui-room/messages*', (route) => route.fulfill({ json: { messages: [message(1)], nextCursor: null } }));
+  await page.route('**/api/rooms/admission-ui-room/people', (route) => route.fulfill({ json: { members: [], currentRole: 'owner', muted: false, allowGuests: true, guestAdmissionPolicy: 'approval', canManage: true, kind: 'group', inviteActive: true, inviteExpiresAt: null, inviteMaxUses: null, inviteUseCount: 1, blockedAccounts: [] } }));
+  await page.route('**/api/rooms/admission-ui-room/guest-requests', (route) => route.fulfill({ json: { requests, pendingCount: 1 } }));
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Mở 2 yêu cầu tham gia Phòng kiểm thử' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Thành viên & An toàn' });
+  await expect(dialog.getByRole('tab', { name: /Yêu cầu/ })).toHaveAttribute('aria-selected', 'true');
+  await expect(dialog.getByRole('heading', { name: 'Đang chờ duyệt' })).toBeVisible();
+  await expect(dialog.getByRole('heading', { name: 'Đã duyệt · Đang chờ vào phòng' })).toBeVisible();
+  await expect(page.locator('#guest-request-pending-request')).toHaveClass(/highlighted/);
+  await expect(dialog.getByText(/3 phút trước/)).toBeVisible();
 });
 
 test.describe('tải ảnh theo múi giờ của người dùng', () => {

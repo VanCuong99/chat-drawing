@@ -4,6 +4,7 @@ import { createClient, type RedisClientType } from 'redis';
 import type { RealtimeEvent } from './realtime.service';
 
 const CHANNEL_PREFIX = 'net:room:';
+const ACTOR_CHANNEL_PREFIX = 'net:actor:';
 
 @Injectable()
 export class RealtimeBrokerService implements OnModuleDestroy {
@@ -17,6 +18,14 @@ export class RealtimeBrokerService implements OnModuleDestroy {
     const client = await this.connectedClient();
     if (!client) return;
     await client.publish(`${CHANNEL_PREFIX}${roomId}`, JSON.stringify({ event, payload: { roomId, ...payload } }));
+  }
+
+  async publishActors(actorKeys: string[], roomId: string, event: RealtimeEvent, payload: Record<string, unknown>) {
+    if (!actorKeys.length) return;
+    const client = await this.connectedClient();
+    if (!client) return;
+    const message = JSON.stringify({ event, payload: { roomId, ...payload } });
+    await Promise.all([...new Set(actorKeys)].map((actorKey) => client.publish(`${ACTOR_CHANNEL_PREFIX}${actorKey}`, message)));
   }
 
   async onModuleDestroy() {

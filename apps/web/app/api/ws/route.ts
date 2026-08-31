@@ -2,16 +2,12 @@ import { experimental_upgradeWebSocket, type WebSocketData } from '@vercel/funct
 import { jwtVerify } from 'jose';
 import { createClient } from 'redis';
 import { WebSocket } from 'ws';
+import { shouldDeliverRealtimeEnvelope, type RealtimeEnvelope, type RealtimeSocketIdentity } from './realtime-routing';
 
 export const runtime = 'nodejs';
 export const maxDuration = 300;
 
-type RealtimeEnvelope = {
-  event?: string;
-  payload?: { roomId?: string; [key: string]: unknown };
-};
-
-type ClientState = { roomId: string | null; authenticated: boolean };
+type ClientState = RealtimeSocketIdentity;
 
 const states = new Map<WebSocket, ClientState>();
 const roomSockets = new Map<string, Set<WebSocket>>();
@@ -40,19 +36,19 @@ async function ensureSubscriber() {
     const next = createClient({ url: redisUrl });
     next.on('error', (error) => console.error('[realtime] Redis subscriber error', error));
     await next.connect();
-    await next.pSubscribe('net:room:*', (message, channel) => {
-      const roomId = channel.slice('net:room:'.length);
-      const sockets = roomSockets.get(roomId);
-      if (!sockets?.size) return;
+    const routeEnvelope = (message: string, channel: string) => {
       let envelope: RealtimeEnvelope;
       try {
         envelope = JSON.parse(message) as RealtimeEnvelope;
       } catch {
         return;
       }
-      if (!envelope.event || envelope.payload?.roomId !== roomId) return;
-      for (const socket of sockets) send(socket, { type: 'event', event: envelope.event, payload: envelope.payload });
-    });
+      for (const [socket, state] of states) {
+        if (shouldDeliverRealtimeEnvelope(state, channel, envelope)) send(socket, { type: 'event', event: envelope.event!, payload: envelope.payload! });
+      }
+    };
+    await next.pSubscribe('net:room:*', routeEnvelope);
+    await next.pSubscribe('net:actor:*', routeEnvelope);
     subscriber = next as NonNullable<typeof subscriber>;
   })().catch((error) => {
     subscriber?.destroy();
@@ -72,7 +68,8 @@ async function authenticate(socket: WebSocket, token: string) {
     audience: 'net-realtime',
   });
   const roomId = verified.payload.roomId;
-  if (typeof verified.payload.sub !== 'string' || !['guest', 'user'].includes(String(verified.payload.kind)) || typeof roomId !== 'string') {
+  const kind = String(verified.payload.kind);
+  if (typeof verified.payload.sub !== 'string' || !['guest', 'user'].includes(kind) || typeof roomId !== 'string') {
     throw new Error('Realtime token is invalid.');
   }
   await ensureSubscriber();
@@ -80,6 +77,7 @@ async function authenticate(socket: WebSocket, token: string) {
   if (!state || state.authenticated) throw new Error('Realtime socket is already authenticated.');
   state.authenticated = true;
   state.roomId = roomId;
+  state.actorKey = `${kind}:${verified.payload.sub}`;
   const sockets = roomSockets.get(roomId) ?? new Set<WebSocket>();
   sockets.add(socket);
   roomSockets.set(roomId, sockets);
@@ -99,7 +97,7 @@ function isAllowedOrigin(request: Request) {
 export function GET(request: Request) {
   if (!isAllowedOrigin(request)) return new Response('Origin not allowed.', { status: 403 });
   return experimental_upgradeWebSocket((socket) => {
-    states.set(socket, { roomId: null, authenticated: false });
+    states.set(socket, { roomId: null, actorKey: null, authenticated: false });
     const authTimeout = setTimeout(() => socket.close(4401, 'Authentication timed out.'), 8_000);
     authTimeout.unref();
 
