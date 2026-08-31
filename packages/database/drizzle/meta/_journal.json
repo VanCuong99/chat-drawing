@@ -106,6 +106,41 @@
       "when": 1787910101947,
       "tag": "0014_lock_direct_invites",
       "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1788163978494,
+      "tag": "0015_furry_thunderbolts",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1788170174228,
+      "tag": "0016_fair_expediter",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1788170785740,
+      "tag": "0017_condemned_prowler",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1788171627731,
+      "tag": "0018_faithful_malcolm_colcord",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1788182280789,
+      "tag": "0019_public_sinister_six",
+      "breakpoints": true
     }
   ]
 }

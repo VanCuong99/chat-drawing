@@ -113,9 +113,12 @@ test('guest kết thúc phiên thì mất quyền truy cập nhưng tin nhắn v
   await expect(page.getByRole('button', { name: 'Lưới' })).toHaveAttribute('aria-pressed', 'true');
   await page.getByRole('button', { name: 'Phóng to' }).click();
   await expect(page.getByText('110%')).toBeVisible();
+  for (let step = 0; step < 4; step += 1) await page.getByRole('button', { name: 'Phóng to' }).click();
+  await expect(page.getByText('150%')).toBeVisible();
   await page.getByRole('button', { name: /Di chuyển/ }).click();
   await expect(page.getByRole('button', { name: /Di chuyển/ })).toHaveAttribute('aria-pressed', 'true');
   const viewport = page.locator('.canvas-viewport');
+  await expect.poll(() => viewport.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeGreaterThan(0);
   const scrollBeforePan = await viewport.evaluate((element) => element.scrollLeft);
   const zoomedBox = await canvas.boundingBox();
   await page.mouse.move(zoomedBox!.x + 300, zoomedBox!.y + 180);

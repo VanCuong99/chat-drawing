@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import type { Namespace } from 'socket.io';
 
-export type RealtimeEvent = 'message.created' | 'reaction.updated' | 'messages.read' | 'guest.ended' | 'room.updated';
+export type RealtimeEvent = 'message.created' | 'message.updated' | 'message.deleted' | 'reaction.updated' | 'messages.read' | 'guest.ended' | 'room.updated';
 
 @Injectable()
 export class RealtimeService {

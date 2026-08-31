@@ -16,13 +16,24 @@ import AppDialog from '@/src/shared/app-dialog';
 import { useLanguage } from '@/src/i18n/language-provider';
 import { deleteStudioDraft, readStudioDraft, saveStudioDraft } from './studio-drafts';
 
-const CANVAS_WIDTH = 1200;
-const CANVAS_HEIGHT = 720;
+const DEFAULT_CANVAS_WIDTH = 1200;
+const DEFAULT_CANVAS_HEIGHT = 720;
 const MIN_ZOOM = 50;
 const MAX_ZOOM = 180;
+const MAX_SOURCE_EDGE = 4096;
+const MAX_SOURCE_PIXELS = 8_000_000;
 const COLORS = ['#27242e', '#6f4ee8', '#ef7668', '#e19a3f', '#3aa694', '#3085c7', '#d34d8b', '#ffffff'];
 
 const clampZoom = (value: number) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value));
+const sourceCanvasSize = (width: number, height: number) => {
+  const safeWidth = Math.max(1, width);
+  const safeHeight = Math.max(1, height);
+  const longestEdge = Math.max(safeWidth, safeHeight);
+  const scale = longestEdge < 480
+    ? 720 / longestEdge
+    : Math.min(1, MAX_SOURCE_EDGE / longestEdge, Math.sqrt(MAX_SOURCE_PIXELS / (safeWidth * safeHeight)));
+  return { width: Math.max(1, Math.round(safeWidth * scale)), height: Math.max(1, Math.round(safeHeight * scale)) };
+};
 const contactDistance = (first: TouchContact, second: TouchContact) => Math.hypot(second.x - first.x, second.y - first.y);
 const contactMidpoint = (first: TouchContact, second: TouchContact): TouchContact => ({ x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 });
 
@@ -34,16 +45,20 @@ type Tool = 'hand' | StrokeTool | ShapeTool | 'fill' | 'text';
 type SizedTool = Exclude<Tool, 'hand' | 'fill' | 'text'>;
 type Paper = 'white' | 'cream' | 'grid' | 'dots';
 type FillMaterial = 'solid' | 'marker' | 'pencil' | 'watercolor' | 'gouache';
+type PaperFormat = 'square' | 'portrait' | 'landscape' | 'story' | 'freeform';
+type CanvasAnchor = 'top-left' | 'top' | 'top-right' | 'left' | 'center' | 'right' | 'bottom-left' | 'bottom' | 'bottom-right';
+type SourceKind = 'photo' | 'drawing' | 'draft';
+type SourcePlacement = 'fit' | 'crop';
 type StyledAction = { color: string; size: number; opacity: number };
 type StrokeAction = StyledAction & { kind: 'stroke'; tool: StrokeTool; points: Point[] };
 type ShapeAction = StyledAction & { kind: 'shape'; tool: ShapeTool; from: Point; to: Point; filled: boolean };
 type FillAction = Pick<StyledAction, 'color' | 'opacity'> & { kind: 'fill'; spans: Uint32Array; edgeSpans: Uint32Array; material: FillMaterial; texture: number; water: number; seed: number };
 type TextAction = StyledAction & { kind: 'text'; id: string; point: Point; text: string };
 type DrawAction = StrokeAction | ShapeAction | FillAction | TextAction;
-type Scene = { actions: DrawAction[]; paper: Paper };
+type Scene = { actions: DrawAction[]; paper: Paper; width?: number; height?: number };
 type History = { past: Scene[]; present: Scene; future: Scene[] };
 type MixerPigment = PigmentComponent & { id: string };
-type StoredDraft = { scene: Scene; caption: string; savedAt: number };
+type StoredDraft = { scene: Scene; caption: string; sourceVisible?: boolean; sourceOpacity?: number; sourcePlacement?: SourcePlacement; savedAt: number };
 type TouchContact = { x: number; y: number };
 type CanvasGesture = {
   pointerIds: [number, number];
@@ -52,7 +67,17 @@ type CanvasGesture = {
   anchor: { x: number; y: number };
 };
 
-const INITIAL_SCENE: Scene = { actions: [], paper: 'white' };
+const INITIAL_SCENE: Scene = { actions: [], paper: 'white', width: DEFAULT_CANVAS_WIDTH, height: DEFAULT_CANVAS_HEIGHT };
+const CANVAS_ANCHORS: CanvasAnchor[] = ['top-left', 'top', 'top-right', 'left', 'center', 'right', 'bottom-left', 'bottom', 'bottom-right'];
+const CANVAS_ANCHOR_LABELS: Record<CanvasAnchor, string> = {
+  'top-left': 'Anchor top left', top: 'Anchor top', 'top-right': 'Anchor top right', left: 'Anchor left', center: 'Anchor center', right: 'Anchor right', 'bottom-left': 'Anchor bottom left', bottom: 'Anchor bottom', 'bottom-right': 'Anchor bottom right',
+};
+const PAPER_FORMATS: Array<{ id: Exclude<PaperFormat, 'freeform'>; label: string; width: number; height: number }> = [
+  { id: 'square', label: 'Square', width: 1080, height: 1080 },
+  { id: 'portrait', label: 'Portrait', width: 900, height: 1200 },
+  { id: 'landscape', label: 'Landscape', width: DEFAULT_CANVAS_WIDTH, height: DEFAULT_CANVAS_HEIGHT },
+  { id: 'story', label: 'Story', width: 900, height: 1600 },
+];
 const INITIAL_MIXER_COMPONENTS: MixerPigment[] = [
   { id: 'pigment-1', color: '#FCF046', weight: 1 },
   { id: 'pigment-2', color: '#E53166', weight: 1 },
@@ -177,30 +202,42 @@ function ToolIcon({ tool }: { tool: Tool }) {
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false" data-tool-icon={tool}>{content}</svg>;
 }
 
+function StudioActionIcon({ action }: { action: 'undo' | 'redo' | 'clear' | 'fit' | 'fillView' }) {
+  const paths = {
+    undo: <><path d="M9 7 4 12l5 5" /><path d="M4 12h9a7 7 0 0 1 7 7" /></>,
+    redo: <><path d="m15 7 5 5-5 5" /><path d="M20 12h-9a7 7 0 0 0-7 7" /></>,
+    clear: <><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13" /></>,
+    fit: <><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" /></>,
+    fillView: <><path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" /><path d="M8 8h8v8H8z" /></>,
+  };
+  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">{paths[action]}</svg>;
+}
+
 function drawPaper(context: CanvasRenderingContext2D, paper: Paper) {
+  const { width, height } = context.canvas;
   context.save();
   context.fillStyle = paper === 'cream' ? '#fff8e9' : '#fffefb';
-  context.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+  context.fillRect(0, 0, width, height);
   if (paper === 'grid') {
     context.strokeStyle = '#e8e4ee';
     context.lineWidth = 1;
-    for (let x = 40; x < CANVAS_WIDTH; x += 40) {
+    for (let x = 40; x < width; x += 40) {
       context.beginPath();
       context.moveTo(x, 0);
-      context.lineTo(x, CANVAS_HEIGHT);
+      context.lineTo(x, height);
       context.stroke();
     }
-    for (let y = 40; y < CANVAS_HEIGHT; y += 40) {
+    for (let y = 40; y < height; y += 40) {
       context.beginPath();
       context.moveTo(0, y);
-      context.lineTo(CANVAS_WIDTH, y);
+      context.lineTo(width, y);
       context.stroke();
     }
   }
   if (paper === 'dots') {
     context.fillStyle = '#dcd5e7';
-    for (let x = 30; x < CANVAS_WIDTH; x += 30) {
-      for (let y = 30; y < CANVAS_HEIGHT; y += 30) {
+    for (let x = 30; x < width; x += 30) {
+      for (let y = 30; y < height; y += 30) {
         context.beginPath();
         context.arc(x, y, 1.5, 0, Math.PI * 2);
         context.fill();
@@ -388,9 +425,9 @@ function withEllipsis(context: CanvasRenderingContext2D, line: string, maxWidth:
 function getTextLayout(context: CanvasRenderingContext2D, action: TextAction) {
   context.save();
   context.font = `600 ${action.size}px ui-sans-serif, system-ui, sans-serif`;
-  const maxWidth = Math.max(40, CANVAS_WIDTH - action.point.x - 24);
+  const maxWidth = Math.max(40, context.canvas.width - action.point.x - 24);
   const lineHeight = action.size * 1.25;
-  const maxLines = Math.max(1, Math.floor((CANVAS_HEIGHT - action.point.y) / lineHeight));
+  const maxLines = Math.max(1, Math.floor((context.canvas.height - action.point.y) / lineHeight));
   const allLines = wrapText(context, action.text, maxWidth);
   const lines = allLines.slice(0, maxLines);
   if (allLines.length > maxLines) lines[lines.length - 1] = withEllipsis(context, lines[lines.length - 1], maxWidth);
@@ -484,6 +521,30 @@ function layerFillAction(previous: FillAction, color: string, opacity: number, m
     water,
     seed,
   };
+}
+
+function shiftedFillSpans(spans: Uint32Array, offsetX: number, offsetY: number, width: number, height: number) {
+  const shifted: number[] = [];
+  for (let index = 0; index < spans.length; index += 3) {
+    const y = spans[index] + offsetY;
+    const start = Math.max(0, spans[index + 1] + offsetX);
+    const end = Math.min(width - 1, spans[index + 2] + offsetX);
+    if (y >= 0 && y < height && start <= end) shifted.push(y, start, end);
+  }
+  return Uint32Array.from(shifted);
+}
+
+function shiftActionForCanvas(action: DrawAction, offsetX: number, offsetY: number, width: number, height: number): DrawAction {
+  if (action.kind === 'stroke') return { ...action, points: action.points.map((point) => ({ ...point, x: point.x + offsetX, y: point.y + offsetY })) };
+  if (action.kind === 'shape') return { ...action, from: { ...action.from, x: action.from.x + offsetX, y: action.from.y + offsetY }, to: { ...action.to, x: action.to.x + offsetX, y: action.to.y + offsetY } };
+  if (action.kind === 'text') return { ...action, point: { ...action.point, x: action.point.x + offsetX, y: action.point.y + offsetY } };
+  return { ...action, spans: shiftedFillSpans(action.spans, offsetX, offsetY, width, height), edgeSpans: shiftedFillSpans(action.edgeSpans, offsetX, offsetY, width, height) };
+}
+
+function canvasResizeOffset(anchor: CanvasAnchor, previousWidth: number, previousHeight: number, width: number, height: number) {
+  const horizontal = anchor.endsWith('left') || anchor === 'left' ? 0 : anchor.endsWith('right') || anchor === 'right' ? width - previousWidth : (width - previousWidth) / 2;
+  const vertical = anchor.startsWith('top') || anchor === 'top' ? 0 : anchor.startsWith('bottom') || anchor === 'bottom' ? height - previousHeight : (height - previousHeight) / 2;
+  return { x: Math.round(horizontal), y: Math.round(vertical) };
 }
 
 function materialTile(action: FillAction) {
@@ -619,7 +680,7 @@ function drawFill(context: CanvasRenderingContext2D, action: FillAction) {
     const pattern = context.createPattern(materialTile(action), 'repeat');
     if (pattern) {
       context.fillStyle = pattern;
-      context.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      context.fillRect(0, 0, context.canvas.width, context.canvas.height);
     }
   }
   context.restore();
@@ -756,16 +817,41 @@ function drawAction(context: CanvasRenderingContext2D, action: DrawAction) {
   }
 }
 
-function makeLayer() {
+function makeLayer(width: number, height: number) {
   const layer = document.createElement('canvas');
-  layer.width = CANVAS_WIDTH;
-  layer.height = CANVAS_HEIGHT;
+  layer.width = width;
+  layer.height = height;
   return layer;
 }
 
-export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, version, draftKey, paletteColors, paletteLoading = false, paletteMutating = false, palettePersistence = 'session', onClose, onSend, onSavePalette, onDeletePalette }: {
+function drawSourceLayer(
+  context: CanvasRenderingContext2D,
+  image: HTMLImageElement,
+  width: number,
+  height: number,
+  visible: boolean,
+  opacity: number,
+  placement: SourcePlacement,
+) {
+  if (!visible) return;
+  const sourceWidth = image.naturalWidth || image.width || width;
+  const sourceHeight = image.naturalHeight || image.height || height;
+  const scale = placement === 'crop'
+    ? Math.max(width / sourceWidth, height / sourceHeight)
+    : Math.min(width / sourceWidth, height / sourceHeight);
+  const drawWidth = sourceWidth * scale;
+  const drawHeight = sourceHeight * scale;
+  context.save();
+  context.globalAlpha = opacity;
+  context.drawImage(image, (width - drawWidth) / 2, (height - drawHeight) / 2, drawWidth, drawHeight);
+  context.restore();
+}
+
+export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, sourceKind = sourceIsDraft ? 'draft' : 'drawing', sourceAuthor, version, draftKey, paletteColors, paletteLoading = false, paletteMutating = false, palettePersistence = 'session', onClose, onSend, onSavePalette, onDeletePalette }: {
   sourceUrl?: string | null;
   sourceIsDraft?: boolean;
+  sourceKind?: SourceKind;
+  sourceAuthor?: string | null;
   version?: number | null;
   draftKey: string;
   paletteColors: PaletteColorView[];
@@ -773,7 +859,7 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
   paletteMutating?: boolean;
   palettePersistence?: 'account' | 'session';
   onClose: () => void;
-  onSend: (blob: Blob, caption: string) => Promise<void>;
+  onSend: (blob: Blob, caption: string) => Promise<boolean>;
   onSavePalette: (input: { name: string; components: PigmentComponent[] }) => Promise<void>;
   onDeletePalette: (id: string) => Promise<void>;
 }) {
@@ -808,10 +894,19 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
   const pendingGestureRef = useRef<{ zoom: number; midpoint: TouchContact } | null>(null);
   const pendingTouchFillRef = useRef<{ pointerId: number; point: Point } | null>(null);
   const zoomRef = useRef(100);
+  const boardBaseWidthRef = useRef(0);
   const zoomOutputRef = useRef<HTMLOutputElement>(null);
   const sendingRef = useRef(false);
   const previousFocusRef = useRef<HTMLElement | null>(null);
-  const [history, setHistory] = useState<History>({ past: [], present: INITIAL_SCENE, future: [] });
+  const [initialScene] = useState<Scene>(() => {
+    const mobileNewCanvas = !sourceUrl && typeof window !== 'undefined' && window.matchMedia('(max-width: 720px)').matches;
+    return mobileNewCanvas ? { ...INITIAL_SCENE, width: 900, height: 1200 } : { ...INITIAL_SCENE };
+  });
+  const [cleanSceneDimensions, setCleanSceneDimensions] = useState({
+    width: initialScene.width ?? DEFAULT_CANVAS_WIDTH,
+    height: initialScene.height ?? DEFAULT_CANVAS_HEIGHT,
+  });
+  const [history, setHistory] = useState<History>(() => ({ past: [], present: initialScene, future: [] }));
   const [tool, setTool] = useState<Tool>('pen');
   const [selectedShape, setSelectedShape] = useState<ClosedShapeTool>('rectangle');
   const [shapeMenuOpen, setShapeMenuOpen] = useState(false);
@@ -838,6 +933,11 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
   const [fillTexture, setFillTexture] = useState(60);
   const [fillWater, setFillWater] = useState(45);
   const [zoom, setZoom] = useState(100);
+  const [viewMode, setViewMode] = useState<'fit' | 'fill'>(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 720px)').matches ? 'fill' : 'fit');
+  const [boardBaseWidth, setBoardBaseWidth] = useState(0);
+  const [customPaperWidth, setCustomPaperWidth] = useState(() => initialScene.width ?? DEFAULT_CANVAS_WIDTH);
+  const [customPaperHeight, setCustomPaperHeight] = useState(() => initialScene.height ?? DEFAULT_CANVAS_HEIGHT);
+  const [resizeAnchor, setResizeAnchor] = useState<CanvasAnchor>('center');
   const [caption, setCaption] = useState('');
   const [draftReady, setDraftReady] = useState(false);
   const [draftStatus, setDraftStatus] = useState<'idle' | 'saving' | 'saved' | 'restored'>('idle');
@@ -845,13 +945,30 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
   const [sourceLoading, setSourceLoading] = useState(Boolean(sourceUrl));
   const [sourceError, setSourceError] = useState(false);
   const [sourceReady, setSourceReady] = useState(0);
+  const [sourceVisible, setSourceVisible] = useState(true);
+  const [sourceOpacity, setSourceOpacity] = useState(1);
+  const [sourcePlacement, setSourcePlacement] = useState<SourcePlacement>('fit');
   const [hint, setHint] = useState(() => t('Drag on the paper to begin'));
+  const [gestureCoachOpen, setGestureCoachOpen] = useState(false);
   const actions = history.present.actions;
   const paper = history.present.paper;
+  const canvasWidth = history.present.width ?? DEFAULT_CANVAS_WIDTH;
+  const canvasHeight = history.present.height ?? DEFAULT_CANVAS_HEIGHT;
+  const canvasAspect = canvasWidth / canvasHeight;
   const size = tool === 'text' ? fontSize : isSizedTool(tool) ? toolSizes[tool] : toolSizes.pen;
   const sizeLimits = tool === 'text' ? { min: 20, max: 96 } : isSizedTool(tool) ? TOOL_SIZE_LIMITS[tool] : TOOL_SIZE_LIMITS.pen;
-  const isDirty = history.past.length > 0 || history.future.length > 0 || actions.length > 0 || paper !== 'white' || Boolean(caption.trim()) || Boolean(textValue.trim());
-  const canSendCanvas = Boolean(sourceUrl) || actions.length > 0 || paper !== 'white';
+  const isDirty = history.past.length > 0 || history.future.length > 0 || actions.length > 0 || paper !== 'white' || canvasWidth !== cleanSceneDimensions.width || canvasHeight !== cleanSceneDimensions.height || Boolean(caption.trim()) || Boolean(textValue.trim()) || !sourceVisible || sourceOpacity !== 1 || sourcePlacement !== 'fit';
+  const visualChanges = useMemo(() => {
+    const changes: string[] = [];
+    if (actions.length > 0) changes.push(t('{count} visual edits', { count: actions.length }));
+    if (paper !== 'white') changes.push(t('Paper changed'));
+    if (canvasWidth !== cleanSceneDimensions.width || canvasHeight !== cleanSceneDimensions.height) changes.push(t('Canvas resized'));
+    if (sourceUrl && !sourceVisible) changes.push(t('Source hidden'));
+    if (sourceUrl && sourceOpacity !== 1) changes.push(t('Source opacity changed'));
+    if (sourceUrl && sourcePlacement !== 'fit') changes.push(t('Source placement changed'));
+    return changes;
+  }, [actions.length, canvasHeight, canvasWidth, cleanSceneDimensions.height, cleanSceneDimensions.width, paper, sourceOpacity, sourcePlacement, sourceUrl, sourceVisible, t]);
+  const canSendCanvas = visualChanges.length > 0;
   const pigmentFormula = useMemo(() => mixerComponents.map(({ color: componentColor, weight }) => ({ color: componentColor, weight })), [mixerComponents]);
   const mixedColor = useMemo(() => mixPigmentHex(pigmentFormula), [pigmentFormula]);
   const mixerPercentages = useMemo(() => pigmentPercentages(pigmentFormula), [pigmentFormula]);
@@ -860,6 +977,46 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
   useEffect(() => { actionsRef.current = actions; }, [actions]);
 
   useEffect(() => { zoomRef.current = zoom; }, [zoom]);
+
+  useEffect(() => { boardBaseWidthRef.current = boardBaseWidth; }, [boardBaseWidth]);
+
+  useEffect(() => {
+    if (!window.matchMedia('(max-width: 720px)').matches) return;
+    const frame = window.requestAnimationFrame(() => {
+      try {
+        if (!localStorage.getItem('net_studio_gesture_coach_seen')) setGestureCoachOpen(true);
+      } catch {
+        setGestureCoachOpen(true);
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
+  const dismissGestureCoach = () => {
+    setGestureCoachOpen(false);
+    try { localStorage.setItem('net_studio_gesture_coach_seen', '1'); } catch { /* The coach can safely reappear when storage is blocked. */ }
+  };
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const updateBoardSize = () => {
+      const styles = window.getComputedStyle(viewport);
+      const horizontalPadding = Number.parseFloat(styles.paddingLeft) + Number.parseFloat(styles.paddingRight);
+      const verticalPadding = Number.parseFloat(styles.paddingTop) + Number.parseFloat(styles.paddingBottom);
+      const availableWidth = Math.max(220, viewport.clientWidth - horizontalPadding);
+      const availableHeight = Math.max(220, viewport.clientHeight - verticalPadding);
+      const fitWidth = Math.min(availableWidth, availableHeight * canvasAspect);
+      const fillWidth = Math.max(availableWidth, availableHeight * canvasAspect);
+      const next = Math.max(220, viewMode === 'fill' ? fillWidth : fitWidth);
+      boardBaseWidthRef.current = next;
+      setBoardBaseWidth(next);
+    };
+    updateBoardSize();
+    const observer = new ResizeObserver(updateBoardSize);
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, [canvasAspect, viewMode]);
 
   useEffect(() => () => {
     if (gestureFrameRef.current !== null) window.cancelAnimationFrame(gestureFrameRef.current);
@@ -873,6 +1030,9 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
         if (cancelled || !draft || !Array.isArray(draft.scene?.actions)) return;
         setHistory({ past: [], present: draft.scene, future: [] });
         setCaption(draft.caption);
+        if (typeof draft.sourceVisible === 'boolean') setSourceVisible(draft.sourceVisible);
+        if (typeof draft.sourceOpacity === 'number') setSourceOpacity(Math.max(0.1, Math.min(1, draft.sourceOpacity)));
+        if (draft.sourcePlacement === 'fit' || draft.sourcePlacement === 'crop') setSourcePlacement(draft.sourcePlacement);
         if (draft.caption) setCaptionOpen(true);
         setDraftStatus('restored');
         setHint(t('Draft restored'));
@@ -891,45 +1051,45 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
         return;
       }
       setDraftStatus('saving');
-      void saveStudioDraft<StoredDraft>(draftKey, { scene: history.present, caption, savedAt: Date.now() })
+      void saveStudioDraft<StoredDraft>(draftKey, { scene: history.present, caption, sourceVisible, sourceOpacity, sourcePlacement, savedAt: Date.now() })
         .then(() => setDraftStatus('saved'))
         .catch(() => setDraftStatus('idle'));
     }, 700);
     return () => window.clearTimeout(timeout);
-  }, [caption, draftKey, draftReady, history.present, isDirty]);
+  }, [caption, draftKey, draftReady, history.present, isDirty, sourceOpacity, sourcePlacement, sourceVisible]);
 
   const paintPreview = useCallback((preview?: DrawAction | null, paperOverride?: Paper, selectedText?: TextAction | null) => {
     const canvas = canvasRef.current;
     const committedLayer = committedLayerRef.current;
     if (!canvas || !committedLayer) return;
-    if (!previewLayerRef.current) previewLayerRef.current = makeLayer();
+    if (!previewLayerRef.current || previewLayerRef.current.width !== canvasWidth || previewLayerRef.current.height !== canvasHeight) previewLayerRef.current = makeLayer(canvasWidth, canvasHeight);
     const previewLayer = previewLayerRef.current;
     const previewContext = previewLayer.getContext('2d');
     const context = canvas.getContext('2d');
     if (!previewContext || !context) return;
-    previewContext.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    previewContext.clearRect(0, 0, canvasWidth, canvasHeight);
     previewContext.drawImage(committedLayer, 0, 0);
     if (preview) drawAction(previewContext, preview);
-    context.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    context.clearRect(0, 0, canvasWidth, canvasHeight);
     drawPaper(context, paperOverride ?? paper);
     context.drawImage(previewLayer, 0, 0);
     const selected = selectedText === undefined
       ? actionsRef.current.find((action): action is TextAction => action.kind === 'text' && action.id === selectedTextIdRef.current)
       : selectedText;
     if (selected) drawTextSelection(context, selected);
-  }, [paper]);
+  }, [canvasHeight, canvasWidth, paper]);
 
   const paintTextDrag = useCallback((dragged: TextAction) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const context = canvas.getContext('2d');
     if (!context) return;
-    if (!previewLayerRef.current) previewLayerRef.current = makeLayer();
+    if (!previewLayerRef.current || previewLayerRef.current.width !== canvasWidth || previewLayerRef.current.height !== canvasHeight) previewLayerRef.current = makeLayer(canvasWidth, canvasHeight);
     const layer = previewLayerRef.current;
     const layerContext = layer.getContext('2d');
     if (!layerContext) return;
-    layerContext.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-    if (sourceImageRef.current) layerContext.drawImage(sourceImageRef.current, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    layerContext.clearRect(0, 0, canvasWidth, canvasHeight);
+    if (sourceImageRef.current) drawSourceLayer(layerContext, sourceImageRef.current, canvasWidth, canvasHeight, sourceVisible, sourceOpacity, sourcePlacement);
     let found = false;
     for (const action of actionsRef.current) {
       if (action.kind === 'text' && action.id === dragged.id) {
@@ -938,22 +1098,22 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
       } else drawAction(layerContext, action);
     }
     if (!found) drawAction(layerContext, dragged);
-    context.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    context.clearRect(0, 0, canvasWidth, canvasHeight);
     drawPaper(context, paper);
     context.drawImage(layer, 0, 0);
     drawTextSelection(context, dragged);
-  }, [paper]);
+  }, [canvasHeight, canvasWidth, paper, sourceOpacity, sourcePlacement, sourceVisible]);
 
   const rebuildScene = useCallback((sceneActions: DrawAction[], paperOverride?: Paper) => {
-    if (!committedLayerRef.current) committedLayerRef.current = makeLayer();
+    if (!committedLayerRef.current || committedLayerRef.current.width !== canvasWidth || committedLayerRef.current.height !== canvasHeight) committedLayerRef.current = makeLayer(canvasWidth, canvasHeight);
     const committedLayer = committedLayerRef.current;
     const context = committedLayer.getContext('2d');
     if (!context) return;
-    context.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-    if (sourceImageRef.current) context.drawImage(sourceImageRef.current, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    context.clearRect(0, 0, canvasWidth, canvasHeight);
+    if (sourceImageRef.current) drawSourceLayer(context, sourceImageRef.current, canvasWidth, canvasHeight, sourceVisible, sourceOpacity, sourcePlacement);
     for (const action of sceneActions) drawAction(context, action);
     paintPreview(null, paperOverride);
-  }, [paintPreview]);
+  }, [canvasHeight, canvasWidth, paintPreview, sourceOpacity, sourcePlacement, sourceVisible]);
 
   const paintStrokeSegment = useCallback((action: StrokeAction) => {
     const canvas = canvasRef.current;
@@ -963,10 +1123,10 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
     const context = canvas.getContext('2d');
     if (!previewContext || !context) return;
     drawSmoothStroke(previewContext, { ...action, points: action.points.slice(-2) });
-    context.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    context.clearRect(0, 0, canvasWidth, canvasHeight);
     drawPaper(context, paper);
     context.drawImage(previewLayer, 0, 0);
-  }, [paper]);
+  }, [canvasHeight, canvasWidth, paper]);
 
   useEffect(() => { rebuildScene(actions); }, [actions, rebuildScene, sourceReady]);
 
@@ -987,6 +1147,14 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
     image.decoding = 'async';
     image.onload = () => {
       sourceImageRef.current = image;
+      const sourceSize = sourceCanvasSize(image.naturalWidth || DEFAULT_CANVAS_WIDTH, image.naturalHeight || DEFAULT_CANVAS_HEIGHT);
+      setCleanSceneDimensions(sourceSize);
+      setHistory((current) => {
+        if (current.present.actions.length || current.past.length) return current;
+        return { ...current, present: { ...current.present, width: sourceSize.width, height: sourceSize.height } };
+      });
+      setCustomPaperWidth(sourceSize.width);
+      setCustomPaperHeight(sourceSize.height);
       setSourceLoading(false);
       setSourceReady((current) => current + 1);
     };
@@ -1044,8 +1212,8 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
   const getPoint = (event: ReactPointerEvent<HTMLCanvasElement>): Point => {
     const rect = event.currentTarget.getBoundingClientRect();
     return {
-      x: Math.max(0, Math.min(CANVAS_WIDTH, ((event.clientX - rect.left) / rect.width) * CANVAS_WIDTH)),
-      y: Math.max(0, Math.min(CANVAS_HEIGHT, ((event.clientY - rect.top) / rect.height) * CANVAS_HEIGHT)),
+      x: Math.max(0, Math.min(event.currentTarget.width, ((event.clientX - rect.left) / rect.width) * event.currentTarget.width)),
+      y: Math.max(0, Math.min(event.currentTarget.height, ((event.clientY - rect.top) / rect.height) * event.currentTarget.height)),
       pressure: event.pressure || 0.5,
     };
   };
@@ -1058,7 +1226,7 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
       return;
     }
     const rect = event.currentTarget.getBoundingClientRect();
-    const diameter = Math.max(4, size * rect.width / CANVAS_WIDTH);
+    const diameter = Math.max(4, size * rect.width / event.currentTarget.width);
     cursor.style.width = `${diameter}px`;
     cursor.style.height = `${diameter}px`;
     cursor.style.transform = `translate3d(${event.clientX - rect.left}px,${event.clientY - rect.top}px,0) translate(-50%,-50%)`;
@@ -1084,7 +1252,7 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
       const previousAction = actionsRef.current.at(-1);
       const action = previousAction?.kind === 'fill' && fillContainsPoint(previousAction, point)
         ? layerFillAction(previousAction, color, opacity, fillMaterial, fillTexture, fillWater, seed)
-        : makeFillAction(context.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT), point, color, opacity, fillTolerance, fillMaterial, fillTexture, fillWater, seed);
+        : makeFillAction(context.getImageData(0, 0, canvas.width, canvas.height), point, color, opacity, fillTolerance, fillMaterial, fillTexture, fillWater, seed);
       if (!action) {
         setHint(t('This region already uses the selected color'));
         return;
@@ -1119,7 +1287,7 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
     const board = canvasRef.current?.parentElement;
     if (!pending || !gesture || !viewport || !board) return;
     pendingGestureRef.current = null;
-    viewport.style.setProperty('--canvas-zoom', `${pending.zoom}%`);
+    viewport.style.setProperty('--canvas-render-width', `${boardBaseWidthRef.current * pending.zoom / 100}px`);
     zoomRef.current = pending.zoom;
     if (zoomOutputRef.current) zoomOutputRef.current.textContent = `${Math.round(pending.zoom)}%`;
     const boardBounds = board.getBoundingClientRect();
@@ -1223,16 +1391,16 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
       });
       if (!existing && !textValue.trim()) { setHint(t('Enter text in the right panel before placing it on the paper')); return; }
       const draft = existing ?? (() => {
-        const safeX = Math.max(24, Math.min(point.x, CANVAS_WIDTH - 260));
+        const safeX = Math.max(24, Math.min(point.x, canvasWidth - 260));
         const lineHeight = fontSize * 1.25;
         let visibleLineCount = 1;
         textContext.save();
         textContext.font = `600 ${fontSize}px ui-sans-serif, system-ui, sans-serif`;
-        const lineCount = wrapText(textContext, textValue.trim(), CANVAS_WIDTH - safeX - 24).length;
-        const maximumLines = Math.max(1, Math.floor((CANVAS_HEIGHT - 48) / lineHeight));
+        const lineCount = wrapText(textContext, textValue.trim(), canvasWidth - safeX - 24).length;
+        const maximumLines = Math.max(1, Math.floor((canvasHeight - 48) / lineHeight));
         visibleLineCount = Math.min(lineCount, maximumLines);
         textContext.restore();
-        const safeY = Math.max(24, Math.min(point.y, CANVAS_HEIGHT - visibleLineCount * lineHeight - 24));
+        const safeY = Math.max(24, Math.min(point.y, canvasHeight - visibleLineCount * lineHeight - 24));
         return { kind: 'text' as const, id: crypto.randomUUID(), point: { ...point, x: safeX, y: safeY }, text: textValue.trim(), color, size: fontSize, opacity };
       })();
       activePointerRef.current = event.pointerId;
@@ -1288,8 +1456,8 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
       const layout = getTextLayout(context, drag.current);
       const nextPoint = {
         ...drag.current.point,
-        x: Math.max(16, Math.min(CANVAS_WIDTH - layout.width - 16, drag.origin.x + point.x - drag.start.x)),
-        y: Math.max(16, Math.min(CANVAS_HEIGHT - layout.height - 16, drag.origin.y + point.y - drag.start.y)),
+        x: Math.max(16, Math.min(canvasWidth - layout.width - 16, drag.origin.x + point.x - drag.start.x)),
+        y: Math.max(16, Math.min(canvasHeight - layout.height - 16, drag.origin.y + point.y - drag.start.y)),
       };
       drag.current = { ...drag.current, point: nextPoint };
       drag.moved ||= Math.hypot(point.x - drag.start.x, point.y - drag.start.y) > 2;
@@ -1426,8 +1594,39 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
   };
 
   const changePaper = (nextPaper: Paper) => {
-    if (nextPaper === paper) return;
+    if (sourceLoading || nextPaper === paper) return;
     setHistory((current) => ({ past: [...current.past, current.present], present: { ...current.present, paper: nextPaper }, future: [] }));
+  };
+
+  const stagePaperFormat = (width: number, height: number) => {
+    if (sourceUrl) return;
+    setCustomPaperWidth(width);
+    setCustomPaperHeight(height);
+  };
+
+  const applyCanvasResize = () => {
+    if (sourceUrl && sourceKind !== 'photo') {
+      setHint(t('Continued drawings keep their original shape. Start a new canvas to resize.'));
+      return;
+    }
+    const width = customPaperWidth;
+    const height = customPaperHeight;
+    const nextWidth = Math.max(480, Math.min(2000, Math.round(width)));
+    const nextHeight = Math.max(480, Math.min(2000, Math.round(height)));
+    if (nextWidth === canvasWidth && nextHeight === canvasHeight) return;
+    const offset = canvasResizeOffset(resizeAnchor, canvasWidth, canvasHeight, nextWidth, nextHeight);
+    setHistory((current) => ({
+      past: [...current.past, current.present],
+      present: { ...current.present, width: nextWidth, height: nextHeight, actions: current.present.actions.map((action) => shiftActionForCanvas(action, offset.x, offset.y, nextWidth, nextHeight)) },
+      future: [],
+    }));
+    setSelectedTextId(null);
+    setCustomPaperWidth(nextWidth);
+    setCustomPaperHeight(nextHeight);
+    setViewMode('fill');
+    zoomRef.current = 100;
+    setZoom(100);
+    setHint(t('Canvas resized to {width} × {height} · Undo restores the previous frame', { width: nextWidth, height: nextHeight }));
   };
 
   const send = async () => {
@@ -1458,8 +1657,8 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
     try {
       const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png', 0.95));
       if (!blob) throw new Error(t('The drawing could not be exported.'));
-      await onSend(blob, caption.trim());
-      await deleteStudioDraft(draftKey).catch(() => undefined);
+      const accepted = await onSend(blob, caption.trim());
+      if (accepted) await deleteStudioDraft(draftKey).catch(() => undefined);
     } finally {
       selectedTextIdRef.current = selectedTextId;
       sendingRef.current = false;
@@ -1746,7 +1945,10 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
     if (shortcut) selectTool(shortcut);
   };
 
-  const zoomStyle = { '--canvas-zoom': `${zoom}%` } as CSSProperties;
+  const zoomStyle = {
+    '--canvas-render-width': `${Math.max(220, boardBaseWidth || 220) * zoom / 100}px`,
+    '--canvas-aspect': `${canvasWidth} / ${canvasHeight}`,
+  } as CSSProperties;
   const activeTool = TOOLS.find((item) => item.id === tool) ?? TOOLS[1];
   const activeShape = SHAPE_TOOLS.find((item) => item.id === selectedShape) ?? SHAPE_TOOLS[0];
   const closedShapeTool = isClosedShapeTool(tool);
@@ -1769,7 +1971,7 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
       <section ref={dialogRef} className="studio advanced-studio" role="dialog" aria-modal="true" aria-labelledby="studio-title" onKeyDown={onKeyDown} tabIndex={-1}>
         <header className="studio-header advanced-studio-header" inert={mobileInspectorOpen ? true : undefined}>
           <button type="button" className="plain-button" onClick={requestClose} disabled={paletteMutating} data-studio-initial-focus>{t('Close')} <kbd>Esc</kbd></button>
-          <div><small className={sourceUrl ? 'studio-source-label' : ''}>{sourceIsDraft ? t('Starting from your first mark') : sourceUrl ? t('Continuing version {version}', { version: version ?? 1 }) : 'Canvas 1200 × 720'}</small><h2 id="studio-title">Nét Studio{sourceUrl ? <span className="mobile-version-label"> · V{version ?? 1}</span> : null}</h2></div>
+          <div><small className={sourceUrl ? 'studio-source-label' : ''}>{sourceIsDraft ? t('Starting from your first mark') : sourceKind === 'photo' ? t('Based on {name}’s photo', { name: sourceAuthor || t('a teammate') }) : sourceUrl ? t('Continuing version {version}', { version: version ?? 1 }) : t('Canvas {width} × {height}', { width: canvasWidth, height: canvasHeight })}</small><h2 id="studio-title">Nét Studio{sourceKind === 'drawing' && sourceUrl ? <span className="mobile-version-label"> · V{version ?? 1}</span> : null}</h2></div>
           <button type="button" className="primary-button studio-header-send" onClick={() => void send()} disabled={!canSendCanvas || paletteMutating || sending || sourceLoading || sourceError} title={!canSendCanvas ? t('Draw at least one mark or choose a paper before sending') : undefined}><span className="desktop-send-label">{sendLabel}</span><span className="mobile-send-label">{sending ? t('Sending…') : t('Send')}</span></button>
         </header>
 
@@ -1779,8 +1981,8 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
               {RAIL_TOOLS.map((item) => <button type="button" key={item.id} className={`${tool === item.id ? 'tool-button active' : 'tool-button'} ${MORE_TOOLS.some((moreTool) => moreTool.id === item.id) ? 'secondary-tool' : ''}`} data-tool-id={item.id} onClick={() => item.id === 'pen' || item.id === 'eraser' ? selectDockTool(item.id) : selectTool(item.id)} title={t('{tool} — key {key}', { tool: t(item.label), key: item.key })} aria-label={`${t(item.label)} (${item.key})`} aria-pressed={tool === item.id}><b><ToolIcon tool={item.id} /></b><span className="desktop-tool-label">{t(item.label)}</span><span className="mobile-tool-label">{item.id === 'hand' ? t('Pan') : item.id === 'pen' ? t('Pencil') : item.id === 'eraser' ? t('Eraser') : t(item.label)}</span></button>)}
               <button type="button" ref={shapeButtonRef} className={closedShapeTool ? 'tool-button active' : 'tool-button'} data-tool-id="shape" onClick={toggleShapeMenu} title={t('Choose shape — currently {shape}', { shape: t(activeShape.label) })} aria-label={t('Shape ({shape})', { shape: t(activeShape.label) })} aria-pressed={closedShapeTool} aria-haspopup="dialog" aria-expanded={shapeMenuOpen} aria-controls="shape-picker"><b><ToolIcon tool={selectedShape} /></b><span className="desktop-tool-label">{t('Shapes')}</span><span className="mobile-tool-label">{t('Shape')}</span></button>
               <button type="button" className={tool === 'text' ? 'tool-button active' : 'tool-button'} data-tool-id="text" onClick={() => selectTool('text')} title={t('{tool} — key {key}', { tool: t(TEXT_TOOL.label), key: TEXT_TOOL.key })} aria-label={`${t(TEXT_TOOL.label)} (${TEXT_TOOL.key})`} aria-pressed={tool === 'text'}><b><ToolIcon tool="text" /></b><span className="desktop-tool-label">{t(TEXT_TOOL.label)}</span><span className="mobile-tool-label">{t('Text')}</span></button>
-              <button type="button" className="tool-button mobile-color-tool" onClick={(event) => { if (mobileInspectorOpen) closeMobileInspector(); else { mobileInspectorTriggerRef.current = event.currentTarget; setMobileInspectorOpen(true); } }} aria-label={t('Color and tool settings')} aria-expanded={mobileInspectorOpen} aria-controls="tool-properties"><b><i style={{ background: color }} /></b><span className="mobile-tool-label">{t('Color')}</span></button>
-              <button type="button" className="tool-button mobile-undo-tool" onClick={undo} disabled={!history.past.length} aria-label={t('Undo')}><b>↶</b><span className="mobile-tool-label">{t('Undo')}</span></button>
+              <button type="button" className="tool-button mobile-color-tool" onClick={(event) => { if (mobileInspectorOpen) closeMobileInspector(); else { mobileInspectorTriggerRef.current = event.currentTarget; setMobileInspectorOpen(true); } }} aria-label={sourceUrl ? t('Source Layer') : t('Color and tool settings')} aria-expanded={mobileInspectorOpen} aria-controls="tool-properties"><b>{sourceUrl ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="2" /><path d="m7 16 3.5-4 2.5 3 2-2 2 3" /><circle cx="9" cy="9" r="1" /></svg> : <i style={{ background: color }} />}</b><span className="mobile-tool-label">{sourceUrl ? t('Source') : t('Color')}</span></button>
+              <button type="button" className="tool-button mobile-undo-tool" onClick={undo} disabled={!history.past.length} aria-label={t('Undo')}><b><StudioActionIcon action="undo" /></b><span className="mobile-tool-label">{t('Undo')}</span></button>
               <button type="button" ref={addToolsButtonRef} className={addToolsOpen || closedShapeTool || tool === 'text' ? 'tool-button add-tools-button active' : 'tool-button add-tools-button'} onClick={toggleAddTools} aria-label={t('Add to canvas')} aria-haspopup="dialog" aria-expanded={addToolsOpen} aria-controls="add-tools-sheet"><b><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg></b><span className="mobile-tool-label">{t('Add')}</span></button>
               <button type="button" ref={moreToolsButtonRef} className={MOBILE_MORE_TOOLS.some((item) => item.id === tool) ? 'tool-button more-tools-button active' : 'tool-button more-tools-button'} onClick={toggleMoreTools} aria-label={t('More tools')} aria-haspopup="dialog" aria-expanded={moreToolsOpen} aria-controls="more-tools-sheet"><b><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true"><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></svg></b><span className="mobile-tool-label">{t('More')}</span></button>
             </aside>
@@ -1817,13 +2019,14 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
 
           <div className="canvas-panel" inert={mobileInspectorOpen ? true : undefined}>
             <div className="canvas-commandbar">
-              <div><button type="button" onClick={undo} disabled={!history.past.length} aria-label={t('Undo')} data-tooltip={t('Undo')} data-tooltip-placement="below">↶</button><button type="button" onClick={redo} disabled={!history.future.length} aria-label={t('Redo')} data-tooltip={t('Redo')} data-tooltip-placement="below">↷</button><button type="button" onClick={clear} disabled={!actions.length} aria-label={t('Clear new marks')} data-tooltip={t('Clear new marks')} data-tooltip-placement="below">⌫</button></div>
+              <div><button type="button" onClick={undo} disabled={!history.past.length} aria-label={t('Undo')} data-tooltip={t('Undo')} data-tooltip-placement="below"><StudioActionIcon action="undo" /></button><button type="button" onClick={redo} disabled={!history.future.length} aria-label={t('Redo')} data-tooltip={t('Redo')} data-tooltip-placement="below"><StudioActionIcon action="redo" /></button><button type="button" onClick={clear} disabled={!actions.length} aria-label={t('Clear new marks')} data-tooltip={t('Clear new marks')} data-tooltip-placement="below"><StudioActionIcon action="clear" /></button></div>
               <span><strong>{t(activeTool.label)}</strong><kbd>{activeTool.key}</kbd><i aria-hidden="true">·</i>{t('{count} actions', { count: actions.length })}</span>
-              <div className="zoom-control"><button type="button" onClick={() => setZoom((value) => { const next = clampZoom(value - 10); zoomRef.current = next; return next; })} aria-label={t('Zoom out')} data-tooltip={t('Zoom out')} data-tooltip-placement="below">−</button><output ref={zoomOutputRef} aria-label={t('Zoom level')}>{zoom}%</output><button type="button" onClick={() => setZoom((value) => { const next = clampZoom(value + 10); zoomRef.current = next; return next; })} aria-label={t('Zoom in')} data-tooltip={t('Zoom in')} data-tooltip-placement="below">＋</button></div>
+              <div className="zoom-control"><button type="button" className={viewMode === 'fit' ? 'active' : ''} onClick={() => { setViewMode('fit'); setZoom(100); zoomRef.current = 100; }} aria-label={t('Fit paper in view')} aria-pressed={viewMode === 'fit'} data-tooltip={t('Fit')} data-tooltip-placement="below"><StudioActionIcon action="fit" /></button><button type="button" className={viewMode === 'fill' ? 'active' : ''} onClick={() => { setViewMode('fill'); setZoom(100); zoomRef.current = 100; }} aria-label={t('Fill workspace with paper')} aria-pressed={viewMode === 'fill'} data-tooltip={t('Fill View')} data-tooltip-placement="below"><StudioActionIcon action="fillView" /></button><button type="button" onClick={() => setZoom((value) => { const next = clampZoom(value - 10); zoomRef.current = next; return next; })} aria-label={t('Zoom out')} data-tooltip={t('Zoom out')} data-tooltip-placement="below">−</button><output ref={zoomOutputRef} aria-label={t('Zoom level')}>{zoom}%</output><button type="button" onClick={() => setZoom((value) => { const next = clampZoom(value + 10); zoomRef.current = next; return next; })} aria-label={t('Zoom in')} data-tooltip={t('Zoom in')} data-tooltip-placement="below">＋</button></div>
             </div>
             <div ref={viewportRef} className="canvas-viewport" style={zoomStyle}>
+              {gestureCoachOpen ? <div className="gesture-coach" role="status"><span><strong>{t('Draw with one finger')}</strong><small>{t('Pinch with two fingers to zoom; drag with two fingers to move.')}</small></span><button type="button" onClick={dismissGestureCoach}>{t('Got It')}</button></div> : null}
               <div className="canvas-board">
-                <canvas ref={canvasRef} width={CANVAS_WIDTH} height={CANVAS_HEIGHT} onPointerDown={begin} onPointerEnter={updateEraserCursor} onPointerMove={move} onPointerLeave={hideEraserCursor} onPointerUp={finish} onPointerCancel={cancelStroke} aria-label={t('Advanced drawing area')} aria-describedby="canvas-gesture-description" aria-disabled={sending || sourceLoading || sourceError} data-tool={tool} data-text-selected={Boolean(selectedTextId)} data-sending={sending} tabIndex={0}>{t('Canvas supports mouse, stylus, and touch input.')}</canvas>
+                <canvas ref={canvasRef} width={canvasWidth} height={canvasHeight} onPointerDown={begin} onPointerEnter={updateEraserCursor} onPointerMove={move} onPointerLeave={hideEraserCursor} onPointerUp={finish} onPointerCancel={cancelStroke} aria-label={t('Advanced drawing area')} aria-describedby="canvas-gesture-description" aria-disabled={sending || sourceLoading || sourceError} data-tool={tool} data-text-selected={Boolean(selectedTextId)} data-sending={sending} tabIndex={0}>{t('Canvas supports mouse, stylus, and touch input.')}</canvas>
                 <span id="canvas-gesture-description" className="sr-only">{t('One finger draws · two fingers zoom and pan')}</span>
                 <span ref={eraserCursorRef} className="eraser-size-cursor" data-visible="false" aria-hidden="true" />
                 {sourceLoading ? <span className="canvas-loading">{t('Loading the original to continue drawing…')}</span> : null}
@@ -1836,6 +2039,7 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
           {mobileInspectorOpen && <button type="button" tabIndex={-1} className="mobile-inspector-dismiss" onClick={closeMobileInspector} aria-label={t('Close tool settings')} />}
           <aside id="tool-properties" className={mobileInspectorOpen ? 'tool-inspector mobile-open' : 'tool-inspector'} role={mobileInspectorOpen ? 'dialog' : undefined} aria-modal={mobileInspectorOpen ? true : undefined} aria-labelledby={mobileInspectorOpen ? 'mobile-tool-settings-title' : undefined} aria-label={mobileInspectorOpen ? undefined : t('Tool properties')}>
             <header className="mobile-inspector-header"><span><small>{t(activeTool.label)}</small><strong id="mobile-tool-settings-title">{t('Tool Settings')}</strong></span><button type="button" onClick={closeMobileInspector} aria-label={t('Close tool settings')}>×</button></header>
+            {sourceUrl ? <section className="source-layer-controls" aria-labelledby="source-layer-title"><div className="inspector-title"><span id="source-layer-title">{t('Source Layer')}</span><output>{t('Locked')}</output></div><p>{sourceKind === 'photo' ? t('The original photo stays unchanged while your marks remain editable above it.') : t('The source stays unchanged while your marks remain editable above it.')}</p><div className="source-layer-toggle"><button type="button" className={sourceVisible ? 'active' : ''} onClick={() => setSourceVisible((value) => !value)} aria-pressed={sourceVisible}>{sourceVisible ? t('Hide Source') : t('Show Source')}</button><div role="group" aria-label={t('Source placement')}><button type="button" className={sourcePlacement === 'fit' ? 'active' : ''} onClick={() => setSourcePlacement('fit')} aria-pressed={sourcePlacement === 'fit'}>{t('Fit')}</button><button type="button" className={sourcePlacement === 'crop' ? 'active' : ''} onClick={() => setSourcePlacement('crop')} aria-pressed={sourcePlacement === 'crop'}>{t('Crop')}</button></div></div><label>{t('Source Opacity')}<span><input type="range" min="10" max="100" value={Math.round(sourceOpacity * 100)} onChange={(event) => setSourceOpacity(Number(event.target.value) / 100)} style={rangeStyle(sourceOpacity * 100, 10, 100)} disabled={!sourceVisible} /><output>{Math.round(sourceOpacity * 100)}%</output></span></label></section> : null}
             {editingTool ? <>
               {tool !== 'eraser' ? <section><div className="inspector-title"><span>{t('Color')}</span><output>{color.toUpperCase()}</output></div><div className="advanced-color-row">{COLORS.map((item) => <button type="button" key={item} className={color.toUpperCase() === item.toUpperCase() ? 'color active' : 'color'} style={{ background: item }} onClick={() => setColor(item)} aria-label={t('Choose color {color}', { color: item })} aria-pressed={color.toUpperCase() === item.toUpperCase()} />)}<label className="custom-color" title={t('Custom color')}>＋<input type="color" name="custom-color" value={color} onChange={(event) => setColor(event.target.value.toUpperCase())} aria-label={t('Choose a custom color')} /></label></div>{paletteAvailable ? <button type="button" ref={mixerToggleRef} className="mixer-toggle" onClick={() => { setMixerOpen((open) => !open); setPaletteError(''); }} aria-label={mixerOpen ? t('Close advanced color mixing') : t('Open advanced color mixing')} aria-expanded={mixerOpen} aria-controls="pigment-mixer"><span aria-hidden="true">◒</span>{mixerOpen ? t('Close Mixer') : t('Advanced Color Mixing')}</button> : null}</section> : null}
               {paletteAvailable && mixerOpen ? (
@@ -1898,11 +2102,26 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, versio
               {tool === 'text' ? <section><label className="text-tool-label" htmlFor="canvas-text">{t('Text Content')}</label><textarea id="canvas-text" name="canvas-text" autoComplete="off" value={textValue} onChange={(event) => setTextValue(event.target.value)} placeholder={t('Enter text, then drag it onto the paper…')} maxLength={160} /><p className="text-tool-help">{t('Press and drag to place text. Click or drag text with a purple frame to reposition it.')}</p>{selectedTextId ? <button type="button" className="text-delete-button" onClick={deleteSelectedText}><span>⌫</span> {t('Delete Selected Text')} <kbd>Delete</kbd></button> : null}</section> : null}
               {closedShapeTool ? <section><label className="fill-toggle"><input type="checkbox" name="shape-fill" checked={filled} onChange={(event) => setFilled(event.target.checked)} /><span><strong>{t('Light Fill')}</strong><small>{t('Keep a clear outline with a 16% fill')}</small></span></label></section> : null}
             </> : <section className="hand-tool-help"><strong>{t('Pan Canvas')}</strong><p>{t('Zoom in, then drag the paper to inspect details. This tool does not create marks.')}</p></section>}
-            <section><div className="inspector-title"><span>{t('Paper')}</span><output>{sourceUrl ? t('Below Original') : ''}</output></div><div className="paper-options">{([['white', 'White'], ['cream', 'Cream'], ['grid', 'Grid'], ['dots', 'Dots']] as Array<[Paper, string]>).map(([id, label]) => <button type="button" key={id} className={paper === id ? `paper-${id} active` : `paper-${id}`} onClick={() => changePaper(id)} aria-pressed={paper === id}><i />{t(label)}</button>)}</div></section>
+            <section className="paper-format-settings">
+              <div className="inspector-title"><span>{t('Canvas Size')}</span><output>{canvasWidth} × {canvasHeight}</output></div>
+              <div className="paper-format-options" role="group" aria-label={t('Paper Format')}>{PAPER_FORMATS.map((format) => {
+                const selected = customPaperWidth === format.width && customPaperHeight === format.height;
+                return <button type="button" key={format.id} className={selected ? 'active' : ''} onClick={() => stagePaperFormat(format.width, format.height)} disabled={Boolean(sourceUrl && sourceKind !== 'photo')} aria-pressed={selected}><span style={{ aspectRatio: `${format.width}/${format.height}` }} aria-hidden="true" /><strong>{t(format.label)}</strong></button>;
+              })}</div>
+              {!sourceUrl || sourceKind === 'photo' ? <>
+                <div className="custom-paper-size"><label>{t('Width')}<input type="number" inputMode="numeric" min="480" max="2000" value={customPaperWidth} onChange={(event) => setCustomPaperWidth(Number(event.target.value))} /></label><span aria-hidden="true">×</span><label>{t('Height')}<input type="number" inputMode="numeric" min="480" max="2000" value={customPaperHeight} onChange={(event) => setCustomPaperHeight(Number(event.target.value))} /></label></div>
+                <div className="resize-preview"><div><span>{t('Current')}</span><strong>{canvasWidth} × {canvasHeight}</strong></div><div className={`resize-preview-map anchor-${resizeAnchor}`} style={{ aspectRatio: `${Math.max(canvasWidth, customPaperWidth)}/${Math.max(canvasHeight, customPaperHeight)}` }}><i style={{ width: `${canvasWidth / Math.max(canvasWidth, customPaperWidth) * 100}%`, height: `${canvasHeight / Math.max(canvasHeight, customPaperHeight) * 100}%` }} /><b style={{ width: `${customPaperWidth / Math.max(canvasWidth, customPaperWidth) * 100}%`, height: `${customPaperHeight / Math.max(canvasHeight, customPaperHeight) * 100}%` }} aria-hidden="true" /></div></div>
+                <div className="resize-anchor-row"><span>{t('Keep artwork anchored')}</span><div role="group" aria-label={t('Resize Anchor')}>{CANVAS_ANCHORS.map((anchor) => <button type="button" key={anchor} className={resizeAnchor === anchor ? 'active' : ''} onClick={() => setResizeAnchor(anchor)} aria-label={t(CANVAS_ANCHOR_LABELS[anchor])} aria-pressed={resizeAnchor === anchor}><i /></button>)}</div></div>
+                <button type="button" className="apply-canvas-resize" onClick={applyCanvasResize} disabled={customPaperWidth === canvasWidth && customPaperHeight === canvasHeight}>{actions.length ? t('Resize Canvas') : t('Apply Size')}</button>
+                <p>{customPaperWidth < canvasWidth || customPaperHeight < canvasHeight ? t('The previewed frame crops outside areas. Undo restores the complete previous canvas.') : t('New space is added around the selected anchor without scaling your marks.')}</p>
+              </> : <p>{t('Continued drawings keep the original paper shape automatically.')}</p>}
+              <p>{t('Export resolution stays independent from the workspace view.')}</p>
+            </section>
+            <section><div className="inspector-title"><span>{t('Paper Style')}</span><output>{sourceUrl ? t('Below Original') : ''}</output></div><div className="paper-options">{([['white', 'White'], ['cream', 'Cream'], ['grid', 'Grid'], ['dots', 'Dots']] as Array<[Paper, string]>).map(([id, label]) => <button type="button" key={id} className={paper === id ? `paper-${id} active` : `paper-${id}`} onClick={() => changePaper(id)} disabled={sourceLoading} aria-pressed={paper === id}><i />{t(label)}</button>)}</div></section>
           </aside>
         </div>
 
-        <footer className={captionOpen ? 'studio-footer mobile-open' : 'studio-footer'} inert={mobileInspectorOpen ? true : undefined}><label><span>{t('Message')}</span><input ref={captionInputRef} name="drawing-caption" autoComplete="off" value={caption} onChange={(event) => setCaption(event.target.value)} placeholder={t('Add context for this drawing…')} maxLength={2000} aria-label={t('Drawing message')} /></label><button type="button" className="mobile-caption-close" onClick={() => { setCaptionOpen(false); addToolsButtonRef.current?.focus(); }} aria-label={t('Close message composer')}>×</button><div><span>{sourceUrl && !sourceIsDraft ? `${t('Original remains unchanged')} · ` : ''}PNG 1200 × 720</span><button type="button" className="primary-button" onClick={() => void send()} disabled={!canSendCanvas || paletteMutating || sending || sourceLoading || sourceError} title={!canSendCanvas ? t('Draw at least one mark or choose a paper before sending') : undefined}>{sendLabel}</button>{!canSendCanvas ? <small className="studio-send-help">{t('Draw or add text to enable Send')}</small> : null}</div></footer>
+        <footer className={captionOpen ? 'studio-footer mobile-open' : 'studio-footer'} inert={mobileInspectorOpen ? true : undefined}><label><span>{t('Message')}</span><input ref={captionInputRef} name="drawing-caption" autoComplete="off" value={caption} onChange={(event) => setCaption(event.target.value)} placeholder={t('Add context for this drawing…')} maxLength={2000} aria-label={t('Drawing message')} /></label><button type="button" className="mobile-caption-close" onClick={() => { setCaptionOpen(false); addToolsButtonRef.current?.focus(); }} aria-label={t('Close message composer')}>×</button><div><span>{canSendCanvas ? t('Changes: {summary}', { summary: visualChanges.join(' · ') }) : sourceUrl ? t('Change the source or add a visual edit before sending.') : t('Draw or change the paper before sending.')} {sourceUrl && !sourceIsDraft ? ` · ${t('Original remains unchanged')}` : ''}</span><button type="button" className="primary-button" onClick={() => void send()} disabled={!canSendCanvas || paletteMutating || sending || sourceLoading || sourceError} title={!canSendCanvas ? t('Make a visual change before sending') : undefined}>{sendLabel}</button>{!canSendCanvas ? <small className="studio-send-help">{t('A caption alone does not create a new visual version.')}</small> : null}</div></footer>
       </section>
       <AppDialog open={Boolean(paletteDeleteTarget)} onClose={() => setPaletteDeleteTarget(null)} labelledBy="delete-palette-title" describedBy="delete-palette-description" className="confirmation-backdrop">
         <section className="dialog-card confirmation-dialog">

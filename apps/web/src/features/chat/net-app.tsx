@@ -4,6 +4,7 @@ import {
   type ChangeEvent,
   type CSSProperties,
   type FormEvent,
+  Fragment,
   lazy,
   Suspense,
   useCallback,
@@ -13,12 +14,14 @@ import {
   useState,
 } from 'react';
 import Image from 'next/image';
-import type { ActorView, CanvasLineageItem, MessageView, PaletteColorView, RoomView, UserSummary } from '@/src/shared/chat.types';
+import type { ActorView, CanvasLineageItem, MessageView, PaletteColorView, RoomPeopleView, RoomPersonView, RoomView, UserSummary } from '@/src/shared/chat.types';
 import { io, type Socket } from 'socket.io-client';
 import AppDialog from '@/src/shared/app-dialog';
 import LandingDoodle from '@/src/features/chat/landing-doodle';
 import { deleteStudioDraftsForPrefix } from '@/src/features/drawing/studio-drafts';
 import MediaViewer from '@/src/features/chat/media-viewer';
+import { deleteOutboxBlob, deleteOutboxBlobsForPrefix, readOutboxBlob, saveOutboxBlob } from '@/src/features/chat/outbox-blobs';
+import { preparePhoto, type PhotoCrop } from '@/src/features/chat/photo-preparation';
 import { useLanguage } from '@/src/i18n/language-provider';
 import { localeTag, translateApiMessage, type Locale } from '@/src/i18n/messages';
 import LanguageSwitcher from '@/src/shared/language-switcher';
@@ -46,16 +49,124 @@ class ApiRequestError extends Error {
   }
 }
 
+function isRetryableSendError(error: unknown) {
+  return error instanceof TypeError || (error instanceof ApiRequestError && (error.status === 429 || error.status >= 500));
+}
+
+async function clearStoredGuestOutbox(sessionId: string) {
+  const legacyStorageKey = `net_message_outbox:v2:guest:${sessionId}`;
+  const storagePrefix = `net_message_outbox:v3:guest:${sessionId}:`;
+  let legacyBlobKeys: string[] = [];
+  try {
+    const legacy = JSON.parse(localStorage.getItem(legacyStorageKey) ?? '[]') as unknown;
+    if (Array.isArray(legacy)) {
+      legacyBlobKeys = legacy.flatMap((item) => item && typeof item === 'object' && typeof (item as { blobKey?: unknown; id?: unknown }).blobKey === 'string'
+        ? [(item as { blobKey: string }).blobKey]
+        : item && typeof item === 'object' && (item as { hasBlob?: unknown }).hasBlob === true && typeof (item as { id?: unknown }).id === 'string'
+          ? [(item as { id: string }).id]
+          : []);
+    }
+    const keys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
+      .filter((key): key is string => Boolean(key && (key === legacyStorageKey || key.startsWith(storagePrefix))));
+    for (const key of keys) localStorage.removeItem(key);
+  } catch {
+    // IndexedDB cleanup below does not depend on readable local metadata.
+  }
+  await Promise.all(legacyBlobKeys.map((key) => deleteOutboxBlob(key).catch(() => undefined)));
+  await deleteOutboxBlobsForPrefix(`guest:${sessionId}:`).catch(() => undefined);
+}
+
 type GuestRecovery = {
   message: string;
   requestId: string | null;
 };
 
+type SendableMessage = {
+  type: 'text' | 'image' | 'canvas';
+  text?: string;
+  assetKey?: string;
+  canvasParentId?: string | null;
+  imageDescription?: string;
+  imagePurpose?: 'creative' | 'reference';
+};
+
+type PendingMessage = {
+  id: string;
+  roomId: string;
+  type: 'text' | 'image' | 'canvas';
+  text: string | null;
+  assetKey: string | null;
+  canvasParentId: string | null;
+  imageDescription?: string | null;
+  imagePurpose?: 'creative' | 'reference';
+  fileName: string | null;
+  blobKey: string | null;
+  replyToId: string | null;
+  createdAt: number;
+  status: 'waiting' | 'sending' | 'failed' | 'blocked';
+  error: string | null;
+};
+
+function restorePendingMessage(item: unknown): PendingMessage | null {
+  if (!item || typeof item !== 'object') return null;
+  const candidate = item as Partial<PendingMessage> & { hasBlob?: boolean };
+  const type = candidate.type === 'image' || candidate.type === 'canvas' ? candidate.type : 'text';
+  if (typeof candidate.id !== 'string' || typeof candidate.roomId !== 'string' || typeof candidate.createdAt !== 'number') return null;
+  if (type === 'text' && typeof candidate.text !== 'string') return null;
+  return {
+    id: candidate.id,
+    roomId: candidate.roomId,
+    type,
+    text: typeof candidate.text === 'string' ? candidate.text : null,
+    assetKey: typeof candidate.assetKey === 'string' ? candidate.assetKey : null,
+    canvasParentId: typeof candidate.canvasParentId === 'string' ? candidate.canvasParentId : null,
+    imageDescription: typeof candidate.imageDescription === 'string' ? candidate.imageDescription : null,
+    imagePurpose: candidate.imagePurpose === 'reference' ? 'reference' : 'creative',
+    fileName: typeof candidate.fileName === 'string' ? candidate.fileName : null,
+    blobKey: typeof candidate.blobKey === 'string' ? candidate.blobKey : candidate.hasBlob === true ? candidate.id : null,
+    replyToId: typeof candidate.replyToId === 'string' ? candidate.replyToId : null,
+    createdAt: candidate.createdAt,
+    status: candidate.status === 'blocked' ? 'blocked' : 'waiting',
+    error: typeof candidate.error === 'string' ? candidate.error : null,
+  };
+}
+
+function serializePendingMessage(message: PendingMessage) {
+  return JSON.stringify({ ...message, status: message.status === 'blocked' ? 'blocked' : 'waiting' });
+}
+
+function readStoredOutbox(storagePrefix: string) {
+  const recovered = new Map<string, PendingMessage>();
+  for (let index = 0; index < localStorage.length; index += 1) {
+    const key = localStorage.key(index);
+    if (!key?.startsWith(storagePrefix)) continue;
+    try {
+      const item = restorePendingMessage(JSON.parse(localStorage.getItem(key) ?? 'null'));
+      if (item) recovered.set(item.id, item);
+    } catch {
+      // Corrupt per-item metadata is ignored without affecting other queued items.
+    }
+  }
+  const legacyKey = storagePrefix.replace('net_message_outbox:v3:', 'net_message_outbox:v2:').slice(0, -1);
+  try {
+    const legacy = JSON.parse(localStorage.getItem(legacyKey) ?? '[]') as unknown;
+    if (Array.isArray(legacy)) {
+      for (const value of legacy) {
+        const item = restorePendingMessage(value);
+        if (item && !recovered.has(item.id)) recovered.set(item.id, item);
+      }
+    }
+  } catch {
+    // A corrupt legacy queue must not hide valid v3 items.
+  }
+  return { messages: [...recovered.values()].sort((left, right) => left.createdAt - right.createdAt), legacyKey };
+}
+
 const API_REQUEST_ORIGIN = (process.env.NEXT_PUBLIC_API_REQUEST_URL ?? '').replace(/\/$/, '');
 
 const EMOJIS = ['❤️', '👍', '✨', '😂', '👀'];
 
-type UiIconName = 'arrow' | 'check' | 'close' | 'download' | 'draw' | 'external' | 'group' | 'history' | 'info' | 'install' | 'link' | 'lock' | 'menu' | 'message' | 'plus' | 'reply' | 'search' | 'send' | 'user';
+type UiIconName = 'arrow' | 'check' | 'close' | 'download' | 'draw' | 'external' | 'group' | 'history' | 'info' | 'install' | 'link' | 'lock' | 'menu' | 'message' | 'more' | 'plus' | 'reply' | 'search' | 'send' | 'user';
 
 function UiIcon({ name, size = 20 }: { name: UiIconName; size?: number }) {
   const paths = {
@@ -73,6 +184,7 @@ function UiIcon({ name, size = 20 }: { name: UiIconName; size?: number }) {
     lock: <><rect x="5" y="10" width="14" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></>,
     menu: <><path d="M4 7h16" /><path d="M4 12h16" /><path d="M4 17h16" /></>,
     message: <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />,
+    more: <><circle cx="5" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="19" cy="12" r="1" fill="currentColor" stroke="none" /></>,
     plus: <><path d="M12 5v14" /><path d="M5 12h14" /></>,
     reply: <><path d="m9 17-5-5 5-5" /><path d="M4 12h9a7 7 0 0 1 7 7" /></>,
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></>,
@@ -117,13 +229,32 @@ function localDateStamp(value: number) {
   return `${year}-${month}-${day}`;
 }
 
+function messageDayKey(value: number) {
+  return localDateStamp(value);
+}
+
+function messageDayLabel(value: number, locale: Locale, t: (key: string) => string) {
+  const date = new Date(value);
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  if (date.toDateString() === today.toDateString()) return t('Today');
+  if (date.toDateString() === yesterday.toDateString()) return t('Yesterday');
+  return new Intl.DateTimeFormat(localeTag(locale), { weekday: 'short', day: 'numeric', month: 'long', year: 'numeric' }).format(date);
+}
+
 function sameMessage(left: MessageView, right: MessageView) {
   return left.id === right.id
     && left.sequence === right.sequence
     && left.body === right.body
     && left.assetUrl === right.assetUrl
+    && left.assetKey === right.assetKey
     && left.editedAt === right.editedAt
+    && left.deletedAt === right.deletedAt
+    && left.lineageRoot?.id === right.lineageRoot?.id
+    && left.lineageRoot?.deletedAt === right.lineageRoot?.deletedAt
     && left.readCount === right.readCount
+    && left.continuationCount === right.continuationCount
     && left.reactions.length === right.reactions.length
     && left.reactions.every((reaction, index) => {
       const next = right.reactions[index];
@@ -173,6 +304,8 @@ function InviteContext({ preview }: { preview: InvitePreview | null }) {
           {preview.participants.slice(0, 4).map((participant, index) => <span key={`${participant.displayName}-${index}`} className="avatar" style={participant.avatarColor ? { '--avatar': participant.avatarColor } as CSSProperties : avatarStyle(participant.displayName)}>{participant.displayName.slice(0, 1)}</span>)}
           {preview.participantCount > 4 && <b>+{preview.participantCount - 4}</b>}
         </div>
+        <p className="invite-participant-names">{preview.participants.slice(0, 3).map((participant) => participant.displayName).join(', ')}{preview.participantCount > 3 ? t(' and {count} others', { count: preview.participantCount - 3 }) : ''}</p>
+        {preview.participantCount > 3 ? <details className="invite-participant-disclosure"><summary>{t('See who is here')}</summary><p>{preview.participants.map((participant) => participant.displayName).join(', ')}{preview.participantCount > preview.participants.length ? t(' and {count} more', { count: preview.participantCount - preview.participants.length }) : ''}</p></details> : null}
         <span><i /> {activity}{preview.recentActivity ? ` · ${timeLabel(preview.recentActivity.createdAt, locale)}` : ''}</span>
       </div>
     </div>
@@ -246,8 +379,9 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const [selectedContacts, setSelectedContacts] = useState<UserSummary[]>([]);
   const [allowGuests, setAllowGuests] = useState(true);
   const [infoOpen, setInfoOpen] = useState(false);
+  const [mobileHeaderMenuOpen, setMobileHeaderMenuOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [studio, setStudio] = useState<{ sourceUrl?: string | null; parentId?: string | null; version?: number | null; draftSource?: boolean } | null>(null);
+  const [studio, setStudio] = useState<{ sourceUrl?: string | null; parentId?: string | null; version?: number | null; draftSource?: boolean; sourceKind?: 'photo' | 'drawing' | 'draft'; sourceAuthor?: string | null } | null>(null);
   const [pendingLandingSketch, setPendingLandingSketch] = useState<string | null>(() => {
     if (typeof window === 'undefined') return null;
     try {
@@ -257,7 +391,8 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     }
   });
   const [viewingMedia, setViewingMedia] = useState<MessageView | null>(null);
-  const [lineageViewer, setLineageViewer] = useState<{ messageId: string; lineage: CanvasLineageItem[]; loading: boolean; error: string; truncated: boolean } | null>(null);
+  const [photoDraft, setPhotoDraft] = useState<{ file: File; url: string; rotation: 0 | 90 | 180 | 270; crop: PhotoCrop; prompt: string; description: string; purpose: 'creative' | 'reference'; replyToId: string | null } | null>(null);
+  const [lineageViewer, setLineageViewer] = useState<{ messageId: string; lineage: CanvasLineageItem[]; loading: boolean; error: string; truncated: boolean; canDecide: boolean; decisionOwners: Array<{ id: string; displayName: string }> } | null>(null);
   const [downloadingAssetKey, setDownloadingAssetKey] = useState<string | null>(null);
   const [paletteColors, setPaletteColors] = useState<PaletteColorView[]>([]);
   const [paletteLoading, setPaletteLoading] = useState(false);
@@ -268,16 +403,46 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const [realtimeConnected, setRealtimeConnected] = useState(false);
   const [networkOnline, setNetworkOnline] = useState(() => typeof navigator === 'undefined' ? true : navigator.onLine);
+  const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([]);
+  const [outboxReady, setOutboxReady] = useState(false);
+  const [outboxRetrying, setOutboxRetrying] = useState(false);
+  const [outboxPersistenceFailed, setOutboxPersistenceFailed] = useState(false);
+  const [outboxExpanded, setOutboxExpanded] = useState(false);
   const [pageVisible, setPageVisible] = useState(() => typeof document === 'undefined' || document.visibilityState === 'visible');
   const [conversationAtBottom, setConversationAtBottom] = useState(false);
+  const [viewingLatest, setViewingLatest] = useState(true);
+  const [firstUnreadSequence, setFirstUnreadSequence] = useState<number | null>(null);
+  const [historyAnnouncement, setHistoryAnnouncement] = useState('');
+  const [roomPeople, setRoomPeople] = useState<RoomPeopleView | null>(null);
+  const [roomPeopleLoading, setRoomPeopleLoading] = useState(false);
+  const [peopleSafetyOpen, setPeopleSafetyOpen] = useState(false);
+  const [reportTarget, setReportTarget] = useState<RoomPersonView | null>(null);
+  const [reportMessage, setReportMessage] = useState<MessageView | null>(null);
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportReason, setReportReason] = useState('harassment');
+  const [reportDetails, setReportDetails] = useState('');
+  const [editingMessage, setEditingMessage] = useState<MessageView | null>(null);
+  const [editingText, setEditingText] = useState('');
+  const [deletingMessage, setDeletingMessage] = useState<MessageView | null>(null);
+  const [safetyAction, setSafetyAction] = useState<{ kind: 'remove' | 'block' | 'leave'; person?: RoomPersonView } | null>(null);
+  const [deleteRoomConfirmOpen, setDeleteRoomConfirmOpen] = useState(false);
+  const [undoMessage, setUndoMessage] = useState<{ messageId: string; roomId: string; expiresAt: number } | null>(null);
+  const [pendingPreview, setPendingPreview] = useState<{ message: PendingMessage; url: string; revoke: boolean } | null>(null);
+  const [pendingRemoval, setPendingRemoval] = useState<PendingMessage | null>(null);
+  const [revealedBlockedMessages, setRevealedBlockedMessages] = useState<Set<string>>(() => new Set());
+  const [replacePendingId, setReplacePendingId] = useState<string | null>(null);
   const [bootstrapRetry, setBootstrapRetry] = useState(0);
   const [apiToken, setApiToken] = useState(initialApiToken);
   const fileRef = useRef<HTMLInputElement>(null);
+  const replaceFileRef = useRef<HTMLInputElement>(null);
   const guestNameRef = useRef<HTMLInputElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const messageScrollRef = useRef<HTMLElement>(null);
+  const messagesRef = useRef<MessageView[]>([]);
   const conversationAtBottomRef = useRef(false);
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
+  const mobileHeaderMenuTriggerRef = useRef<HTMLButtonElement>(null);
+  const mobileHeaderActionsRef = useRef<HTMLDivElement>(null);
   const joinedInvite = useRef(false);
   const activeRoomRef = useRef<string | null>(null);
   const latestMessageRequestGeneration = useRef(0);
@@ -300,10 +465,22 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const continuationGeneration = useRef(0);
   const guestBootstrapSessionRef = useRef<string | null>(null);
   const pendingLandingSketchRef = useRef(pendingLandingSketch);
+  const skipNextOutboxPersistenceRef = useRef(false);
+  const outboxStoragePrefixRef = useRef<string | null>(null);
 
   const activeRoom = rooms.find((room) => room.id === activeRoomId) ?? null;
+  const activeRoomUnreadCount = activeRoom?.unreadCount ?? 0;
+  const activeRoomFirstUnreadSequence = activeRoom?.firstUnreadSequence ?? null;
   const actorId = actor?.id ?? null;
   const normalizedMessageQuery = messageQuery.trim().toLocaleLowerCase(localeTag(locale));
+  const outboxStoragePrefix = actor ? `net_message_outbox:v3:${actor.kind}:${actor.id}:` : null;
+  const activePendingMessages = activeRoomId ? pendingMessages.filter((message) => message.roomId === activeRoomId) : [];
+
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+
+  useEffect(() => () => {
+    if (pendingPreview?.revoke) URL.revokeObjectURL(pendingPreview.url);
+  }, [pendingPreview]);
 
   const api = useCallback(async <T,>(path: string, init: RequestInit = {}, sessionOverride?: string | null): Promise<T> => {
     const requestUrl = API_REQUEST_ORIGIN ? `${API_REQUEST_ORIGIN}${path}` : path;
@@ -333,7 +510,10 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
 
   const clearGuestSession = useCallback((message: string) => {
     const storedGuest = sessionStorage.getItem('net_guest_session');
-    if (storedGuest) void deleteStudioDraftsForPrefix(`guest:${storedGuest}:`).catch(() => undefined);
+    if (storedGuest) {
+      void deleteStudioDraftsForPrefix(`guest:${storedGuest}:`).catch(() => undefined);
+      void clearStoredGuestOutbox(storedGuest);
+    }
     sessionStorage.removeItem('net_guest_session');
     latestMessageRequestGeneration.current += 1;
     historyMessageRequestGeneration.current += 1;
@@ -348,7 +528,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     activeRoomRef.current = null;
     continuationGeneration.current += 1;
     paginationInitializedRoomRef.current = null;
-    setGuestSession(null); setActor(null); setRooms([]); setMessages([]); setNextCursor(null); setPaletteColors([]);
+    setGuestSession(null); setActor(null); setRooms([]); setMessages([]); setNextCursor(null); setPaletteColors([]); setPendingMessages([]);
     setActiveRoomId(null); setReplyTo(null); setViewingMedia(null); setLineageViewer(null); setPhase('landing'); setSidebarOpen(false); setInfoOpen(false);
     setError(message);
   }, []);
@@ -359,12 +539,14 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     messageSearchGeneration.current += 1;
     activeRoomRef.current = roomId;
     paginationInitializedRoomRef.current = null;
+    messagesRef.current = [];
     setActiveRoomId(roomId); setMessages([]); setNextCursor(null); setReplyTo(null);
     setMessageSearchResults([]); setMessageSearchTotal(0); setMessageSearchLoading(false);
     conversationAtBottomRef.current = false;
     lineageRequestGeneration.current += 1;
     continuationGeneration.current += 1;
-    setSidebarOpen(false); setInfoOpen(false); setViewingMedia(null); setLineageViewer(null); setMessageQuery(''); setConversationAtBottom(false);
+    setSidebarOpen(false); setInfoOpen(false); setPeopleSafetyOpen(false); setRoomPeople(null); setViewingMedia(null); setLineageViewer(null); setMessageQuery(''); setConversationAtBottom(false); setViewingLatest(true); setFirstUnreadSequence(null);
+    setMobileHeaderMenuOpen(false);
   }, []);
 
   const consumeInvite = useCallback(() => {
@@ -484,12 +666,94 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   }, [api, bootstrapRetry, clearGuestSession, consumeInvite, guestSession, initialUser, inviteCode, loadBootstrap, selectRoom, t]);
 
   useEffect(() => {
-    if (initialUser) sessionStorage.removeItem('net_guest_session');
+    if (!initialUser) return;
+    const storedGuest = sessionStorage.getItem('net_guest_session');
+    if (storedGuest) void clearStoredGuestOutbox(storedGuest);
+    sessionStorage.removeItem('net_guest_session');
   }, [initialUser]);
+
+  useEffect(() => {
+    skipNextOutboxPersistenceRef.current = true;
+    outboxStoragePrefixRef.current = outboxStoragePrefix;
+    const frame = window.requestAnimationFrame(() => {
+      setOutboxReady(false);
+      setOutboxPersistenceFailed(false);
+      if (!outboxStoragePrefix) {
+        setPendingMessages([]);
+        setOutboxReady(true);
+        return;
+      }
+      try {
+        const recovered = readStoredOutbox(outboxStoragePrefix);
+        for (const message of recovered.messages) localStorage.setItem(`${outboxStoragePrefix}${message.id}`, serializePendingMessage(message));
+        localStorage.removeItem(recovered.legacyKey);
+        setPendingMessages(recovered.messages);
+      } catch {
+        setPendingMessages([]);
+        setOutboxPersistenceFailed(true);
+      }
+      setOutboxReady(true);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [outboxStoragePrefix]);
+
+  useEffect(() => {
+    if (!outboxStoragePrefix || !outboxReady) return;
+    if (skipNextOutboxPersistenceRef.current) {
+      skipNextOutboxPersistenceRef.current = false;
+      return;
+    }
+    let persistenceFailed = false;
+    try {
+      for (const message of pendingMessages) localStorage.setItem(`${outboxStoragePrefix}${message.id}`, serializePendingMessage(message));
+    } catch {
+      persistenceFailed = true;
+    }
+    const frame = window.requestAnimationFrame(() => setOutboxPersistenceFailed(persistenceFailed));
+    return () => window.cancelAnimationFrame(frame);
+  }, [outboxReady, outboxStoragePrefix, pendingMessages]);
+
+  useEffect(() => {
+    if (!outboxStoragePrefix) return;
+    const synchronizeOutbox = (event: StorageEvent) => {
+      if (!event.key?.startsWith(outboxStoragePrefix)) return;
+      try {
+        setPendingMessages(readStoredOutbox(outboxStoragePrefix).messages);
+        setOutboxPersistenceFailed(false);
+      } catch {
+        setOutboxPersistenceFailed(true);
+      }
+    };
+    window.addEventListener('storage', synchronizeOutbox);
+    return () => window.removeEventListener('storage', synchronizeOutbox);
+  }, [outboxStoragePrefix]);
 
   useEffect(() => {
     if ('serviceWorker' in navigator) void navigator.serviceWorker.register('/sw.js');
   }, []);
+
+  useEffect(() => {
+    if (!mobileHeaderMenuOpen) return;
+    const frame = window.requestAnimationFrame(() => mobileHeaderActionsRef.current?.querySelector<HTMLButtonElement>('button')?.focus());
+    const dismissFromOutside = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node) || mobileHeaderActionsRef.current?.contains(target) || mobileHeaderMenuTriggerRef.current?.contains(target)) return;
+      setMobileHeaderMenuOpen(false);
+    };
+    const dismissFromKeyboard = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      setMobileHeaderMenuOpen(false);
+      mobileHeaderMenuTriggerRef.current?.focus();
+    };
+    document.addEventListener('pointerdown', dismissFromOutside);
+    document.addEventListener('keydown', dismissFromKeyboard);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener('pointerdown', dismissFromOutside);
+      document.removeEventListener('keydown', dismissFromKeyboard);
+    };
+  }, [mobileHeaderMenuOpen]);
 
   useEffect(() => {
     const onOffline = () => setNetworkOnline(false);
@@ -533,13 +797,17 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     return () => { window.removeEventListener('pointerdown', touch); window.removeEventListener('keydown', touch); };
   }, [actor?.kind, api, clearGuestSession, t]);
 
-  const loadMessages = useCallback(async (roomId: string, quiet = false, before?: string) => {
+  const loadMessages = useCallback(async (roomId: string, quiet = false, before?: string, from?: number | null) => {
     const requestGeneration = before ? historyMessageRequestGeneration : latestMessageRequestGeneration;
     const generation = ++requestGeneration.current;
     const followLatest = quiet && !before && conversationAtBottomRef.current;
     try {
-      const cursor = before ? `?before=${encodeURIComponent(before)}` : quiet ? '?limit=100' : '';
-      const data = await api<{ messages: MessageView[]; nextCursor: string | null }>(`/api/rooms/${roomId}/messages${cursor}`);
+      const cursor = before
+        ? `?before=${encodeURIComponent(before)}`
+        : from
+          ? `?from=${encodeURIComponent(String(from))}&limit=100`
+          : quiet ? '?limit=100' : '';
+      const data = await api<{ messages: MessageView[]; nextCursor: string | null; hasMoreAfter?: boolean }>(`/api/rooms/${roomId}/messages${cursor}`);
       if (activeRoomRef.current !== roomId || generation !== requestGeneration.current) return;
       if (!quiet || paginationInitializedRoomRef.current !== roomId) {
         setNextCursor(data.nextCursor);
@@ -552,6 +820,9 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           return [...merged.values()].sort((left, right) => left.sequence - right.sequence);
         });
       } else if (quiet) {
+        const previousNewest = messagesRef.current[messagesRef.current.length - 1]?.sequence ?? 0;
+        const newIncoming = data.messages.filter((message) => message.sequence > previousNewest && (actor?.kind === 'user' ? message.senderId !== actor.id : message.guestSessionId !== actor?.id) && message.type !== 'system');
+        if (newIncoming.length) setHistoryAnnouncement(t('{count} new messages arrived.', { count: newIncoming.length }));
         setMessages((current) => {
           if (!data.messages.length) return [];
           const ids = new Set(data.messages.map((message) => message.id));
@@ -568,8 +839,14 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           return [...merged.values()].sort((left, right) => left.sequence - right.sequence);
         });
       } else setMessages(data.messages);
+      if (!quiet && !before) {
+        setViewingLatest(!data.hasMoreAfter);
+        setFirstUnreadSequence(from ?? null);
+      }
       if ((!quiet && !before) || followLatest) requestAnimationFrame(() => {
-        endRef.current?.scrollIntoView({ block: 'end' });
+        const unread = from ? document.getElementById(`message-${data.messages.find((message) => message.sequence >= from)?.id ?? ''}`) : null;
+        if (unread) unread.scrollIntoView({ block: 'center' });
+        else endRef.current?.scrollIntoView({ block: 'end' });
         const scrollContainer = messageScrollRef.current;
         if (!scrollContainer) return;
         const distance = scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
@@ -585,7 +862,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       }
       if (!quiet) setError(loadError instanceof Error ? loadError.message : t('Messages could not be loaded. Try again.'));
     }
-  }, [api, clearGuestSession, guestSession, t]);
+  }, [actor?.id, actor?.kind, api, clearGuestSession, guestSession, t]);
 
   useEffect(() => {
     const scrollContainer = messageScrollRef.current;
@@ -620,7 +897,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   }, []);
 
   useEffect(() => {
-    if (!activeRoomId || !pageVisible || normalizedMessageQuery || infoOpen || studio || !messages.length) return;
+    if (!activeRoomId || !pageVisible || normalizedMessageQuery || infoOpen || studio || !messages.length || !viewingLatest) return;
     const scrollContainer = messageScrollRef.current;
     const distanceFromBottom = scrollContainer
       ? scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight
@@ -630,7 +907,10 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     if (!newest || newest.id === readMarkers.current.get(activeRoomId)) return;
     readMarkers.current.set(activeRoomId, newest.id);
     void api(`/api/rooms/${activeRoomId}/messages`, { method: 'PATCH', body: JSON.stringify({ messageId: newest.id }) })
-      .then(() => setRooms((current) => current.map((room) => room.id === activeRoomId ? { ...room, unreadCount: 0 } : room)))
+      .then(() => {
+        setRooms((current) => current.map((room) => room.id === activeRoomId ? { ...room, unreadCount: 0, firstUnreadSequence: null, lastReadSequence: newest.sequence } : room));
+        setFirstUnreadSequence(null);
+      })
       .catch((readError) => {
         readMarkers.current.delete(activeRoomId);
         if (endingGuestRef.current) return;
@@ -638,7 +918,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           clearGuestSession(t('Your guest session expired. You no longer have access; messages and attached images remain in the room.'));
         }
       });
-  }, [activeRoomId, api, clearGuestSession, conversationAtBottom, guestSession, infoOpen, messages, normalizedMessageQuery, pageVisible, studio, t]);
+  }, [activeRoomId, api, clearGuestSession, conversationAtBottom, guestSession, infoOpen, messages, normalizedMessageQuery, pageVisible, studio, t, viewingLatest]);
 
   useEffect(() => {
     const websocketUrl = process.env.NEXT_PUBLIC_WEBSOCKET_URL;
@@ -802,6 +1082,21 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           refreshActiveRoom(payload);
           void loadBootstrap();
         });
+        socket.on('message.updated', (payload: { roomId?: string; messageId?: string; body?: string; editedAt?: number }) => {
+          if (!payload?.roomId || payload.roomId !== activeRoomRef.current || !payload.messageId || typeof payload.body !== 'string' || !Number.isSafeInteger(payload.editedAt)) return;
+          const applyEdit = (current: MessageView[]) => current.map((message) => message.id === payload.messageId ? { ...message, body: payload.body ?? '', editedAt: Number(payload.editedAt) } : message);
+          setMessages(applyEdit);
+          setMessageSearchResults(applyEdit);
+          void loadBootstrap();
+        });
+        socket.on('message.deleted', (payload: { roomId?: string; messageId?: string; deletedAt?: number }) => {
+          if (!payload?.roomId || payload.roomId !== activeRoomRef.current || !payload.messageId || !Number.isSafeInteger(payload.deletedAt)) return;
+          const applyDelete = (current: MessageView[]) => current.map((message) => message.id === payload.messageId ? { ...message, body: null, assetKey: null, assetUrl: null, deletedAt: Number(payload.deletedAt), reactions: [] } : message);
+          setMessages(applyDelete);
+          setMessageSearchResults(applyDelete);
+          setViewingMedia((current) => current?.id === payload.messageId ? null : current);
+          void loadBootstrap();
+        });
         socket.on('reaction.updated', (payload: { roomId?: string; messageId?: string; emoji?: string; actorKey?: string; reacted?: boolean; count?: number }) => {
           const currentRoom = activeRoomRef.current;
           if (!payload?.roomId || payload.roomId !== currentRoom || !payload.messageId || !payload.emoji || !Number.isSafeInteger(payload.count) || Number(payload.count) < 0) return;
@@ -892,9 +1187,10 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
 
   useEffect(() => {
     if (!activeRoomId || phase !== 'app') return;
-    const initialLoad = window.setTimeout(() => void loadMessages(activeRoomId), 0);
+    const unreadStart = activeRoomUnreadCount > 0 ? activeRoomFirstUnreadSequence : null;
+    const initialLoad = window.setTimeout(() => void loadMessages(activeRoomId, false, undefined, unreadStart), 0);
     return () => window.clearTimeout(initialLoad);
-  }, [activeRoomId, loadMessages, phase]);
+  }, [activeRoomFirstUnreadSequence, activeRoomId, activeRoomUnreadCount, loadMessages, phase]);
 
   useEffect(() => {
     if (!activeRoomId || phase !== 'app') return;
@@ -918,6 +1214,12 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     const timeout = window.setTimeout(() => setNotice(''), 6500);
     return () => window.clearTimeout(timeout);
   }, [notice]);
+
+  useEffect(() => {
+    if (!undoMessage) return;
+    const timeout = window.setTimeout(() => setUndoMessage((current) => current?.messageId === undoMessage.messageId ? null : current), Math.max(0, undoMessage.expiresAt - Date.now()));
+    return () => window.clearTimeout(timeout);
+  }, [undoMessage]);
 
   useEffect(() => {
     if (phase !== 'landing' || (!guestModal && inviteStatus !== 'guest')) return;
@@ -1097,51 +1399,218 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     setBusy(false);
   };
 
-  const sendMessage = async (payload: { type: 'text' | 'image' | 'canvas'; text?: string; assetKey?: string; canvasParentId?: string | null }, replyToId: string | null) => {
-    if (!activeRoomId) return;
-    const clientRequestId = crypto.randomUUID();
-    const request = () => api(`/api/rooms/${activeRoomId}/messages`, {
+  const uploadAsset = useCallback(async (blob: Blob, roomId = activeRoomId, uploadId?: string) => {
+    if (!roomId) throw new Error(t('Select a conversation first.'));
+    const uploadQuery = uploadId ? `&uploadId=${encodeURIComponent(uploadId)}` : '';
+    return api<{ key: string }>(`/api/assets?room=${encodeURIComponent(roomId)}${uploadQuery}`, { method: 'POST', headers: { 'content-type': blob.type }, body: blob });
+  }, [activeRoomId, api, t]);
+
+  const sendMessage = useCallback(async (payload: SendableMessage, replyToId: string | null, clientRequestId = crypto.randomUUID(), roomId = activeRoomId) => {
+    if (!roomId) throw new Error(t('Select a conversation first.'));
+    const sent = await api<{ id: string; sequence: number; createdAt: number; canvasVersion: number | null }>(`/api/rooms/${roomId}/messages`, {
       method: 'POST',
       body: JSON.stringify({ ...payload, replyToId, clientRequestId }),
     });
-    try { await request(); }
-    catch (requestError) {
-      if (!(requestError instanceof TypeError)) throw requestError;
-      await request();
+    if (activeRoomRef.current === roomId) await loadMessages(roomId);
+    await loadBootstrap();
+    return sent;
+  }, [activeRoomId, api, loadBootstrap, loadMessages, t]);
+
+  const queueMessage = useCallback(async (
+    pending: Omit<PendingMessage, 'createdAt' | 'status' | 'error' | 'blobKey'>,
+    blob?: Blob,
+    recovery?: { status: 'waiting' | 'blocked'; error: string | null },
+  ) => {
+    if (!actor || !outboxStoragePrefix || (actor.kind === 'guest' && endingGuestRef.current)) throw new Error(t('This item could not be saved on your device.'));
+    const capturedActorId = actor.id;
+    const capturedPrefix = outboxStoragePrefix;
+    const blobKey = blob ? `${actor.kind}:${actor.id}:${pending.id}` : null;
+    if (blob && blobKey) await saveOutboxBlob(blobKey, blob);
+    const identityChanged = actorIdRef.current !== capturedActorId || outboxStoragePrefixRef.current !== capturedPrefix || (actor.kind === 'guest' && endingGuestRef.current);
+    if (identityChanged) {
+      if (blobKey) await deleteOutboxBlob(blobKey).catch(() => undefined);
+      throw new Error(t('This item could not be saved on your device.'));
     }
-    await Promise.all([loadMessages(activeRoomId), loadBootstrap()]);
-  };
+    const queued: PendingMessage = {
+      ...pending,
+      blobKey,
+      createdAt: Date.now(),
+      status: recovery?.status ?? 'waiting',
+      error: recovery?.error ?? null,
+    };
+    try {
+      localStorage.setItem(`${capturedPrefix}${pending.id}`, serializePendingMessage(queued));
+    } catch (storageError) {
+      if (blobKey) await deleteOutboxBlob(blobKey).catch(() => undefined);
+      setOutboxPersistenceFailed(true);
+      throw storageError;
+    }
+    setPendingMessages(readStoredOutbox(capturedPrefix).messages);
+    setOutboxPersistenceFailed(false);
+    setOutboxExpanded(true);
+  }, [actor, outboxStoragePrefix, t]);
+
+  const removePendingMessage = useCallback((id: string) => {
+    const removed = pendingMessages.find((message) => message.id === id);
+    if (outboxStoragePrefix) {
+      try {
+        localStorage.removeItem(`${outboxStoragePrefix}${id}`);
+        setOutboxPersistenceFailed(false);
+      } catch {
+        setOutboxPersistenceFailed(true);
+      }
+    }
+    setPendingMessages(outboxStoragePrefix ? readStoredOutbox(outboxStoragePrefix).messages : pendingMessages.filter((message) => message.id !== id));
+    if (removed?.blobKey) void deleteOutboxBlob(removed.blobKey).catch(() => undefined);
+    if (removed?.assetKey) void api(`/api/assets/${encodeURIComponent(removed.assetKey)}/pending`, { method: 'DELETE' }).catch(() => undefined);
+  }, [api, outboxStoragePrefix, pendingMessages]);
+
+  const deliverPendingMessage = useCallback(async (pending: PendingMessage) => {
+    let assetKey = pending.assetKey;
+    if (pending.type !== 'text' && !assetKey) {
+      const blob = pending.blobKey ? await readOutboxBlob(pending.blobKey) : null;
+      if (!blob) throw new ApiRequestError(410, t('The saved attachment is no longer available. Remove it and attach the file again.'));
+      const asset = await uploadAsset(blob, pending.roomId, pending.id);
+      assetKey = asset.key;
+      setPendingMessages((current) => current.map((message) => message.id === pending.id ? { ...message, assetKey } : message));
+    }
+    await sendMessage({ type: pending.type, text: pending.text || undefined, assetKey: assetKey || undefined, canvasParentId: pending.canvasParentId, imageDescription: pending.imageDescription || undefined, imagePurpose: pending.imagePurpose }, pending.replyToId, pending.id, pending.roomId);
+    if (pending.blobKey) await deleteOutboxBlob(pending.blobKey).catch(() => undefined);
+  }, [sendMessage, t, uploadAsset]);
+
+  const retryPendingMessages = useCallback(async (roomId?: string | null, messageId?: string) => {
+    if (!networkOnline || outboxRetrying) return;
+    const waiting = pendingMessages.filter((message) => message.status !== 'sending' && (message.status !== 'blocked' || Boolean(messageId)) && (!roomId || message.roomId === roomId) && (!messageId || message.id === messageId));
+    if (!waiting.length) return;
+    setOutboxRetrying(true);
+    for (const pending of waiting) {
+      setPendingMessages((current) => current.map((message) => message.id === pending.id ? { ...message, status: 'sending', error: null } : message));
+      try {
+        await deliverPendingMessage(pending);
+        removePendingMessage(pending.id);
+      } catch (retryError) {
+        const retryable = isRetryableSendError(retryError);
+        setPendingMessages((current) => current.map((message) => message.id === pending.id ? {
+          ...message,
+          status: retryable ? 'failed' : 'blocked',
+          error: retryError instanceof Error ? retryError.message : t('This item could not be sent.'),
+        } : message));
+        if (!navigator.onLine) break;
+      }
+    }
+    setOutboxRetrying(false);
+  }, [deliverPendingMessage, networkOnline, outboxRetrying, pendingMessages, removePendingMessage, t]);
+
+  const previousNetworkOnlineRef = useRef(networkOnline);
+  useEffect(() => {
+    const reconnected = networkOnline && !previousNetworkOnlineRef.current;
+    previousNetworkOnlineRef.current = networkOnline;
+    if (!outboxReady || !reconnected || !pendingMessages.some((message) => message.status !== 'blocked')) return;
+    void retryPendingMessages();
+  }, [networkOnline, outboxReady, pendingMessages, retryPendingMessages]);
 
   const submitText = async () => {
     const text = draft.trim();
     if (!text || busy) return;
     const replyingTo = replyTo;
+    const clientRequestId = crypto.randomUUID();
     setBusy(true); setError('');
     setDraft(''); setReplyTo(null);
-    try { await sendMessage({ type: 'text', text }, replyingTo?.id ?? null); }
+    if (!networkOnline) {
+      try {
+        await queueMessage({ id: clientRequestId, roomId: activeRoomId ?? '', type: 'text', text, assetKey: null, canvasParentId: null, fileName: null, replyToId: replyingTo?.id ?? null });
+      } catch {
+        setDraft(text);
+        setReplyTo(replyingTo);
+        setError(t('The message could not be saved for retry. Copy it before closing this page.'));
+      }
+      setBusy(false);
+      return;
+    }
+    try {
+      const sent = await sendMessage({ type: 'text', text }, replyingTo?.id ?? null, clientRequestId);
+      setUndoMessage({ messageId: sent.id, roomId: activeRoomId ?? '', expiresAt: Date.now() + 8_000 });
+    }
     catch (sendError) {
-      setDraft((current) => current || text);
-      setReplyTo((current) => current ?? replyingTo);
-      setError(sendError instanceof Error ? sendError.message : t('The message could not be sent. Try again.'));
+      if (isRetryableSendError(sendError)) {
+        try {
+          await queueMessage({ id: clientRequestId, roomId: activeRoomId ?? '', type: 'text', text, assetKey: null, canvasParentId: null, fileName: null, replyToId: replyingTo?.id ?? null });
+        } catch {
+          setDraft(text);
+          setReplyTo(replyingTo);
+          setError(t('The message could not be saved for retry. Copy it before closing this page.'));
+        }
+      }
+      else {
+        setDraft((current) => current || text);
+        setReplyTo((current) => current ?? replyingTo);
+        setError(sendError instanceof Error ? sendError.message : t('The message could not be sent. Try again.'));
+      }
     }
     setBusy(false);
   };
 
-  const uploadAsset = async (blob: Blob) => {
-    if (!activeRoomId) throw new Error(t('Select a conversation first.'));
-    return api<{ key: string }>(`/api/assets?room=${encodeURIComponent(activeRoomId)}`, { method: 'POST', headers: { 'content-type': blob.type }, body: blob });
-  };
-
-  const attachImage = async (event: ChangeEvent<HTMLInputElement>) => {
+  const attachImage = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = '';
-    if (!file) return;
+    if (!file || !activeRoomId) return;
+    setPhotoDraft({ file, url: URL.createObjectURL(file), rotation: 0, crop: 'original', prompt: '', description: '', purpose: 'creative', replyToId: replyTo?.id ?? null });
+  };
+
+  const closePhotoDraft = () => {
+    setPhotoDraft((current) => {
+      if (current) URL.revokeObjectURL(current.url);
+      return null;
+    });
+  };
+
+  const sendPreparedPhoto = async () => {
+    if (!photoDraft || !activeRoomId || busy) return;
+    const { file, rotation, crop, prompt, description, purpose, replyToId } = photoDraft;
+    const roomId = activeRoomId;
+    const clientRequestId = crypto.randomUUID();
     setBusy(true); setError('');
+    let assetKey: string | null = null;
     try {
-      const asset = await uploadAsset(file);
-      await sendMessage({ type: 'image', assetKey: asset.key }, replyTo?.id ?? null);
+      const prepared = rotation === 0 && crop === 'original' ? file : await preparePhoto(file, rotation, crop);
+      if (!networkOnline) {
+        await queueMessage({ id: clientRequestId, roomId, type: 'image', text: prompt.trim() || null, assetKey: null, canvasParentId: null, imageDescription: description.trim() || null, imagePurpose: purpose, fileName: prepared.name, replyToId }, prepared);
+        setReplyTo(null);
+        closePhotoDraft();
+        setBusy(false);
+        return;
+      }
+      const asset = await uploadAsset(prepared, roomId, clientRequestId);
+      assetKey = asset.key;
+      const sent = await sendMessage({ type: 'image', assetKey, text: prompt.trim() || undefined, imageDescription: description.trim() || undefined, imagePurpose: purpose }, replyToId, clientRequestId, roomId);
+      setUndoMessage({ messageId: sent.id, roomId, expiresAt: Date.now() + 8_000 });
       setReplyTo(null);
-    } catch (uploadError) { setError(uploadError instanceof Error ? uploadError.message : t('The image could not be sent. Try again.')); }
+      closePhotoDraft();
+    } catch (uploadError) {
+      if (isRetryableSendError(uploadError)) {
+        try {
+          const prepared = assetKey ? undefined : rotation === 0 && crop === 'original' ? file : await preparePhoto(file, rotation, crop);
+          await queueMessage({ id: clientRequestId, roomId, type: 'image', text: prompt.trim() || null, assetKey, canvasParentId: null, imageDescription: description.trim() || null, imagePurpose: purpose, fileName: file.name, replyToId }, prepared);
+          setReplyTo(null);
+          closePhotoDraft();
+        } catch (storageError) {
+          setError(storageError instanceof Error ? storageError.message : t('The image could not be saved for retry. Keep this page open and try again.'));
+        }
+      } else {
+        const message = uploadError instanceof Error ? uploadError.message : t('The image could not be sent. Try again.');
+        try {
+          await queueMessage(
+            { id: clientRequestId, roomId, type: 'image', text: prompt.trim() || null, assetKey, canvasParentId: null, imageDescription: description.trim() || null, imagePurpose: purpose, fileName: file.name, replyToId },
+            assetKey ? undefined : file,
+            { status: 'blocked', error: message },
+          );
+          setReplyTo(null);
+          closePhotoDraft();
+        } catch (storageError) {
+          setError(storageError instanceof Error ? storageError.message : t('The image could not be saved for retry. Keep this page open and try again.'));
+        }
+      }
+    }
     setBusy(false);
   };
 
@@ -1158,15 +1627,144 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   };
 
   const sendDrawing = async (blob: Blob, caption: string) => {
+    if (!activeRoomId) return false;
+    const roomId = activeRoomId;
+    const replyingTo = replyTo;
+    const clientRequestId = crypto.randomUUID();
+    let assetKey: string | null = null;
     try {
-      const asset = await uploadAsset(blob);
-      await sendMessage({ type: 'canvas', assetKey: asset.key, text: caption || undefined, canvasParentId: studio?.parentId ?? null }, replyTo?.id ?? null);
+      if (!networkOnline) {
+        await queueMessage({ id: clientRequestId, roomId, type: 'canvas', text: caption || null, assetKey: null, canvasParentId: studio?.parentId ?? null, fileName: t('Drawing'), replyToId: replyingTo?.id ?? null }, blob);
+        setReplyTo(null);
+        closeStudio();
+        return true;
+      }
+      const asset = await uploadAsset(blob, roomId, clientRequestId);
+      assetKey = asset.key;
+      const sent = await sendMessage({ type: 'canvas', assetKey, text: caption || undefined, canvasParentId: studio?.parentId ?? null }, replyingTo?.id ?? null, clientRequestId, roomId);
+      setUndoMessage({ messageId: sent.id, roomId, expiresAt: Date.now() + 8_000 });
       setReplyTo(null);
       closeStudio();
-    } catch (drawingError) { setError(drawingError instanceof Error ? drawingError.message : t('The drawing could not be sent. Try again.')); }
+      return true;
+    } catch (drawingError) {
+      if (isRetryableSendError(drawingError)) {
+        try {
+          await queueMessage({ id: clientRequestId, roomId, type: 'canvas', text: caption || null, assetKey, canvasParentId: studio?.parentId ?? null, fileName: t('Drawing'), replyToId: replyingTo?.id ?? null }, assetKey ? undefined : blob);
+          setReplyTo(null);
+          closeStudio();
+          return true;
+        } catch (storageError) {
+          setError(storageError instanceof Error ? storageError.message : t('The drawing could not be saved for retry. Keep Studio open and try again.'));
+          return false;
+        }
+      } else {
+        const message = drawingError instanceof Error ? drawingError.message : t('The drawing could not be sent. Try again.');
+        try {
+          await queueMessage(
+            { id: clientRequestId, roomId, type: 'canvas', text: caption || null, assetKey, canvasParentId: studio?.parentId ?? null, fileName: t('Drawing'), replyToId: replyingTo?.id ?? null },
+            assetKey ? undefined : blob,
+            { status: 'blocked', error: message },
+          );
+        } catch (storageError) {
+          setError(storageError instanceof Error ? storageError.message : t('The drawing could not be saved for retry. Keep Studio open and try again.'));
+          return false;
+        }
+        setError(message);
+        return false;
+      }
+    }
   };
 
-  const openStudio = (nextStudio: { sourceUrl?: string | null; parentId?: string | null; version?: number | null; draftSource?: boolean }) => {
+  const editPendingMessage = (pending: PendingMessage) => {
+    if (pending.type !== 'text' || !pending.text) return;
+    setDraft(pending.text);
+    setReplyTo(pending.replyToId ? messages.find((message) => message.id === pending.replyToId) ?? null : null);
+    removePendingMessage(pending.id);
+    window.requestAnimationFrame(() => messageInputRef.current?.focus());
+  };
+
+  const copyPendingMessage = async (pending: PendingMessage) => {
+    const content = pending.text || pending.fileName || t(pending.type === 'canvas' ? 'Drawing' : 'Photo');
+    try {
+      await navigator.clipboard.writeText(content);
+      setNotice(t('Queued content copied.'));
+    } catch {
+      setError(t('Your browser blocked clipboard access.'));
+    }
+  };
+
+  const resolvePendingMedia = async (pending: PendingMessage) => {
+    const blob = pending.blobKey ? await readOutboxBlob(pending.blobKey) : null;
+    if (blob) return { blob, url: URL.createObjectURL(blob), revoke: true };
+    if (pending.assetKey) {
+      const access = await api<{ assetUrl: string }>(`/api/assets/${encodeURIComponent(pending.assetKey)}/access`);
+      return { blob: null, url: access.assetUrl, revoke: false };
+    }
+    throw new Error(t('The saved attachment is no longer available. Replace the file before sending again.'));
+  };
+
+  const closePendingPreview = () => {
+    setPendingPreview((current) => {
+      if (current?.revoke) URL.revokeObjectURL(current.url);
+      return null;
+    });
+  };
+
+  const previewPendingMedia = async (pending: PendingMessage) => {
+    try {
+      closePendingPreview();
+      const media = await resolvePendingMedia(pending);
+      setPendingPreview({ message: pending, url: media.url, revoke: media.revoke });
+    } catch (previewError) {
+      setError(previewError instanceof Error ? previewError.message : t('The saved attachment could not be previewed.'));
+    }
+  };
+
+  const savePendingMedia = async (pending: PendingMessage) => {
+    try {
+      const media = await resolvePendingMedia(pending);
+      let blob = media.blob;
+      if (!blob) blob = await fetch(media.url).then((response) => {
+        if (!response.ok) throw new Error(t('The saved attachment could not be downloaded.'));
+        return response.blob();
+      });
+      if (!blob) throw new Error(t('The saved attachment could not be downloaded.'));
+      const objectUrl = media.revoke ? media.url : URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = pending.fileName || (pending.type === 'canvas' ? 'net-drawing.png' : 'net-photo.png');
+      document.body.append(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      setNotice(t('Saved the queued attachment to your device.'));
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : t('The saved attachment could not be downloaded.'));
+    }
+  };
+
+  const replacePendingMedia = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    const pendingId = replacePendingId;
+    setReplacePendingId(null);
+    if (!file || !pendingId || !outboxStoragePrefix) return;
+    const pending = pendingMessages.find((message) => message.id === pendingId);
+    if (!pending || pending.type === 'text') return;
+    const blobKey = pending.blobKey ?? `${actor?.kind}:${actor?.id}:${pending.id}`;
+    try {
+      await saveOutboxBlob(blobKey, file);
+      const replaced = { ...pending, assetKey: null, blobKey, fileName: file.name, status: 'waiting' as const, error: null };
+      localStorage.setItem(`${outboxStoragePrefix}${pending.id}`, serializePendingMessage(replaced));
+      setPendingMessages((current) => current.map((message) => message.id === pending.id ? replaced : message));
+      if (pending.assetKey) void api(`/api/assets/${encodeURIComponent(pending.assetKey)}/pending`, { method: 'DELETE' }).catch(() => undefined);
+      setHistoryAnnouncement(t('Queued attachment replaced and ready to send.'));
+    } catch (replaceError) {
+      setError(replaceError instanceof Error ? replaceError.message : t('The replacement could not be saved on this device.'));
+    }
+  };
+
+  const openStudio = (nextStudio: { sourceUrl?: string | null; parentId?: string | null; version?: number | null; draftSource?: boolean; sourceKind?: 'photo' | 'drawing' | 'draft'; sourceAuthor?: string | null }) => {
     paletteAbortRef.current?.abort();
     const controller = new AbortController();
     const generation = ++paletteRequestGeneration.current;
@@ -1256,7 +1854,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     const generation = ++continuationGeneration.current;
     const freshUrl = await refreshAssetUrl(message.assetKey);
     if (freshUrl && generation === continuationGeneration.current && activeRoomRef.current === roomId) {
-      openStudio({ sourceUrl: freshUrl, parentId: message.id, version: message.canvasVersion });
+      openStudio({ sourceUrl: freshUrl, parentId: message.id, version: message.canvasVersion, sourceKind: message.type === 'image' ? 'photo' : 'drawing', sourceAuthor: message.senderName });
     }
   };
 
@@ -1264,21 +1862,29 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     if (!activeRoomId) return;
     const roomId = activeRoomId;
     const generation = ++lineageRequestGeneration.current;
-    setLineageViewer((current) => ({ messageId, lineage: current?.messageId === messageId ? current.lineage : [], loading: true, error: '', truncated: false }));
+    setLineageViewer((current) => ({ messageId, lineage: current?.messageId === messageId ? current.lineage : [], loading: true, error: '', truncated: false, canDecide: current?.canDecide ?? false, decisionOwners: current?.decisionOwners ?? [] }));
     try {
-      const data = await api<{ lineage: CanvasLineageItem[]; truncated?: boolean }>(`/api/rooms/${roomId}/messages/${messageId}/lineage`);
+      const data = await api<{ lineage: CanvasLineageItem[]; truncated?: boolean; canDecide?: boolean; decisionOwners?: Array<{ id: string; displayName: string }> }>(`/api/rooms/${roomId}/messages/${messageId}/lineage`);
       if (generation !== lineageRequestGeneration.current || activeRoomRef.current !== roomId) return;
-      setLineageViewer({ messageId, lineage: data.lineage, loading: false, error: '', truncated: Boolean(data.truncated) });
+      setLineageViewer({ messageId, lineage: data.lineage, loading: false, error: '', truncated: Boolean(data.truncated), canDecide: Boolean(data.canDecide), decisionOwners: data.decisionOwners ?? [] });
     } catch (lineageError) {
       if (generation !== lineageRequestGeneration.current || activeRoomRef.current !== roomId) return;
       setLineageViewer({
         messageId,
         lineage: [],
         loading: false,
-        error: lineageError instanceof Error ? lineageError.message : t('Drawing history could not be loaded. Try again.'),
+        error: lineageError instanceof Error ? lineageError.message : t('Visual history could not be loaded. Try again.'),
         truncated: false,
+        canDecide: false,
+        decisionOwners: [],
       });
     }
+  };
+
+  const updateVisualDecision = async (item: CanvasLineageItem, input: { voted?: boolean; status?: CanvasLineageItem['visualStatus']; note?: string; ownerId?: string | null }) => {
+    if (!activeRoomId || !lineageViewer) return;
+    await api(`/api/rooms/${activeRoomId}/messages/${item.id}/decision`, { method: 'PATCH', body: JSON.stringify(input) });
+    await loadDrawingLineage(lineageViewer.messageId);
   };
 
   const continueFromLineage = async (item: CanvasLineageItem) => {
@@ -1291,7 +1897,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     lineageRequestGeneration.current += 1;
     continuationGeneration.current += 1;
     setLineageViewer(null);
-    openStudio({ sourceUrl: freshUrl, parentId: item.id, version: item.canvasVersion });
+    openStudio({ sourceUrl: freshUrl, parentId: item.id, version: item.canvasVersion, sourceKind: item.type === 'image' ? 'photo' : 'drawing', sourceAuthor: item.senderName });
   };
 
   const savePaletteColor = async (input: { name: string; components: Array<{ color: string; weight: number }> }) => {
@@ -1341,6 +1947,54 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     } catch (reactionError) { setError(reactionError instanceof Error ? reactionError.message : t('The reaction could not be updated. Try again.')); }
   };
 
+  const saveMessageEdit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!activeRoomId || !editingMessage || busy) return;
+    const nextText = editingText.trim();
+    if (editingMessage.type === 'text' && !nextText) return;
+    setBusy(true);
+    try {
+      await api(`/api/rooms/${activeRoomId}/messages/${editingMessage.id}`, { method: 'PATCH', body: JSON.stringify({ text: nextText }) });
+      setEditingMessage(null);
+      await loadMessages(activeRoomId, true);
+      setNotice(t('Contribution updated.'));
+    } catch (editError) {
+      setError(editError instanceof Error ? editError.message : t('The contribution could not be updated. Try again.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteContribution = async (message: MessageView) => {
+    if (!activeRoomId || busy) return;
+    setBusy(true);
+    try {
+      await api(`/api/rooms/${activeRoomId}/messages/${message.id}`, { method: 'DELETE' });
+      setDeletingMessage(null);
+      setUndoMessage((current) => current?.messageId === message.id ? null : current);
+      await loadMessages(activeRoomId, true);
+      setNotice(t('Contribution removed. Its place in visual history is preserved.'));
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : t('The contribution could not be removed. Try again.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const undoLastSend = async () => {
+    const pendingUndo = undoMessage;
+    if (!pendingUndo || pendingUndo.expiresAt <= Date.now()) return;
+    setUndoMessage(null);
+    try {
+      await api(`/api/rooms/${pendingUndo.roomId}/messages/${pendingUndo.messageId}/undo`, { method: 'DELETE' });
+      if (activeRoomRef.current === pendingUndo.roomId) await loadMessages(pendingUndo.roomId, true);
+      await loadBootstrap();
+      setNotice(t('Send undone.'));
+    } catch (undoError) {
+      setError(undoError instanceof Error ? undoError.message : t('Undo Send is no longer available.'));
+    }
+  };
+
   const loadOlder = async () => {
     if (!activeRoomId || !nextCursor || loadingOlder) return;
     setLoadingOlder(true);
@@ -1348,13 +2002,165 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
     setLoadingOlder(false);
   };
 
+  const jumpToLatest = async () => {
+    if (!activeRoomId) return;
+    setViewingLatest(true);
+    setFirstUnreadSequence(null);
+    await loadMessages(activeRoomId);
+    requestAnimationFrame(() => endRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' }));
+  };
+
   const copyInvite = async () => {
     if (!activeRoom) return;
+    if (!activeRoom.inviteActive) { setError(t('Create a new invite link before copying it.')); return; }
     const link = `${window.location.origin}/?room=${activeRoom.inviteCode}`;
     try {
       await navigator.clipboard.writeText(link);
       setNotice(t('Copied the invite link.'));
     } catch { setError(t('Your browser blocked clipboard access. Select the invite link and copy it manually.')); }
+  };
+
+  const openPeopleSafety = async () => {
+    if (!activeRoomId) return;
+    setPeopleSafetyOpen(true);
+    setRoomPeopleLoading(true);
+    try {
+      setRoomPeople(await api<RoomPeopleView>(`/api/rooms/${activeRoomId}/people`));
+    } catch (peopleError) {
+      setError(peopleError instanceof Error ? peopleError.message : t('People and safety settings could not be loaded.'));
+    } finally {
+      setRoomPeopleLoading(false);
+    }
+  };
+
+  const toggleRoomMute = async () => {
+    if (!activeRoomId || !roomPeople) return;
+    try {
+      const result = await api<{ muted: boolean }>(`/api/rooms/${activeRoomId}/preferences`, { method: 'PATCH', body: JSON.stringify({ muted: !roomPeople.muted }) });
+      setRoomPeople((current) => current ? { ...current, muted: result.muted } : current);
+      setRooms((current) => current.map((room) => room.id === activeRoomId ? { ...room, muted: result.muted } : room));
+      setNotice(result.muted ? t('Conversation muted.') : t('Conversation notifications restored.'));
+    } catch (muteError) {
+      setError(muteError instanceof Error ? muteError.message : t('The notification preference could not be updated.'));
+    }
+  };
+
+  const revokeRoomInvite = async () => {
+    if (!activeRoomId) return;
+    try {
+      await api(`/api/rooms/${activeRoomId}/invite/revoke`, { method: 'POST' });
+      setRooms((current) => current.map((room) => room.id === activeRoomId ? { ...room, inviteActive: false } : room));
+      setRoomPeople((current) => current ? { ...current, inviteActive: false } : current);
+      setNotice(t('The invite link was revoked. No replacement link is active.'));
+    } catch (revokeError) {
+      setError(revokeError instanceof Error ? revokeError.message : t('The invite link could not be revoked.'));
+    }
+  };
+
+  const removeRoomMember = async (person: RoomPersonView) => {
+    if (!activeRoomId || person.kind !== 'user') return;
+    try {
+      await api(`/api/rooms/${activeRoomId}/members/${encodeURIComponent(person.id)}`, { method: 'DELETE' });
+      setRoomPeople((current) => current ? { ...current, members: current.members.filter((member) => member.id !== person.id) } : current);
+      setNotice(t('{name} was removed from the conversation.', { name: person.displayName }));
+    } catch (removeError) {
+      setError(removeError instanceof Error ? removeError.message : t('The member could not be removed.'));
+    }
+  };
+
+  const leaveConversation = async () => {
+    if (!activeRoomId) return;
+    try {
+      await api(`/api/rooms/${activeRoomId}/membership`, { method: 'DELETE' });
+      setPeopleSafetyOpen(false);
+      await loadBootstrap();
+      setNotice(t('You left the conversation.'));
+    } catch (leaveError) {
+      setError(leaveError instanceof Error ? leaveError.message : t('You could not leave this conversation.'));
+    }
+  };
+
+  const submitReport = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!activeRoomId) return;
+    try {
+      await api(`/api/rooms/${activeRoomId}/reports`, { method: 'POST', body: JSON.stringify({ reason: reportReason, details: reportDetails, reportedUserId: reportMessage?.senderId ?? (reportTarget?.kind === 'user' ? reportTarget.id : null), messageId: reportMessage?.id ?? null }) });
+      setReportTarget(null);
+      setReportMessage(null);
+      setReportOpen(false);
+      setReportDetails('');
+      setNotice(t('Report received. Thank you for helping keep Nét safe.'));
+    } catch (reportError) {
+      setError(reportError instanceof Error ? reportError.message : t('The report could not be submitted.'));
+    }
+  };
+
+  const blockRoomMember = async (person: RoomPersonView) => {
+    if (person.kind !== 'user') return;
+    try {
+      await api(`/api/users/${encodeURIComponent(person.id)}/block`, { method: 'POST' });
+      setNotice(t('{name} was blocked.', { name: person.displayName }));
+    } catch (blockError) {
+      setError(blockError instanceof Error ? blockError.message : t('The member could not be blocked.'));
+    }
+  };
+
+  const updateGovernance = async (patch: Record<string, unknown>) => {
+    if (!activeRoomId) return;
+    try {
+      const updated = await api<RoomView>(`/api/rooms/${activeRoomId}/governance`, { method: 'PATCH', body: JSON.stringify(patch) });
+      setRooms((current) => current.map((room) => room.id === activeRoomId ? { ...room, ...updated } : room));
+      setRoomPeople((current) => current ? { ...current, allowGuests: updated.allowGuests, inviteActive: updated.inviteActive, inviteExpiresAt: updated.inviteExpiresAt, inviteMaxUses: updated.inviteMaxUses, inviteUseCount: updated.inviteUseCount } : current);
+      setNotice(updated.inviteActive ? t('Guest and invite settings updated.') : t('Guest access is closed.'));
+    } catch (governanceError) { setError(governanceError instanceof Error ? governanceError.message : t('Conversation settings could not be updated.')); }
+  };
+
+  const transferOwnership = async (person: RoomPersonView) => {
+    if (!activeRoomId || person.kind !== 'user') return;
+    try {
+      await api(`/api/rooms/${activeRoomId}/ownership`, { method: 'POST', body: JSON.stringify({ userId: person.id }) });
+      await openPeopleSafety();
+      setNotice(t('{name} is now the conversation owner.', { name: person.displayName }));
+    } catch (transferError) { setError(transferError instanceof Error ? transferError.message : t('Ownership could not be transferred.')); }
+  };
+
+  const removeRoomGuest = async (person: RoomPersonView) => {
+    if (!activeRoomId || person.kind !== 'guest') return;
+    try {
+      await api(`/api/rooms/${activeRoomId}/guests/${encodeURIComponent(person.id)}`, { method: 'DELETE' });
+      setRoomPeople((current) => current ? { ...current, members: current.members.filter((member) => member.id !== person.id) } : current);
+      setNotice(t('{name} no longer has access. Their contributions remain.', { name: person.displayName }));
+    } catch (guestError) { setError(guestError instanceof Error ? guestError.message : t('The guest session could not be ended.')); }
+  };
+
+  const archiveConversation = async () => {
+    if (!activeRoomId) return;
+    try {
+      await api(`/api/rooms/${activeRoomId}/membership/archive`, { method: 'PATCH', body: JSON.stringify({ archived: true }) });
+      setPeopleSafetyOpen(false);
+      await loadBootstrap();
+      setNotice(t('Conversation archived for you.'));
+    } catch (archiveError) { setError(archiveError instanceof Error ? archiveError.message : t('The conversation could not be archived.')); }
+  };
+
+  const deleteConversation = async () => {
+    if (!activeRoomId) return;
+    try {
+      await api(`/api/rooms/${activeRoomId}`, { method: 'DELETE' });
+      setDeleteRoomConfirmOpen(false);
+      setPeopleSafetyOpen(false);
+      await loadBootstrap();
+      setNotice(t('Conversation permanently deleted.'));
+    } catch (deleteError) { setError(deleteError instanceof Error ? deleteError.message : t('The conversation could not be deleted.')); }
+  };
+
+  const unblockAccount = async (userId: string) => {
+    try {
+      await api(`/api/users/${encodeURIComponent(userId)}/block`, { method: 'DELETE' });
+      setRoomPeople((current) => current ? { ...current, blockedAccounts: (current.blockedAccounts ?? []).filter((account) => account.id !== userId) } : current);
+      setNotice(t('Account unblocked.'));
+      if (activeRoomId) await loadMessages(activeRoomId, true);
+    } catch (unblockError) { setError(unblockError instanceof Error ? unblockError.message : t('The account could not be unblocked.')); }
   };
 
   const filteredRooms = rooms.filter((room) => `${room.name} ${room.preview}`.toLocaleLowerCase(localeTag(locale)).includes(roomQuery.trim().toLocaleLowerCase(localeTag(locale))));
@@ -1367,7 +2173,11 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const visibleMessages = useMemo(() => normalizedMessageQuery
     ? normalizedMessageQuery.length >= 2 ? messageSearchResults : []
     : messages, [messageSearchResults, messages, normalizedMessageQuery]);
-  const showInviteOnboarding = Boolean(activeRoom?.allowGuests)
+  const canvasLineageMeta = useMemo(() => {
+    const byId = new Map(messages.filter((message) => message.type === 'canvas' || message.type === 'image').map((message) => [message.id, message]));
+    return { byId };
+  }, [messages]);
+  const showInviteOnboarding = Boolean(activeRoom)
     && !normalizedMessageQuery
     && (activeRoom?.messageCount ?? messages.length) <= 1
     && messages.every((message) => message.type === 'system');
@@ -1467,54 +2277,102 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       <main id="main-content" className="conversation-panel">
         {activeRoom ? (
           <>
-            <header className="conversation-header"><button type="button" className="mobile-menu" onClick={() => setSidebarOpen(true)} aria-label={t('Open conversation list')} data-tooltip={t('Conversation list')} data-tooltip-placement="below"><UiIcon name="menu" size={19} /></button><span className="avatar" style={avatarStyle(activeRoom.name)}>{activeRoom.name.slice(0, 1)}</span><div className="conversation-title"><strong>{activeRoom.name}</strong><small><i className={realtimeConnected && networkOnline ? '' : 'offline'} /> {realtimeConnected && networkOnline ? t('Synced') : t('Reconnecting…')}</small></div><div className="conversation-actions">{activeRoom.kind !== 'direct' && <button type="button" className="invite-header-action" onClick={() => void copyInvite()} aria-label={t('Copy invite link')} data-tooltip={t('Invite by Link')} data-tooltip-placement="below"><UiIcon name="link" size={17} /><span>{t('Invite')}</span></button>}{installPrompt && <button type="button" className="install-header-action" onClick={() => { void installPrompt.prompt(); setInstallPrompt(null); }} aria-label={t('Install App')} data-tooltip={t('Install App')} data-tooltip-placement="below"><UiIcon name="install" size={18} /></button>}<button type="button" onClick={() => setMessageQuery((value) => value ? '' : ' ')} aria-label={t('Search messages')} data-tooltip={t('Search Messages')} data-tooltip-placement="below"><UiIcon name="search" size={18} /></button><button type="button" onClick={() => setInfoOpen((value) => !value)} aria-label={t('Conversation details')} data-tooltip={t('Details')} data-tooltip-placement="below"><UiIcon name="info" size={18} /></button></div></header>
+            <header className="conversation-header">
+              <button type="button" className="mobile-menu" onClick={() => setSidebarOpen(true)} aria-label={t('Open conversation list')} data-tooltip={t('Conversation list')} data-tooltip-placement="below"><UiIcon name="menu" size={19} /></button>
+              <button type="button" className="conversation-identity" onClick={() => { setMobileHeaderMenuOpen(false); setInfoOpen(true); }} aria-label={t('Open details for {room}', { room: activeRoom.name })}>
+                <span className="avatar" style={avatarStyle(activeRoom.name)}>{activeRoom.name.slice(0, 1)}</span>
+                <span className="conversation-title"><strong>{activeRoom.name}</strong><small><i className={realtimeConnected && networkOnline && !activePendingMessages.length ? '' : 'offline'} /> {activePendingMessages.length ? networkOnline ? outboxRetrying ? t('Sending {count} waiting items…', { count: activePendingMessages.length }) : t('Couldn’t send · {count} items waiting', { count: activePendingMessages.length }) : t('Offline · {count} items waiting', { count: activePendingMessages.length }) : networkOnline ? realtimeConnected ? t('Synced just now') : t('Reconnecting…') : t('Offline')}</small></span>
+              </button>
+              <div className="conversation-actions">
+                {activeRoom.kind !== 'direct' && <button type="button" className={showInviteOnboarding ? 'invite-header-action contextual' : 'invite-header-action'} onClick={() => void copyInvite()} aria-label={t('Copy invite link')} data-tooltip={t('Invite by Link')} data-tooltip-placement="below"><UiIcon name="link" size={17} /><span>{t('Invite')}</span></button>}
+                {installPrompt && <button type="button" className="install-header-action" onClick={() => { void installPrompt.prompt(); setInstallPrompt(null); }} aria-label={t('Install App')} data-tooltip={t('Install App')} data-tooltip-placement="below"><UiIcon name="install" size={18} /></button>}
+                <button type="button" className="desktop-header-action" onClick={() => setMessageQuery((value) => value ? '' : ' ')} aria-label={t('Search messages')} data-tooltip={t('Search Messages')} data-tooltip-placement="below"><UiIcon name="search" size={18} /></button>
+                <button type="button" className="desktop-header-action" onClick={() => setInfoOpen((value) => !value)} aria-label={t('Conversation details')} data-tooltip={t('Details')} data-tooltip-placement="below"><UiIcon name="info" size={18} /></button>
+                <button ref={mobileHeaderMenuTriggerRef} type="button" className="mobile-header-overflow-trigger" onClick={() => setMobileHeaderMenuOpen((value) => !value)} aria-label={t('More conversation actions')} aria-expanded={mobileHeaderMenuOpen} aria-controls="mobile-header-actions"><UiIcon name="more" size={20} /></button>
+              </div>
+              {mobileHeaderMenuOpen ? <div ref={mobileHeaderActionsRef} id="mobile-header-actions" className="mobile-header-actions" role="group" aria-label={t('More conversation actions')}>
+                <button type="button" onClick={() => { setMobileHeaderMenuOpen(false); setMessageQuery((value) => value ? '' : ' '); }}><UiIcon name="search" size={18} /> {t('Search Messages')}</button>
+                <button type="button" onClick={() => { setMobileHeaderMenuOpen(false); setInfoOpen(true); }}><UiIcon name="info" size={18} /> {t('Conversation details')}</button>
+                {activeRoom.kind !== 'direct' && !showInviteOnboarding ? <button type="button" onClick={() => { setMobileHeaderMenuOpen(false); void copyInvite(); }}><UiIcon name="link" size={18} /> {t('Invite by Link')}</button> : null}
+              </div> : null}
+            </header>
             {messageQuery !== '' && <div className="message-search"><span><UiIcon name="search" size={18} /></span><input name="message-search" autoComplete="off" value={messageQuery.trimStart()} onChange={(event) => setMessageQuery(event.target.value || ' ')} placeholder={t('Search content or sender…')} aria-label={t('Search message content')} /><small>{messageSearchLoading ? t('Searching…') : normalizedMessageQuery.length === 1 ? t('Enter 1 more character') : normalizedMessageQuery ? t('{count} results across full history', { count: messageSearchTotal }) : t('Search this conversation')}</small><button type="button" onClick={() => setMessageQuery('')} aria-label={t('Close search')} data-tooltip={t('Close Search')}><UiIcon name="close" size={17} /></button></div>}
-            <section ref={messageScrollRef} className="message-scroll" aria-live="polite" aria-label={t('Message history')}>
-              <div className="message-lane"><div className="day-pill">{t('Today')}</div>
+            <section ref={messageScrollRef} className="message-scroll" aria-label={t('Message history')}>
+              <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{historyAnnouncement}</span>
+              <div className="message-lane">
                 {nextCursor && !normalizedMessageQuery && <button type="button" className="load-older" onClick={() => void loadOlder()} disabled={loadingOlder}>{loadingOlder ? t('Loading…') : t('Load Older Messages')}</button>}
-                {showInviteOnboarding && <section className="invite-onboarding" aria-labelledby="invite-onboarding-title"><span className="invite-onboarding-icon" aria-hidden="true"><UiIcon name="draw" size={22} /></span><div><h2 id="invite-onboarding-title">{t('Start Your Way')}</h2><p>{t('Invite someone to draw with you, or make the first mark and share it later.')}</p></div><div className="invite-onboarding-actions"><button type="button" className="primary-button" onClick={() => openStudio({})}><UiIcon name="draw" size={17} /> {t('Draw Now')}</button><button type="button" className="secondary-button" onClick={() => void copyInvite()}><UiIcon name="link" size={17} /> {t('Invite Someone')}</button></div></section>}
-                {!visibleMessages.length && <div className="conversation-empty"><span aria-hidden="true"><UiIcon name="draw" size={28} /></span><h2>{normalizedMessageQuery ? t('No Messages Found') : t('Start with a Word or a Line')}</h2><p>{normalizedMessageQuery.length === 1 ? t('Enter at least 2 characters to search the full history.') : normalizedMessageQuery ? t('Try another keyword.') : t('Send a message, share an image, or open the canvas.')}</p></div>}
-                {visibleMessages.map((message) => {
+                {showInviteOnboarding ? <section className="invite-onboarding room-seed-card" aria-labelledby="invite-onboarding-title"><span className="invite-onboarding-icon" aria-hidden="true"><UiIcon name="draw" size={22} /></span><div><h2 id="invite-onboarding-title">{t('Nothing Here Yet')}</h2><p>{t('Draw the first line, write a thought, or invite someone.')}</p></div><div className="invite-onboarding-actions"><button type="button" className="primary-button" onClick={() => openStudio({})}><UiIcon name="draw" size={17} /> {t('Draw the First Line')}</button>{activeRoom.allowGuests ? <button type="button" className="secondary-button" onClick={() => void copyInvite()}><UiIcon name="link" size={17} /> {t('Invite Someone')}</button> : null}</div></section> : null}
+                {!visibleMessages.length && !showInviteOnboarding && <div className="conversation-empty"><span aria-hidden="true"><UiIcon name="draw" size={28} /></span><h2>{normalizedMessageQuery ? t('No Messages Found') : t('Start with a Word or a Line')}</h2><p>{normalizedMessageQuery.length === 1 ? t('Enter at least 2 characters to search the full history.') : normalizedMessageQuery ? t('Try another keyword.') : t('Send a message, share an image, or open the canvas.')}</p></div>}
+                {visibleMessages.map((message, index) => {
+                  const previousMessage = visibleMessages[index - 1];
+                  const showDay = !previousMessage || messageDayKey(previousMessage.createdAt) !== messageDayKey(message.createdAt);
+                  const leading = <>{showDay ? <div className="day-pill sticky-day">{messageDayLabel(message.createdAt, locale, t)}</div> : null}{!normalizedMessageQuery && firstUnreadSequence === message.sequence ? <div className="unread-divider" role="separator"><span>{t('{count} new messages', { count: activeRoom.unreadCount })}</span></div> : null}</>;
                   const own = actor?.kind === 'user' ? message.senderId === actor.id : message.guestSessionId === actor?.id;
+                  const isDeleted = Boolean(message.deletedAt);
+                  const blocked = Boolean(message.blockedAuthor && !revealedBlockedMessages.has(message.id));
                   const replied = message.replyToId ? messages.find((item) => item.id === message.replyToId) : null;
-                  if (message.type === 'system') return <div key={message.id} className="system-message">{t(systemMessageKey(message.body))}</div>;
+                  const visualParent = message.canvasParentId ? canvasLineageMeta.byId.get(message.canvasParentId) : null;
+                  const continuationCount = message.continuationCount ?? 0;
+                  if (message.type === 'system') return <Fragment key={message.id}>{leading}<div className="system-message">{t(systemMessageKey(message.body))}</div></Fragment>;
                   return (
-                    <article key={message.id} className={own ? 'message-row own' : 'message-row'}>
+                    <Fragment key={message.id}>{leading}<article className={own ? 'message-row own' : 'message-row'}>
                       {!own && <span className="avatar message-avatar" style={avatarStyle(message.senderName)}>{message.senderName.slice(0, 1)}</span>}
                       <div className="message-content">
                         {!own && <small className="sender-name">{message.senderName}</small>}
-                        {replied && <button type="button" className="reply-context" onClick={() => document.getElementById(`message-${replied.id}`)?.scrollIntoView({ block: 'center' })}><strong>{replied.senderName}</strong><span>{replied.body || (replied.type === 'canvas' ? t('Drawing') : t('Image'))}</span></button>}
+                        {replied && !blocked && <button type="button" className="reply-context" onClick={() => document.getElementById(`message-${replied.id}`)?.scrollIntoView({ block: 'center' })}><strong>{replied.senderName}</strong><span>{replied.body || (replied.type === 'canvas' ? t('Drawing') : t('Image'))}</span></button>}
                         <div id={`message-${message.id}`} className="message-payload">
-                          {message.assetUrl && <button type="button" className="message-media-button" onClick={() => setViewingMedia(message)} aria-label={message.type === 'canvas' ? t('Open drawing version {version}', { version: message.canvasVersion ?? 1 }) : t('Open image full screen')} data-tooltip={t('View Full Screen')} data-tooltip-placement="above">
+                          {blocked ? <div className="blocked-message"><UiIcon name="lock" size={17} /><span><strong>{t('Content from a blocked member is hidden')}</strong><small>{t('Interactions and notifications from this member are suppressed.')}</small></span><button type="button" onClick={() => { setRevealedBlockedMessages((current) => new Set(current).add(message.id)); if (message.assetKey) void refreshAssetUrl(message.assetKey); }}>{t('Show Once')}</button></div> : null}
+                          {isDeleted ? <div className="message-tombstone"><UiIcon name="info" size={17} /><span>{message.type === 'canvas' || message.type === 'image' ? t('Original removed by its creator') : t('Message removed by its creator')}</span></div> : null}
+                          {!blocked && !isDeleted && message.assetUrl && <button type="button" className="message-media-button" onClick={() => setViewingMedia(message)} aria-label={message.type === 'canvas' ? t('Open drawing version {version}', { version: message.canvasVersion ?? 1 }) : t('Open image full screen')} data-tooltip={t('View Full Screen')} data-tooltip-placement="above">
                             {/* Assets use a short-lived, room-scoped signed URL so a plain img request can load them. */}
                             {/* eslint-disable-next-line @next/next/no-img-element */}
-                            <img src={message.assetUrl} width="1200" height="720" loading="lazy" decoding="async" alt={message.type === 'canvas' ? t('Drawing version {version}', { version: message.canvasVersion ?? 1 }) : t('Image in the conversation')} onLoad={() => { if (message.assetKey) automaticAssetRefreshAttempts.current.delete(message.assetKey); }} onError={() => { if (message.assetKey) void refreshAssetUrl(message.assetKey, true); }} />
+                            <img src={message.assetUrl} width="1200" height="720" loading="lazy" decoding="async" alt={message.imageDescription || (message.type === 'canvas' ? t('Drawing version {version} by {name}', { version: message.canvasVersion ?? 1, name: message.senderName }) : t('Photo shared by {name}', { name: message.senderName }))} onLoad={() => { if (message.assetKey) automaticAssetRefreshAttempts.current.delete(message.assetKey); }} onError={() => { if (message.assetKey) void refreshAssetUrl(message.assetKey, true); }} />
                             <span className="media-open-hint" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" /></svg></span>
                           </button>}
-                          {message.type === 'canvas' && <span className="version-badge">{t('Version {version}', { version: message.canvasVersion ?? 1 })}</span>}
-                          {message.body && <div className="message-bubble">{message.body}</div>}
+                          {!blocked && !isDeleted && message.type === 'canvas' && <span className="version-badge">{t('Version {version}', { version: message.canvasVersion ?? 1 })}</span>}
+                          {!blocked && !isDeleted && message.body && <div className="message-bubble">{message.body}</div>}
                         </div>
-                        {message.type === 'canvas' && <div className="canvas-loop-actions"><button type="button" className="continue-drawing-cta" onClick={() => void continueDrawing(message)}><UiIcon name="draw" size={17} /><span><strong>{t('Continue This Drawing')}</strong><small>{t('Create version {version} without changing the original', { version: (message.canvasVersion ?? 1) + 1 })}</small></span><UiIcon name="arrow" size={16} /></button><button type="button" className="drawing-history-cta" onClick={() => void loadDrawingLineage(message.id)}><UiIcon name="history" size={17} /><span>{t('View Version History')}</span></button></div>}
-                        <div className="message-meta"><time>{timeLabel(message.createdAt, locale)}</time>{own && <span>{message.readCount > 0 ? t('Read') : t('Sent')}</span>}</div>
-                        <div className="reaction-list">{message.reactions.map((reaction) => <button type="button" key={reaction.emoji} className={reaction.reacted ? 'reacted' : ''} onClick={() => void react(message.id, reaction.emoji)} aria-label={reaction.reacted ? t('Remove {emoji} reaction, {count} total', { emoji: reaction.emoji, count: reaction.count }) : t('Add {emoji} reaction, {count} total', { emoji: reaction.emoji, count: reaction.count })}>{reaction.emoji} <span>{reaction.count}</span></button>)}</div>
-                        <div className="message-tools"><button type="button" onClick={() => setReplyTo(message)}><UiIcon name="reply" size={16} /> <span>{t('Reply')}</span></button>{message.assetUrl && <button type="button" onClick={() => void downloadMedia(message)} disabled={downloadingAssetKey === (message.assetKey ?? message.id)} aria-label={downloadingAssetKey === (message.assetKey ?? message.id) ? t('Downloading image') : t('Download image')} data-tooltip={downloadingAssetKey === (message.assetKey ?? message.id) ? t('Downloading…') : t('Download Image')} data-tooltip-placement="above"><UiIcon name="download" size={16} /> <span>{downloadingAssetKey === (message.assetKey ?? message.id) ? t('Downloading…') : t('Download')}</span></button>}<div>{EMOJIS.map((emoji) => <button type="button" key={emoji} onClick={() => void react(message.id, emoji)} aria-label={t('Add {emoji} reaction', { emoji })} data-tooltip={t('Add {emoji}', { emoji })}>{emoji}</button>)}</div></div>
-                        <details className="message-overflow"><summary aria-label={t('More actions for this message')}>•••</summary><div><button type="button" onClick={() => setReplyTo(message)}><UiIcon name="reply" size={16} /> {t('Reply')}</button>{message.assetUrl && <button type="button" onClick={() => void downloadMedia(message)} disabled={downloadingAssetKey === (message.assetKey ?? message.id)}><UiIcon name="download" size={16} /> {t('Download')}</button>}<span>{EMOJIS.map((emoji) => <button type="button" key={emoji} onClick={() => void react(message.id, emoji)} aria-label={t('Add {emoji} reaction', { emoji })}>{emoji}</button>)}</span></div></details>
+                        {!blocked && (message.type === 'canvas' || (message.type === 'image' && message.imagePurpose !== 'reference')) && <>
+                          <button type="button" className="inline-lineage-context" onClick={() => void loadDrawingLineage(message.id)}><UiIcon name="history" size={15} /><span>{message.type === 'image' ? t('Source Photo') : message.lineageRoot?.type === 'image' ? t('Based on {name}’s photo', { name: message.lineageRoot.senderName }) : visualParent ? t('Based on {name}’s drawing', { name: visualParent.senderName }) : message.canvasParentId ? t('Based on an earlier visual') : t('Original drawing')}</span>{continuationCount > 0 ? <strong>{t('{count} continuations', { count: continuationCount })}</strong> : null}</button>
+                          <div className="canvas-loop-actions">{!isDeleted ? <button type="button" className="continue-drawing-cta" onClick={() => void continueDrawing(message)}><UiIcon name="draw" size={17} /><span><strong>{message.type === 'image' ? t('Continue with This Photo') : t('Continue This Drawing')}</strong><small>{message.type === 'image' ? t('Create a new visual direction without changing the original') : t('Create version {version} without changing the original', { version: (message.canvasVersion ?? 1) + 1 })}</small></span><UiIcon name="arrow" size={16} /></button> : null}<button type="button" className="drawing-history-cta" onClick={() => void loadDrawingLineage(message.id)}><UiIcon name="history" size={17} /><span>{continuationCount > 0 ? t('Compare Versions') : t('View Version History')}</span></button></div>
+                        </>}
+                        <div className="message-meta"><time>{timeLabel(message.createdAt, locale)}</time>{message.editedAt && !isDeleted ? <span>{t('Edited')}</span> : null}{own && <span>{message.readCount > 0 ? t('Read') : t('Sent')}</span>}</div>
+                        {!blocked && <div className="reaction-list">{message.reactions.map((reaction) => <button type="button" key={reaction.emoji} className={reaction.reacted ? 'reacted' : ''} onClick={() => void react(message.id, reaction.emoji)} aria-label={reaction.reacted ? t('Remove {emoji} reaction, {count} total', { emoji: reaction.emoji, count: reaction.count }) : t('Add {emoji} reaction, {count} total', { emoji: reaction.emoji, count: reaction.count })}>{reaction.emoji} <span>{reaction.count}</span></button>)}</div>}
+                        {!isDeleted ? <div className="message-tools"><button type="button" onClick={() => setReplyTo(message)}><UiIcon name="reply" size={16} /> <span>{t('Reply')}</span></button>{message.assetUrl && <button type="button" onClick={() => void downloadMedia(message)} disabled={downloadingAssetKey === (message.assetKey ?? message.id)} aria-label={downloadingAssetKey === (message.assetKey ?? message.id) ? t('Downloading image') : t('Download image')} data-tooltip={downloadingAssetKey === (message.assetKey ?? message.id) ? t('Downloading…') : t('Download Image')} data-tooltip-placement="above"><UiIcon name="download" size={16} /> <span>{downloadingAssetKey === (message.assetKey ?? message.id) ? t('Downloading…') : t('Download')}</span></button>}{!own ? <button type="button" onClick={() => { setReportMessage(message); setReportOpen(true); }}>{t('Report')}</button> : null}{own ? <><button type="button" onClick={() => { setEditingMessage(message); setEditingText(message.body ?? ''); }}>{t('Edit')}</button><button type="button" onClick={() => setDeletingMessage(message)}>{t('Delete')}</button></> : null}<div>{EMOJIS.map((emoji) => <button type="button" key={emoji} onClick={() => void react(message.id, emoji)} aria-label={t('Add {emoji} reaction', { emoji })} data-tooltip={t('Add {emoji}', { emoji })}>{emoji}</button>)}</div></div> : null}
+                        {!isDeleted ? <details className="message-overflow"><summary aria-label={t('More actions for this message')}>•••</summary><div><button type="button" onClick={() => setReplyTo(message)}><UiIcon name="reply" size={16} /> {t('Reply')}</button>{message.assetUrl && <button type="button" onClick={() => void downloadMedia(message)} disabled={downloadingAssetKey === (message.assetKey ?? message.id)}><UiIcon name="download" size={16} /> {t('Download')}</button>}{!own ? <button type="button" onClick={() => { setReportMessage(message); setReportOpen(true); }}>{t('Report')}</button> : null}{own ? <><button type="button" onClick={() => { setEditingMessage(message); setEditingText(message.body ?? ''); }}>{t('Edit')}</button><button type="button" className="destructive-action" onClick={() => setDeletingMessage(message)}>{t('Delete')}</button></> : null}<span>{EMOJIS.map((emoji) => <button type="button" key={emoji} onClick={() => void react(message.id, emoji)} aria-label={t('Add {emoji} reaction', { emoji })}>{emoji}</button>)}</span></div></details> : null}
                       </div>
-                    </article>
+                    </article></Fragment>
                   );
                 })}
                 <div ref={endRef} />
               </div>
             </section>
+            {!viewingLatest && !normalizedMessageQuery ? <button type="button" className="jump-latest" onClick={() => void jumpToLatest()}>{t('Jump to latest')} <UiIcon name="arrow" size={16} /></button> : null}
             <footer className="composer-zone">
               {showGuestConversion && <div className="guest-conversion"><span><UiIcon name="lock" size={17} /><span><strong>{t('Keep this room and your drawing history')}</strong><small>{t('Create an account after contributing so you can return anytime.')}</small></span></span><a href={guestConversionPath}>{t('Keep My Work')} <UiIcon name="arrow" size={15} /></a></div>}
+              {activePendingMessages.length > 0 && <section className="message-outbox" aria-label={t('Sending Outbox')}>
+                <span className="sr-only" role="status" aria-live="polite">{t('{count} items are waiting to send.', { count: activePendingMessages.length })}</span>
+                <header>
+                  <button type="button" className="outbox-summary" onClick={() => setOutboxExpanded((value) => !value)} aria-expanded={outboxExpanded} aria-controls="active-message-outbox"><UiIcon name="message" size={18} /><span><strong>{outboxRetrying ? t('Sending waiting messages…') : networkOnline ? t('Couldn’t Send Yet') : t('Waiting for Connection')}</strong><small>{outboxPersistenceFailed ? t('Keep this tab open — this queue could not be saved on your device.') : t('{count} items are saved on this device.', { count: activePendingMessages.length })}</small></span><UiIcon name="arrow" size={16} /></button>
+                  <button type="button" onClick={() => void retryPendingMessages(activeRoomId)} disabled={!networkOnline || outboxRetrying || activePendingMessages.every((message) => message.status === 'blocked')}>{outboxRetrying ? t('Sending…') : t('Retry All')}</button>
+                </header>
+                {outboxExpanded ? <ol id="active-message-outbox" className="outbox-items">
+                  {activePendingMessages.map((pending) => {
+                    const typeLabel = t(pending.type === 'text' ? 'Text Message' : pending.type === 'image' ? 'Photo' : 'Drawing');
+                    const preview = pending.text || pending.fileName || typeLabel;
+                    const statusLabel = pending.status === 'sending' ? t('Sending…') : pending.status === 'blocked' ? t('Needs Attention') : pending.status === 'failed' ? t('Ready to Retry') : networkOnline ? t('Ready to Send') : t('Waiting for Connection');
+                    return <li key={pending.id} className={pending.status === 'blocked' ? 'blocked' : ''}><div className="outbox-item-copy"><span><strong>{typeLabel}</strong><time>{timeLabel(pending.createdAt, locale)}</time></span><p>{preview}</p><small><b>{statusLabel}</b>{pending.error ? ` · ${pending.error}` : ''}</small></div><div className="outbox-item-actions">{pending.type === 'text' ? <><button type="button" onClick={() => editPendingMessage(pending)}>{t('Edit')}</button><button type="button" onClick={() => void copyPendingMessage(pending)}>{t('Copy')}</button></> : <><button type="button" onClick={() => void previewPendingMedia(pending)}>{t('Preview')}</button><button type="button" onClick={() => void savePendingMedia(pending)}>{t('Save to Device')}</button><button type="button" onClick={() => { setReplacePendingId(pending.id); replaceFileRef.current?.click(); }}>{t('Replace File')}</button></>}<button type="button" onClick={() => void retryPendingMessages(activeRoomId, pending.id)} disabled={!networkOnline || outboxRetrying}>{t('Send Again')}</button><button type="button" onClick={() => setPendingRemoval(pending)} disabled={outboxRetrying}>{t('Remove')}</button></div></li>;
+                  })}
+                </ol> : null}
+              </section>}
               {replyTo && <div className="reply-draft"><span>{t('Replying to')} <strong>{replyTo.senderName}</strong><small>{replyTo.body || (replyTo.type === 'canvas' ? t('Drawing') : t('Image'))}</small></span><button type="button" onClick={() => setReplyTo(null)} aria-label={t('Cancel reply')} data-tooltip={t('Cancel Reply')} data-tooltip-placement="above">×</button></div>}
               <div className="composer-modes" role="toolbar" aria-label={t('Reply with text, drawing, or photo')}><button type="button" onClick={() => messageInputRef.current?.focus()}><UiIcon name="message" size={17} /> {t('Text')}</button><button type="button" className="draw-mode" onClick={() => openStudio({})} disabled={busy}><UiIcon name="draw" size={17} /> {t('Draw')}</button><button type="button" onClick={() => fileRef.current?.click()} disabled={busy}><UiIcon name="plus" size={17} /> {t('Photo')}</button></div>
               <div className="composer"><textarea ref={messageInputRef} name="message" autoComplete="off" value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitText(); } }} placeholder={t('Write a message…')} maxLength={2000} aria-label={t('Message content')} /><button type="button" className="send-button" onClick={() => void submitText()} disabled={busy || !draft.trim()} aria-label={t('Send message')} data-tooltip={t('Send Message')} data-tooltip-placement="above"><UiIcon name="send" size={18} /></button></div>
               <input ref={fileRef} hidden name="message-image" aria-label={t('Image file')} type="file" accept="image/png,image/jpeg,image/gif,image/webp" onChange={(event) => void attachImage(event)} />
+              <input ref={replaceFileRef} hidden name="replace-outbox-image" aria-label={t('Replacement image file')} type="file" accept="image/png,image/jpeg,image/gif,image/webp" onChange={(event) => void replacePendingMedia(event)} />
               <p><kbd>Enter</kbd> {t('send')} · <kbd>Shift</kbd> + <kbd>Enter</kbd> {t('new line')} · {t('images up to 8 MB')}</p>
             </footer>
-            {infoOpen && <aside className="info-drawer"><button type="button" className="dialog-close" onClick={() => setInfoOpen(false)} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below">×</button><span className="avatar info-avatar" style={avatarStyle(activeRoom.name)}>{activeRoom.name.slice(0, 1)}</span><h2>{activeRoom.name}</h2><p>{t('A space to continue ideas with words and drawings.')}</p><div className="info-stats"><span><strong>{activeRoom.messageCount ?? messages.length}</strong><small>{t('Messages')}</small></span><span><strong>{activeRoom.mediaCount ?? messages.filter((item) => item.assetKey).length}</strong><small>{t('Images & Drawings')}</small></span></div>{activeRoom.kind !== 'direct' && <><label>{t('Invite Link')}<input name="invite-link" readOnly value={`${typeof window !== 'undefined' ? window.location.origin : ''}/?room=${activeRoom.inviteCode}`} /></label><button type="button" className="primary-button wide" onClick={() => void copyInvite()}>{t('Copy Invite Link')}</button></>}<small className="privacy-note"><UiIcon name="lock" size={15} /> {t('Signed-in members keep access long term. Guest messages and attached images remain after they leave.')}</small></aside>}
+            <AppDialog open={infoOpen} onClose={() => setInfoOpen(false)} labelledBy="conversation-details-title" describedBy="conversation-details-description" className="details-backdrop"><aside className="info-drawer"><button type="button" className="dialog-close" onClick={() => setInfoOpen(false)} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below">×</button><span className="avatar info-avatar" style={avatarStyle(activeRoom.name)}>{activeRoom.name.slice(0, 1)}</span><h2 id="conversation-details-title">{activeRoom.name}</h2><p id="conversation-details-description">{t('A space to continue ideas with words and drawings.')}</p><div className="info-stats"><span><strong>{activeRoom.messageCount ?? messages.length}</strong><small>{t('Messages')}</small></span><span><strong>{activeRoom.mediaCount ?? messages.filter((item) => item.assetKey).length}</strong><small>{t('Images & Drawings')}</small></span></div>{activeRoom.kind !== 'direct' && <><label>{t('Invite Link')}<input name="invite-link" readOnly value={`${typeof window !== 'undefined' ? window.location.origin : ''}/?room=${activeRoom.inviteCode}`} /></label><button type="button" className="primary-button wide" onClick={() => void copyInvite()}>{t('Copy Invite Link')}</button></>}<button type="button" className="secondary-button wide people-safety-entry" onClick={() => void openPeopleSafety()}><UiIcon name="group" size={18} /> {t('People & Safety')}</button><small className="privacy-note"><UiIcon name="lock" size={15} /> {t('Signed-in members keep access long term. Guest messages and attached images remain after they leave.')}</small></aside></AppDialog>
           </>
         ) : <div className="no-room"><Logo /><h1>{t('No Conversations Yet')}</h1><p>{actor?.kind === 'user' ? t('Find someone to message or create a new group.') : t('This invite link is no longer active.')}</p>{actor?.kind === 'user' && <button type="button" className="primary-button" onClick={() => openConversationStarter()}>{t('Start a Conversation')}</button>}</div>}
       </main>
@@ -1537,6 +2395,63 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           </form>
         </section>
       </AppDialog>
+      <AppDialog open={Boolean(photoDraft)} onClose={closePhotoDraft} labelledBy="photo-preparation-title" describedBy="photo-preparation-description">
+        <section className="dialog-card photo-preparation-dialog">
+          <button type="button" className="dialog-close" onClick={closePhotoDraft} aria-label={t('Close')}>×</button>
+          <span className="eyebrow">{t('Prepare Photo')}</span>
+          <h2 id="photo-preparation-title">{t('Frame the idea before sharing')}</h2>
+          <p id="photo-preparation-description">{t('Preview the photo, choose how the team should use it, then send when it is ready.')}</p>
+          {photoDraft ? <>
+            <div className={`photo-stage crop-${photoDraft.crop}`}>
+              {/* Local object URLs are intentionally previewed without optimization. */}
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={photoDraft.url} alt="" style={{ transform: `rotate(${photoDraft.rotation}deg)` }} />
+            </div>
+            <div className="photo-edit-controls" role="group" aria-label={t('Photo framing controls')}>
+              <button type="button" onClick={() => setPhotoDraft((current) => current ? { ...current, rotation: ((current.rotation + 270) % 360) as 0 | 90 | 180 | 270 } : current)}>{t('Rotate Left')}</button>
+              <button type="button" onClick={() => setPhotoDraft((current) => current ? { ...current, rotation: ((current.rotation + 90) % 360) as 0 | 90 | 180 | 270 } : current)}>{t('Rotate Right')}</button>
+              <label>{t('Crop')}<select value={photoDraft.crop} onChange={(event) => setPhotoDraft((current) => current ? { ...current, crop: event.target.value as PhotoCrop } : current)}><option value="original">{t('Original')}</option><option value="square">{t('Square')}</option><option value="landscape">{t('Landscape')}</option><option value="portrait">{t('Portrait')}</option></select></label>
+            </div>
+            <fieldset className="photo-purpose"><legend>{t('How should the team use this photo?')}</legend><label><input type="radio" name="photo-purpose" value="creative" checked={photoDraft.purpose === 'creative'} onChange={() => setPhotoDraft((current) => current ? { ...current, purpose: 'creative' } : current)} /><span><strong>{t('Use as Creative Source')}</strong><small>{t('Teammates can continue this photo in Studio.')}</small></span></label><label><input type="radio" name="photo-purpose" value="reference" checked={photoDraft.purpose === 'reference'} onChange={() => setPhotoDraft((current) => current ? { ...current, purpose: 'reference' } : current)} /><span><strong>{t('Attach as Reference')}</strong><small>{t('Share it for context without starting a visual branch.')}</small></span></label></fieldset>
+            <label>{t('What should the team explore?')} <small>{t('(optional)')}</small><textarea value={photoDraft.prompt} onChange={(event) => setPhotoDraft((current) => current ? { ...current, prompt: event.target.value } : current)} maxLength={2000} placeholder={t('Example: explore a softer shape and warmer color palette…')} /></label>
+            <label>{t('Accessible Image Description')} <small>{t('(optional)')}</small><textarea value={photoDraft.description} onChange={(event) => setPhotoDraft((current) => current ? { ...current, description: event.target.value } : current)} maxLength={500} placeholder={t('Describe the important visual content for people who cannot see it.')} /></label>
+            <div className="confirmation-actions photo-send-actions"><button type="button" onClick={closePhotoDraft}>{t('Cancel')}</button><button type="button" className="primary-button" onClick={() => void sendPreparedPhoto()} disabled={busy}>{busy ? t('Preparing…') : t('Send Photo')}</button></div>
+          </> : null}
+        </section>
+      </AppDialog>
+      <AppDialog open={peopleSafetyOpen} onClose={() => { setPeopleSafetyOpen(false); setReportOpen(false); setReportTarget(null); }} labelledBy="people-safety-title" describedBy="people-safety-description">
+        <section className="dialog-card people-safety-dialog">
+          <button type="button" className="dialog-close" onClick={() => setPeopleSafetyOpen(false)} aria-label={t('Close')}>×</button>
+          <span className="eyebrow">{t('Conversation Controls')}</span>
+          <h2 id="people-safety-title">{t('People & Safety')}</h2>
+          <p id="people-safety-description">{t('Know who is here, control interruptions, and act when something feels unsafe.')}</p>
+          {roomPeopleLoading ? <div className="people-safety-loading" role="status">{t('Loading people…')}</div> : null}
+          {roomPeople ? <>
+            <div className="safety-preferences"><button type="button" onClick={() => void toggleRoomMute()} aria-pressed={roomPeople.muted}><UiIcon name="message" size={18} /><span><strong>{roomPeople.muted ? t('Unmute Conversation') : t('Mute Conversation')}</strong><small>{roomPeople.muted ? t('Resume push and in-app notifications for new activity.') : t('Suppress push and in-app notifications until you unmute. Mentions are also muted.')}</small></span></button>{roomPeople.canManage && roomPeople.kind !== 'direct' ? <><button type="button" onClick={() => void updateGovernance({ allowGuests: !roomPeople.allowGuests })} aria-pressed={roomPeople.allowGuests}><UiIcon name="group" size={18} /><span><strong>{roomPeople.allowGuests ? t('Guest Access On') : t('Guest Access Off')}</strong><small>{roomPeople.allowGuests ? t('People with an active invite may join as guests.') : t('Guests cannot join, even with an old link.')}</small></span></button>{roomPeople.inviteActive !== false ? <button type="button" onClick={() => void revokeRoomInvite()}><UiIcon name="link" size={18} /><span><strong>{t('Revoke Invite Link')}</strong><small>{t('The current link stops working. A replacement is not created automatically.')}</small></span></button> : <button type="button" onClick={() => void updateGovernance({ inviteActive: true })}><UiIcon name="link" size={18} /><span><strong>{t('Create New Invite Link')}</strong><small>{t('Creates a fresh link and resets its use count.')}</small></span></button>}<label className="governance-select">{t('Invite Expiration')}<select value={roomPeople.inviteExpiresAt ? '24' : '0'} onChange={(event) => void updateGovernance({ inviteExpiresInHours: Number(event.target.value) })}><option value="0">{t('No Expiration')}</option><option value="1">{t('1 Hour')}</option><option value="24">{t('24 Hours')}</option><option value="168">{t('7 Days')}</option></select></label><label className="governance-select">{t('Invite Uses')}<select value={roomPeople.inviteMaxUses ?? 0} onChange={(event) => void updateGovernance({ inviteMaxUses: Number(event.target.value) })}><option value="0">{t('Unlimited')}</option><option value="1">{t('One Time')}</option><option value="5">{t('5 People')}</option><option value="20">{t('20 People')}</option></select></label></> : null}</div>
+            <section className="people-list" aria-labelledby="people-list-title"><div className="people-list-heading"><h3 id="people-list-title">{t('People')}</h3><span>{roomPeople.members.length}</span></div>{roomPeople.members.map((person) => { const self = person.kind === actor?.kind && person.id === actor?.id; return <article key={`${person.kind}:${person.id}`}><span className="avatar" style={person.avatarColor ? { '--avatar': person.avatarColor } as CSSProperties : avatarStyle(person.displayName)}>{person.displayName.slice(0, 1)}</span><span><strong>{person.displayName}{self ? ` · ${t('You')}` : ''}</strong><small>{person.role === 'owner' ? t('Owner') : person.role === 'guest' ? t('Guest') : t('Member')}</small></span>{!self ? <div><button type="button" onClick={() => { setReportTarget(person); setReportOpen(true); }}>{t('Report')}</button>{actor?.kind === 'user' && person.kind === 'user' ? <button type="button" onClick={() => setSafetyAction({ kind: 'block', person })}>{t('Block')}</button> : null}{roomPeople.canManage && person.kind === 'user' && person.role === 'member' ? <><button type="button" onClick={() => void transferOwnership(person)}>{t('Make Owner')}</button><button type="button" className="destructive-action" onClick={() => setSafetyAction({ kind: 'remove', person })}>{t('Remove')}</button></> : null}{roomPeople.canManage && person.kind === 'guest' ? <button type="button" className="destructive-action" onClick={() => void removeRoomGuest(person)}>{t('End Guest Access')}</button> : null}</div> : null}</article>; })}</section>
+            {(roomPeople.blockedAccounts ?? []).length ? <section className="blocked-accounts" aria-labelledby="blocked-accounts-title"><h3 id="blocked-accounts-title">{t('Blocked Accounts')}</h3>{(roomPeople.blockedAccounts ?? []).map((account) => <div key={account.id}><span className="avatar" style={{ '--avatar': account.avatarColor } as CSSProperties}>{account.displayName.slice(0, 1)}</span><strong>{account.displayName}</strong><button type="button" onClick={() => void unblockAccount(account.id)}>{t('Unblock')}</button></div>)}</section> : null}
+            <div className="safety-footer-actions"><button type="button" onClick={() => { setReportTarget(null); setReportOpen(true); }}>{t('Report Conversation')}</button>{actor?.kind === 'user' ? <button type="button" onClick={() => void archiveConversation()}>{t('Archive for Me')}</button> : null}{actor?.kind === 'user' && roomPeople.currentRole !== 'owner' ? <button type="button" className="danger-button" onClick={() => setSafetyAction({ kind: 'leave' })}>{t('Leave Conversation')}</button> : null}{roomPeople.canManage ? <button type="button" className="danger-button" onClick={() => setDeleteRoomConfirmOpen(true)}>{t('Delete Conversation')}</button> : null}</div>
+          </> : null}
+        </section>
+      </AppDialog>
+      <AppDialog open={Boolean(safetyAction)} onClose={() => setSafetyAction(null)} labelledBy="safety-action-title" describedBy="safety-action-description" className="confirmation-backdrop"><section className="dialog-card confirmation-dialog"><span className="eyebrow destructive">{safetyAction?.kind === 'block' ? t('Block Member') : safetyAction?.kind === 'remove' ? t('Remove Member') : t('Leave Conversation')}</span><h2 id="safety-action-title">{safetyAction?.kind === 'block' ? t('Block {name}?', { name: safetyAction.person?.displayName ?? '' }) : safetyAction?.kind === 'remove' ? t('Remove {name}?', { name: safetyAction.person?.displayName ?? '' }) : t('Leave this conversation?')}</h2><p id="safety-action-description">{safetyAction?.kind === 'block' ? t('They cannot start a direct conversation with you or appear in your people search. Their existing shared-room content will be hidden by default.') : safetyAction?.kind === 'remove' ? t('They lose access immediately. Their earlier contributions remain so the conversation and visual history stay understandable.') : t('You will lose access and need a new active invite to return. Your contributions remain.')}</p><div className="confirmation-actions"><button type="button" onClick={() => setSafetyAction(null)}>{t('Cancel')}</button><button type="button" className="danger-button" onClick={() => { const action = safetyAction; setSafetyAction(null); if (action?.kind === 'block' && action.person) void blockRoomMember(action.person); else if (action?.kind === 'remove' && action.person) void removeRoomMember(action.person); else if (action?.kind === 'leave') void leaveConversation(); }}>{safetyAction?.kind === 'block' ? t('Block') : safetyAction?.kind === 'remove' ? t('Remove') : t('Leave')}</button></div></section></AppDialog>
+      <AppDialog open={deleteRoomConfirmOpen} onClose={() => setDeleteRoomConfirmOpen(false)} labelledBy="delete-room-title" describedBy="delete-room-description" className="confirmation-backdrop"><section className="dialog-card confirmation-dialog"><span className="eyebrow destructive">{t('Permanent Deletion')}</span><h2 id="delete-room-title">{t('Delete this conversation?')}</h2><p id="delete-room-description">{t('Every message, drawing, version, report, reaction, and stored image in this conversation will be permanently deleted for everyone. This cannot be undone.')}</p><div className="impact-preview"><strong>{t('Impact')}</strong><span>{t('{messages} messages · {media} images and drawings · all members lose access', { messages: activeRoom?.messageCount ?? messages.length, media: activeRoom?.mediaCount ?? 0 })}</span></div><div className="confirmation-actions"><button type="button" onClick={() => setDeleteRoomConfirmOpen(false)}>{t('Cancel')}</button><button type="button" className="danger-button" onClick={() => void deleteConversation()}>{t('Delete for Everyone')}</button></div></section></AppDialog>
+      <AppDialog open={reportOpen} onClose={() => { setReportOpen(false); setReportTarget(null); setReportMessage(null); }} labelledBy="report-title" describedBy="report-description" className="confirmation-backdrop">
+        <form className="dialog-card report-dialog" onSubmit={submitReport}>
+          <button type="button" className="dialog-close" onClick={() => { setReportOpen(false); setReportTarget(null); setReportMessage(null); }} aria-label={t('Close')}>×</button>
+          <span className="eyebrow destructive">{t('Safety Report')}</span><h2 id="report-title">{reportMessage ? t('Report Message') : reportTarget ? t('Report {name}', { name: reportTarget.displayName }) : t('Report Conversation')}</h2><p id="report-description">{t('Reports are private. Include only the context needed to understand what happened.')}</p>
+          {reportMessage ? <blockquote className="report-evidence"><strong>{reportMessage.senderName}</strong><p>{reportMessage.body || (reportMessage.type === 'canvas' ? t('Drawing contribution') : t('Photo contribution'))}</p><small>{t('This message and its room context will be attached automatically.')}</small></blockquote> : null}
+          <label>{t('Reason')}<select value={reportReason} onChange={(event) => setReportReason(event.target.value)}><option value="harassment">{t('Harassment')}</option><option value="spam">{t('Spam')}</option><option value="unsafe-content">{t('Unsafe Content')}</option><option value="impersonation">{t('Impersonation')}</option><option value="other">{t('Other')}</option></select></label>
+          <label>{t('Details')} <small>{t('(optional)')}</small><textarea value={reportDetails} onChange={(event) => setReportDetails(event.target.value)} maxLength={1000} placeholder={t('Describe what happened…')} /></label>
+          <div className="confirmation-actions"><button type="button" onClick={() => { setReportOpen(false); setReportTarget(null); setReportMessage(null); }}>{t('Cancel')}</button><button type="submit" className="danger-button">{t('Submit Report')}</button></div>
+        </form>
+      </AppDialog>
+      <AppDialog open={Boolean(editingMessage)} onClose={() => setEditingMessage(null)} labelledBy="edit-message-title" describedBy="edit-message-description">
+        <form className="dialog-card edit-message-dialog" onSubmit={saveMessageEdit}><button type="button" className="dialog-close" onClick={() => setEditingMessage(null)} aria-label={t('Close')}>×</button><span className="eyebrow">{t('Edit Contribution')}</span><h2 id="edit-message-title">{editingMessage?.type === 'text' ? t('Edit Message') : t('Edit Caption')}</h2><p id="edit-message-description">{t('The conversation will show that this contribution was edited.')}</p><label>{editingMessage?.type === 'text' ? t('Message') : t('Caption')}<textarea value={editingText} onChange={(event) => setEditingText(event.target.value)} maxLength={2000} autoFocus /></label><div className="confirmation-actions"><button type="button" onClick={() => setEditingMessage(null)}>{t('Cancel')}</button><button type="submit" className="primary-button" disabled={busy || (editingMessage?.type === 'text' && !editingText.trim())}>{t('Save Changes')}</button></div></form>
+      </AppDialog>
+      <AppDialog open={Boolean(deletingMessage)} onClose={() => setDeletingMessage(null)} labelledBy="delete-message-title" describedBy="delete-message-description" className="confirmation-backdrop"><section className="dialog-card confirmation-dialog"><span className="eyebrow destructive">{t('Remove Contribution')}</span><h2 id="delete-message-title">{t('Remove this contribution?')}</h2><p id="delete-message-description">{deletingMessage?.type === 'canvas' || deletingMessage?.type === 'image' ? t('The image is removed, but a safe placeholder keeps replies and visual branches understandable.') : t('A placeholder will remain so replies keep their context.')}</p><div className="confirmation-actions"><button type="button" onClick={() => setDeletingMessage(null)}>{t('Keep It')}</button><button type="button" className="danger-button" onClick={() => deletingMessage && void deleteContribution(deletingMessage)} disabled={busy}>{t('Remove')}</button></div></section></AppDialog>
+      <AppDialog open={Boolean(pendingPreview)} onClose={closePendingPreview} labelledBy="pending-preview-title" describedBy="pending-preview-description"><section className="dialog-card pending-preview-dialog"><button type="button" className="dialog-close" onClick={closePendingPreview} aria-label={t('Close')}>×</button><span className="eyebrow">{t('Saved on This Device')}</span><h2 id="pending-preview-title">{pendingPreview?.message.fileName || t('Queued Artwork')}</h2><p id="pending-preview-description">{t('Preview this attachment before deciding whether to retry, replace, save, or remove it.')}</p>{pendingPreview ? <Image unoptimized src={pendingPreview.url} width="1200" height="720" alt={t('Preview of queued attachment')} /> : null}<div className="confirmation-actions"><button type="button" onClick={closePendingPreview}>{t('Close')}</button>{pendingPreview ? <button type="button" className="primary-button" onClick={() => void savePendingMedia(pendingPreview.message)}>{t('Save to Device')}</button> : null}</div></section></AppDialog>
+      <AppDialog open={Boolean(pendingRemoval)} onClose={() => setPendingRemoval(null)} labelledBy="remove-pending-title" describedBy="remove-pending-description" className="confirmation-backdrop"><section className="dialog-card confirmation-dialog"><span className="eyebrow destructive">{t('Remove Saved Item')}</span><h2 id="remove-pending-title">{t('Remove this unsent item?')}</h2><p id="remove-pending-description">{t('Save it to your device first if you may need it later. Removal deletes the local recovery copy.')}</p><div className="confirmation-actions"><button type="button" onClick={() => setPendingRemoval(null)}>{t('Keep Item')}</button><button type="button" className="danger-button" onClick={() => { const pending = pendingRemoval; setPendingRemoval(null); if (pending) removePendingMessage(pending.id); }}>{t('Remove')}</button></div></section></AppDialog>
       <AppDialog open={guestEndConfirmOpen} onClose={() => setGuestEndConfirmOpen(false)} labelledBy="end-guest-title" describedBy="end-guest-description" className="confirmation-backdrop">
         <section className="dialog-card confirmation-dialog">
           <span className="eyebrow destructive">{t('Cannot Be Undone')}</span>
@@ -1545,9 +2460,10 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
           <div className="confirmation-actions"><button type="button" onClick={() => setGuestEndConfirmOpen(false)}>{t('Keep Session')}</button><button type="button" className="danger-button" onClick={() => void endGuest()}>{t('End Session')}</button></div>
         </section>
       </AppDialog>
-      {studio && actor && activeRoomId && <Suspense fallback={<div className="studio-loading" role="status">{t('Opening Nét Studio…')}</div>}><DrawingStudio sourceUrl={studio.sourceUrl} sourceIsDraft={studio.draftSource} version={studio.version} draftKey={`${actor.kind}:${actor.id}:${activeRoomId}:${studio.parentId ?? 'new'}`} paletteColors={paletteColors} paletteLoading={paletteLoading} paletteMutating={paletteMutating} palettePersistence={actor?.kind === 'user' ? 'account' : 'session'} onClose={closeStudio} onSend={sendDrawing} onSavePalette={savePaletteColor} onDeletePalette={deletePaletteColor} /></Suspense>}
-      {lineageViewer && <Suspense fallback={<div className="studio-loading" role="status">{t('Loading drawing history…')}</div>}><DrawingLineage key={`${lineageViewer.messageId}:${lineageViewer.loading ? 'loading' : 'ready'}:${lineageViewer.error ? 'error' : 'ok'}`} lineage={lineageViewer.lineage} initialId={lineageViewer.messageId} loading={lineageViewer.loading} error={lineageViewer.error} truncated={lineageViewer.truncated} onClose={() => { lineageRequestGeneration.current += 1; continuationGeneration.current += 1; setLineageViewer(null); }} onRetry={() => void loadDrawingLineage(lineageViewer.messageId)} onContinue={(item) => void continueFromLineage(item)} /></Suspense>}
+      {studio && actor && activeRoomId && <Suspense fallback={<div className="studio-loading" role="status">{t('Opening Nét Studio…')}</div>}><DrawingStudio sourceUrl={studio.sourceUrl} sourceIsDraft={studio.draftSource} sourceKind={studio.sourceKind} sourceAuthor={studio.sourceAuthor} version={studio.version} draftKey={`${actor.kind}:${actor.id}:${activeRoomId}:${studio.parentId ?? 'new'}`} paletteColors={paletteColors} paletteLoading={paletteLoading} paletteMutating={paletteMutating} palettePersistence={actor?.kind === 'user' ? 'account' : 'session'} onClose={closeStudio} onSend={sendDrawing} onSavePalette={savePaletteColor} onDeletePalette={deletePaletteColor} /></Suspense>}
+      {lineageViewer && <Suspense fallback={<div className="studio-loading" role="status">{t('Loading drawing history…')}</div>}><DrawingLineage key={`${lineageViewer.messageId}:${lineageViewer.loading ? 'loading' : 'ready'}:${lineageViewer.error ? 'error' : 'ok'}`} lineage={lineageViewer.lineage} initialId={lineageViewer.messageId} loading={lineageViewer.loading} error={lineageViewer.error} truncated={lineageViewer.truncated} canDecide={lineageViewer.canDecide} decisionOwners={lineageViewer.decisionOwners} onDecision={updateVisualDecision} onClose={() => { lineageRequestGeneration.current += 1; continuationGeneration.current += 1; setLineageViewer(null); }} onRetry={() => void loadDrawingLineage(lineageViewer.messageId)} onContinue={(item) => void continueFromLineage(item)} /></Suspense>}
       {viewingMedia && <MediaViewer key={viewingMedia.id} message={viewingMedia} downloading={downloadingAssetKey === (viewingMedia.assetKey ?? viewingMedia.id)} onClose={() => setViewingMedia(null)} onDownload={downloadMedia} onRefresh={(assetKey) => { void refreshAssetUrl(assetKey, true); }} />}
+      {undoMessage ? <div className="undo-send-toast" role="status" aria-live="polite"><span>{t('Sent')}</span><button type="button" onClick={() => void undoLastSend()}>{t('Undo Send')}</button></div> : null}
       {(error || notice) && <div className={`${error ? 'toast error' : 'toast'}${studio ? ' studio-toast' : ''}`} role="status" aria-live="polite"><span>{error || notice}</span>{error && <button type="button" onClick={() => setError('')} aria-label={t('Dismiss notification')} data-tooltip={t('Dismiss notification')} data-tooltip-placement="above">×</button>}</div>}
     </div></>
   );

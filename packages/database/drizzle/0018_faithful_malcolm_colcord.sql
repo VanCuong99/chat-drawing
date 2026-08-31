@@ -1,0 +1,2 @@
+ALTER TABLE "room_reports" DROP CONSTRAINT "room_reports_single_reporter_check";--> statement-breakpoint
+ALTER TABLE "room_reports" ADD CONSTRAINT "room_reports_single_reporter_check" CHECK (not ("room_reports"."reporter_id" is not null and "room_reports"."guest_session_id" is not null));

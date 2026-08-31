@@ -2,6 +2,7 @@ import { BadRequestException, Inject, Injectable, NotFoundException, Unauthorize
 import { ConfigService } from '@nestjs/config';
 import { JwtService, type JwtSignOptions } from '@nestjs/jwt';
 import { and, assets, eq, gt, guestSessions, inArray, lt, ne, users, type NetDatabase } from '@net/database';
+import { createHash } from 'node:crypto';
 import { ActorService } from '../auth/actor.service';
 import type { Actor, AssetReadClaims } from '../auth/actor.types';
 import { DATABASE } from '../database/database.module';
@@ -12,6 +13,7 @@ const MAX_SIZE = 8 * 1024 * 1024;
 const MAX_OWNER_ASSETS = 500;
 const MAX_OWNER_BYTES = 256 * 1024 * 1024;
 const MAX_PENDING_ASSETS = 3;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 @Injectable()
 export class AssetsService {
@@ -23,12 +25,15 @@ export class AssetsService {
     private readonly config: ConfigService,
   ) {}
 
-  async upload(roomId: string, actor: Actor, mimeType: string, bytes: Buffer) {
+  async upload(roomId: string, actor: Actor, mimeType: string, bytes: Buffer, uploadId?: string) {
     await this.actors.assertRoomAccess(roomId, actor);
     if (!ALLOWED_TYPES.has(mimeType)) throw new UnsupportedMediaTypeException('Only PNG, JPEG, GIF, and WebP are supported.');
     if (!bytes.length || bytes.length > MAX_SIZE) throw new BadRequestException('Images must be smaller than 8 MB.');
-    const key = crypto.randomUUID();
+    if (uploadId && !UUID_V4.test(uploadId)) throw new BadRequestException('The upload request ID is invalid.');
+    const key = uploadId ?? crypto.randomUUID();
+    const contentSha256 = createHash('sha256').update(bytes).digest('hex');
     const now = Date.now();
+    let inserted = false;
     await this.db.transaction(async (tx) => {
       const owner = actor.kind === 'guest'
         ? await tx.select({ id: guestSessions.id }).from(guestSessions).where(and(
@@ -38,6 +43,14 @@ export class AssetsService {
         )).for('update')
         : await tx.select({ id: users.id }).from(users).where(eq(users.id, actor.id)).for('update');
       if (!owner.length) throw new UnauthorizedException('The session ended before the image was uploaded.');
+      const [existing] = await tx.select({ roomId: assets.roomId, ownerKey: assets.ownerKey, mimeType: assets.mimeType, byteSize: assets.byteSize, contentSha256: assets.contentSha256, status: assets.status })
+        .from(assets).where(eq(assets.key, key)).limit(1);
+      if (existing) {
+        if (existing.roomId !== roomId || existing.ownerKey !== actor.actorKey || existing.mimeType !== mimeType || existing.byteSize !== bytes.length || existing.contentSha256 !== contentSha256 || existing.status === 'deleting') {
+          throw new BadRequestException('The upload request ID was already used for different content.');
+        }
+        return;
+      }
       const owned = await tx.select({ status: assets.status, byteSize: assets.byteSize }).from(assets)
         .where(and(eq(assets.ownerKey, actor.actorKey), ne(assets.status, 'deleting')));
       if (owned.filter((asset) => asset.status === 'pending').length >= MAX_PENDING_ASSETS) {
@@ -54,20 +67,30 @@ export class AssetsService {
         status: 'pending',
         mimeType,
         byteSize: bytes.length,
+        contentSha256,
         createdAt: now,
         expiresAt: actor.kind === 'guest' ? actor.expiresAt : null,
       });
+      inserted = true;
     });
     try {
-      await this.storage.put(key, bytes, mimeType);
+      if (!(await this.storage.exists(key))) {
+        try {
+          await this.storage.put(key, bytes, mimeType);
+        } catch (putError) {
+          // Two requests with the same upload ID may race. The completed object is
+          // the idempotent result as long as it now exists under the same key.
+          if (!(await this.storage.exists(key))) throw putError;
+        }
+      }
       const [ledger] = await this.db.select({ status: assets.status, guestSessionId: assets.guestSessionId }).from(assets).where(eq(assets.key, key)).limit(1);
-      if (!ledger || ledger.status !== 'pending' || (actor.kind === 'guest' && ledger.guestSessionId !== actor.id)) {
-        await this.storage.delete(key);
+      if (!ledger || !['pending', 'attached'].includes(ledger.status) || (actor.kind === 'guest' && ledger.guestSessionId !== actor.id)) {
+        if (inserted) await this.storage.delete(key);
         throw new UnauthorizedException('The guest session ended while the image was uploading.');
       }
       return { key, size: bytes.length };
     } catch (error) {
-      await this.db.delete(assets).where(eq(assets.key, key)).catch(() => undefined);
+      if (inserted) await this.db.delete(assets).where(eq(assets.key, key)).catch(() => undefined);
       throw error;
     }
   }
@@ -98,9 +121,12 @@ export class AssetsService {
   }
 
   async refreshReadUrl(key: string, actor: Actor) {
-    const [asset] = await this.db.select({ roomId: assets.roomId }).from(assets).where(and(eq(assets.key, key), eq(assets.status, 'attached'))).limit(1);
+    const [asset] = await this.db.select({ roomId: assets.roomId, ownerKey: assets.ownerKey, status: assets.status }).from(assets).where(eq(assets.key, key)).limit(1);
     if (!asset) throw new NotFoundException('The image no longer exists.');
     await this.actors.assertRoomAccess(asset.roomId, actor);
+    if (asset.status !== 'attached' && !(asset.status === 'pending' && asset.ownerKey === actor.actorKey)) {
+      throw new NotFoundException('The image no longer exists.');
+    }
     return { assetUrl: await this.issueReadUrl(key, asset.roomId, actor) };
   }
 
@@ -137,6 +163,17 @@ export class AssetsService {
     return executor.update(assets).set({ status: 'attached' }).where(and(
       eq(assets.key, key), eq(assets.roomId, roomId), eq(assets.ownerKey, actor.actorKey), eq(assets.status, 'pending'),
     )).returning({ key: assets.key });
+  }
+
+  async discardPending(key: string, actor: Actor) {
+    const claimed = await this.db.update(assets).set({ status: 'deleting' }).where(and(
+      eq(assets.key, key),
+      eq(assets.ownerKey, actor.actorKey),
+      eq(assets.status, 'pending'),
+    )).returning({ key: assets.key });
+    if (!claimed.length) return { deleted: false };
+    const result = await this.deleteKeys([key]);
+    return { deleted: result.deleted.includes(key) };
   }
 
   async deleteKeys(keys: string[]) {

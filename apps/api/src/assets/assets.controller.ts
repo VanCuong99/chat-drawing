@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Header, HttpCode, Param, Post, Query, Req, Res } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Header, HttpCode, Param, Post, Query, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { ActorService } from '../auth/actor.service';
 import { AssetsService } from './assets.service';
@@ -14,11 +14,12 @@ export class AssetsController {
   async upload(
     @Req() request: Request,
     @Query('room') roomId: string,
+    @Query('uploadId') uploadId: string | undefined,
     @Body() bytes: Buffer,
   ) {
     const actor = await this.actors.require(request, true);
     await this.limits.consume('asset:upload', actor.actorKey, 30, 5 * 60 * 1000);
-    return this.assets.upload(roomId, actor, request.header('content-type')?.split(';')[0] ?? '', Buffer.from(bytes));
+    return this.assets.upload(roomId, actor, request.header('content-type')?.split(';')[0] ?? '', Buffer.from(bytes), uploadId);
   }
 
   @Get(':key')
@@ -33,5 +34,10 @@ export class AssetsController {
   @Get(':key/access')
   async access(@Req() request: Request, @Param('key') key: string) {
     return this.assets.refreshReadUrl(key, await this.actors.require(request));
+  }
+
+  @Delete(':key/pending')
+  async discardPending(@Req() request: Request, @Param('key') key: string) {
+    return this.assets.discardPending(key, await this.actors.require(request, true));
   }
 }

@@ -67,9 +67,10 @@ export class ChatController {
     @Param('id') roomId: string,
     @Query('limit') limit?: string,
     @Query('before') before?: string,
+    @Query('from') from?: string,
     @Query('q') query?: string,
   ) {
-    return this.chat.listMessages(roomId, await this.actors.require(request), limit, before, query);
+    return this.chat.listMessages(roomId, await this.actors.require(request), limit, before, from, query);
   }
 
   @Get('rooms/:id/messages/:messageId/lineage')
@@ -81,16 +82,114 @@ export class ChatController {
     return this.chat.listCanvasLineage(roomId, messageId, await this.actors.require(request));
   }
 
+  @Patch('rooms/:id/messages/:messageId/decision')
+  async visualDecision(@Req() request: Request, @Param('id') roomId: string, @Param('messageId') messageId: string, @Body() body: { voted?: unknown; status?: unknown; note?: unknown; ownerId?: unknown }) {
+    return this.chat.updateVisualDecision(roomId, messageId, await this.actors.require(request, true), body);
+  }
+
   @Post('rooms/:id/messages')
   @HttpCode(200)
   async sendMessage(
     @Req() request: Request,
     @Param('id') roomId: string,
-    @Body() body: { type?: string; text?: unknown; assetKey?: string; replyToId?: string | null; canvasParentId?: string | null; clientRequestId?: string },
+    @Body() body: { type?: string; text?: unknown; assetKey?: string; imageDescription?: unknown; imagePurpose?: unknown; replyToId?: string | null; canvasParentId?: string | null; clientRequestId?: string },
   ) {
     const actor = await this.actors.require(request, true);
     await this.limits.consume('message:send', actor.actorKey, 120, 60 * 1000);
     return this.chat.sendMessage(roomId, actor, body);
+  }
+
+  @Patch('rooms/:id/messages/:messageId')
+  async editMessage(
+    @Req() request: Request,
+    @Param('id') roomId: string,
+    @Param('messageId') messageId: string,
+    @Body() body: { text?: unknown },
+  ) {
+    return this.chat.editMessage(roomId, messageId, await this.actors.require(request, true), body.text);
+  }
+
+  @Delete('rooms/:id/messages/:messageId')
+  async deleteMessage(@Req() request: Request, @Param('id') roomId: string, @Param('messageId') messageId: string) {
+    return this.chat.deleteMessage(roomId, messageId, await this.actors.require(request, true));
+  }
+
+  @Delete('rooms/:id/messages/:messageId/undo')
+  async undoMessage(@Req() request: Request, @Param('id') roomId: string, @Param('messageId') messageId: string) {
+    return this.chat.undoMessage(roomId, messageId, await this.actors.require(request, true));
+  }
+
+  @Get('rooms/:id/people')
+  async roomPeople(@Req() request: Request, @Param('id') roomId: string) {
+    return this.chat.listPeople(roomId, await this.actors.require(request));
+  }
+
+  @Patch('rooms/:id/preferences')
+  async roomPreferences(@Req() request: Request, @Param('id') roomId: string, @Body() body: { muted?: unknown }) {
+    return this.chat.updateRoomPreferences(roomId, await this.actors.require(request, true), body);
+  }
+
+  @Patch('rooms/:id/governance')
+  async roomGovernance(@Req() request: Request, @Param('id') roomId: string, @Body() body: { allowGuests?: unknown; inviteActive?: unknown; inviteExpiresInHours?: unknown; inviteMaxUses?: unknown }) {
+    return this.chat.updateRoomGovernance(roomId, await this.actors.require(request), body);
+  }
+
+  @Post('rooms/:id/ownership')
+  @HttpCode(200)
+  async transferOwnership(@Req() request: Request, @Param('id') roomId: string, @Body() body: { userId?: string }) {
+    return this.chat.transferOwnership(roomId, body.userId ?? '', await this.actors.require(request));
+  }
+
+  @Delete('rooms/:id/guests/:guestId')
+  async removeGuest(@Req() request: Request, @Param('id') roomId: string, @Param('guestId') guestId: string) {
+    return this.chat.removeGuest(roomId, guestId, await this.actors.require(request));
+  }
+
+  @Patch('rooms/:id/membership/archive')
+  async archiveRoom(@Req() request: Request, @Param('id') roomId: string, @Body() body: { archived?: unknown }) {
+    return this.chat.archiveRoom(roomId, await this.actors.require(request), body.archived);
+  }
+
+  @Delete('rooms/:id')
+  async deleteRoom(@Req() request: Request, @Param('id') roomId: string) {
+    return this.chat.deleteRoom(roomId, await this.actors.require(request));
+  }
+
+  @Post('rooms/:id/invite/revoke')
+  @HttpCode(200)
+  async revokeInvite(@Req() request: Request, @Param('id') roomId: string) {
+    return this.chat.revokeInvite(roomId, await this.actors.require(request));
+  }
+
+  @Delete('rooms/:id/members/:userId')
+  async removeMember(@Req() request: Request, @Param('id') roomId: string, @Param('userId') userId: string) {
+    return this.chat.removeMember(roomId, userId, await this.actors.require(request));
+  }
+
+  @Delete('rooms/:id/membership')
+  async leaveRoom(@Req() request: Request, @Param('id') roomId: string) {
+    return this.chat.leaveRoom(roomId, await this.actors.require(request));
+  }
+
+  @Post('rooms/:id/reports')
+  @HttpCode(200)
+  async reportRoom(
+    @Req() request: Request,
+    @Param('id') roomId: string,
+    @Body() body: { reason?: unknown; details?: unknown; reportedUserId?: unknown; messageId?: unknown },
+  ) {
+    return this.chat.reportRoom(roomId, await this.actors.require(request, true), body);
+  }
+
+  @Post('users/:id/block')
+  @HttpCode(200)
+  async blockUser(@Req() request: Request, @Param('id') userId: string) {
+    return this.chat.blockUser(userId, await this.actors.require(request));
+  }
+
+  @Delete('users/:id/block')
+  async unblockUser(@Req() request: Request, @Param('id') userId: string) {
+    return this.chat.unblockUser(userId, await this.actors.require(request));
   }
 
   @Patch('rooms/:id/messages')

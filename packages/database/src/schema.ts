@@ -19,6 +19,8 @@ export const roomKind = pgEnum('room_kind', ['direct', 'group', 'guest']);
 export const roomRole = pgEnum('room_role', ['owner', 'member']);
 export const messageType = pgEnum('message_type', ['system', 'text', 'image', 'canvas']);
 export const assetStatus = pgEnum('asset_status', ['pending', 'attached', 'deleting']);
+export const imagePurpose = pgEnum('image_purpose', ['creative', 'reference']);
+export const visualStatus = pgEnum('visual_status', ['exploring', 'needs_changes', 'selected']);
 
 export const users = pgTable('users', {
   id: text('id').primaryKey(),
@@ -42,6 +44,10 @@ export const rooms = pgTable('rooms', {
   kind: roomKind('kind').notNull(),
   createdBy: text('created_by').references(() => users.id, { onDelete: 'set null' }),
   inviteCode: text('invite_code').notNull(),
+  inviteActive: boolean('invite_active').notNull().default(true),
+  inviteExpiresAt: bigint('invite_expires_at', { mode: 'number' }),
+  inviteMaxUses: integer('invite_max_uses'),
+  inviteUseCount: integer('invite_use_count').notNull().default(0),
   allowGuests: boolean('allow_guests').notNull().default(true),
   createdAt: bigint('created_at', { mode: 'number' }).notNull(),
 }, (table) => [
@@ -55,6 +61,8 @@ export const roomMembers = pgTable('room_members', {
   role: roomRole('role').notNull(),
   joinedAt: bigint('joined_at', { mode: 'number' }).notNull(),
   lastReadSequence: bigint('last_read_sequence', { mode: 'number' }).notNull().default(0),
+  mutedAt: bigint('muted_at', { mode: 'number' }),
+  archivedAt: bigint('archived_at', { mode: 'number' }),
 }, (table) => [
   primaryKey({ columns: [table.roomId, table.userId] }),
   index('room_members_user_room_idx').on(table.userId, table.roomId),
@@ -67,6 +75,7 @@ export const guestSessions = pgTable('guest_sessions', {
   createdAt: bigint('created_at', { mode: 'number' }).notNull(),
   lastSeenAt: bigint('last_seen_at', { mode: 'number' }).notNull(),
   lastReadSequence: bigint('last_read_sequence', { mode: 'number' }).notNull().default(0),
+  mutedAt: bigint('muted_at', { mode: 'number' }),
   expiresAt: bigint('expires_at', { mode: 'number' }).notNull(),
 }, (table) => [
   index('guest_sessions_room_expiry_idx').on(table.roomId, table.expiresAt),
@@ -107,21 +116,66 @@ export const messages = pgTable('messages', {
   senderName: text('sender_name').notNull(),
   type: messageType('type').notNull(),
   body: text('body'),
+  imageDescription: text('image_description'),
+  imagePurpose: imagePurpose('image_purpose').notNull().default('creative'),
   assetKey: uuid('asset_key').references(() => assets.key, { onDelete: 'set null' }),
   replyToId: uuid('reply_to_id').references((): AnyPgColumn => messages.id, { onDelete: 'set null' }),
   canvasParentId: uuid('canvas_parent_id').references((): AnyPgColumn => messages.id, { onDelete: 'set null' }),
+  canvasRootId: uuid('canvas_root_id').references((): AnyPgColumn => messages.id, { onDelete: 'set null' }),
   canvasVersion: integer('canvas_version'),
   clientRequestId: uuid('client_request_id'),
   createdAt: bigint('created_at', { mode: 'number' }).notNull(),
   editedAt: bigint('edited_at', { mode: 'number' }),
+  deletedAt: bigint('deleted_at', { mode: 'number' }),
+  visualStatus: visualStatus('visual_status').notNull().default('exploring'),
+  decisionNote: text('decision_note'),
+  decisionOwnerId: text('decision_owner_id').references(() => users.id, { onDelete: 'set null' }),
+  decidedAt: bigint('decided_at', { mode: 'number' }),
   expiresAt: bigint('expires_at', { mode: 'number' }),
 }, (table) => [
   uniqueIndex('messages_room_sequence_unique').on(table.roomId, table.sequence),
   index('messages_guest_expiry_idx').on(table.guestSessionId, table.expiresAt),
   index('messages_reply_to_idx').on(table.replyToId),
   index('messages_canvas_parent_idx').on(table.canvasParentId),
+  index('messages_canvas_root_idx').on(table.canvasRootId),
+  index('messages_decision_owner_idx').on(table.decisionOwnerId),
   uniqueIndex('messages_asset_key_unique').on(table.assetKey),
   uniqueIndex('messages_client_request_unique').on(table.clientRequestId),
+]);
+
+export const userBlocks = pgTable('user_blocks', {
+  blockerId: text('blocker_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  blockedId: text('blocked_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.blockerId, table.blockedId] }),
+  index('user_blocks_blocked_idx').on(table.blockedId),
+  check('user_blocks_not_self_check', sql`${table.blockerId} <> ${table.blockedId}`),
+]);
+
+export const roomReports = pgTable('room_reports', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  roomId: uuid('room_id').notNull().references(() => rooms.id, { onDelete: 'cascade' }),
+  reporterId: text('reporter_id').references(() => users.id, { onDelete: 'set null' }),
+  guestSessionId: uuid('guest_session_id').references(() => guestSessions.id, { onDelete: 'set null' }),
+  reportedUserId: text('reported_user_id').references(() => users.id, { onDelete: 'set null' }),
+  messageId: uuid('message_id').references(() => messages.id, { onDelete: 'set null' }),
+  reason: text('reason').notNull(),
+  details: text('details'),
+  createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+}, (table) => [
+  index('room_reports_room_created_idx').on(table.roomId, table.createdAt),
+  index('room_reports_reporter_idx').on(table.reporterId, table.createdAt),
+  check('room_reports_single_reporter_check', sql`not (${table.reporterId} is not null and ${table.guestSessionId} is not null)`),
+]);
+
+export const visualVotes = pgTable('visual_votes', {
+  messageId: uuid('message_id').notNull().references(() => messages.id, { onDelete: 'cascade' }),
+  actorKey: text('actor_key').notNull(),
+  createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.messageId, table.actorKey] }),
+  index('visual_votes_message_idx').on(table.messageId),
 ]);
 
 export type RealtimeOutboxPayload = Record<string, unknown>;
@@ -163,6 +217,7 @@ export const assets = pgTable('assets', {
   status: assetStatus('status').notNull(),
   mimeType: text('mime_type').notNull(),
   byteSize: integer('byte_size').notNull(),
+  contentSha256: text('content_sha256'),
   createdAt: bigint('created_at', { mode: 'number' }).notNull(),
   expiresAt: bigint('expires_at', { mode: 'number' }),
 }, (table) => [

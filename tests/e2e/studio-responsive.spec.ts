@@ -79,6 +79,7 @@ test('Studio không bị cắt ở màn hình ngang thấp và mobile @critical'
   await mixer.getByRole('button', { name: 'Đóng pha màu nâng cao' }).click();
   await page.locator('.tool-inspector').getByRole('button', { name: 'Đóng cài đặt công cụ' }).click();
   await studio.locator('.studio-header').getByRole('button', { name: /Đóng/ }).click();
+  await page.getByRole('button', { name: 'Thêm thao tác cuộc trò chuyện' }).click();
   await page.getByRole('button', { name: 'Tìm trong tin nhắn' }).click();
   await expect(page.getByRole('textbox', { name: 'Tìm nội dung tin nhắn' })).toBeVisible();
   await page.getByRole('button', { name: 'Đóng tìm kiếm' }).click();

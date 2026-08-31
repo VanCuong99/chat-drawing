@@ -51,8 +51,16 @@ test('WebSocket chỉ phát message vào đúng room đã được cấp quyền
   ]);
   const eventsA: Array<{ roomId: string; messageId: string }> = [];
   const eventsB: Array<{ roomId: string; messageId: string }> = [];
+  const editsA: Array<{ roomId: string; messageId: string; body: string }> = [];
+  const deletesA: Array<{ roomId: string; messageId: string; deletedAt: number }> = [];
+  const editsB: Array<{ roomId: string; messageId: string; body: string }> = [];
+  const deletesB: Array<{ roomId: string; messageId: string; deletedAt: number }> = [];
   socketA.on('message.created', (event) => eventsA.push(event));
   socketB.on('message.created', (event) => eventsB.push(event));
+  socketA.on('message.updated', (event) => editsA.push(event));
+  socketA.on('message.deleted', (event) => deletesA.push(event));
+  socketB.on('message.updated', (event) => editsB.push(event));
+  socketB.on('message.deleted', (event) => deletesB.push(event));
 
   try {
     await expect(subscribe(socketA, guestA.roomId)).resolves.toEqual({ ok: true, roomId: guestA.roomId });
@@ -67,9 +75,23 @@ test('WebSocket chỉ phát message vào đúng room đã được cấp quyền
     await expect.poll(() => eventsA.length, { timeout: 3000 }).toBe(1);
     expect(eventsA[0].roomId).toBe(guestA.roomId);
 
+    const messageId = ((await sent.json()) as { id: string }).id;
+    const edited = await request.patch(`${apiOrigin}/api/rooms/${guestA.roomId}/messages/${messageId}`, {
+      headers: { 'x-net-guest-session': guestA.sessionId },
+      data: { text: 'Nội dung đã sửa realtime' },
+    });
+    expect(edited.ok()).toBe(true);
+    await expect.poll(() => editsA.some((event) => event.roomId === guestA.roomId && event.messageId === messageId && event.body === 'Nội dung đã sửa realtime')).toBe(true);
+
+    const deleted = await request.delete(`${apiOrigin}/api/rooms/${guestA.roomId}/messages/${messageId}`, { headers: { 'x-net-guest-session': guestA.sessionId } });
+    expect(deleted.ok()).toBe(true);
+    await expect.poll(() => deletesA.some((event) => event.roomId === guestA.roomId && event.messageId === messageId && Number.isSafeInteger(event.deletedAt))).toBe(true);
+
     // A short negative window proves the server did not broadcast the room-A event globally.
     await new Promise((resolve) => setTimeout(resolve, 250));
     expect(eventsB).toEqual([]);
+    expect(editsB).toEqual([]);
+    expect(deletesB).toEqual([]);
 
     const disconnected = new Promise<void>((resolve) => socketB.once('disconnect', () => resolve()));
     const ended = await request.delete(`${apiOrigin}/api/guest`, { headers: { 'x-net-guest-session': guestB.sessionId } });

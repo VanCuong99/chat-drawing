@@ -1,4 +1,4 @@
-import { BadRequestException, Inject, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Inject, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import {
   and,
   asc,
@@ -18,9 +18,12 @@ import {
   reactions,
   realtimeOutbox,
   roomMembers,
+  roomReports,
   rooms,
   sql,
+  userBlocks,
   users,
+  visualVotes,
   type NetDatabase,
 } from '@net/database';
 import type { Actor } from '../auth/actor.types';
@@ -55,25 +58,30 @@ export class ChatService {
 
   async listRooms(actor: Actor) {
     const accessRows = actor.kind === 'user'
-      ? await this.db.select({ roomId: roomMembers.roomId, lastReadSequence: roomMembers.lastReadSequence }).from(roomMembers).where(eq(roomMembers.userId, actor.id))
-      : await this.db.select({ roomId: guestSessions.roomId, lastReadSequence: guestSessions.lastReadSequence }).from(guestSessions).where(eq(guestSessions.id, actor.id));
+      ? await this.db.select({ roomId: roomMembers.roomId, lastReadSequence: roomMembers.lastReadSequence, mutedAt: roomMembers.mutedAt }).from(roomMembers).where(and(eq(roomMembers.userId, actor.id), isNull(roomMembers.archivedAt)))
+      : await this.db.select({ roomId: guestSessions.roomId, lastReadSequence: guestSessions.lastReadSequence, mutedAt: guestSessions.mutedAt }).from(guestSessions).where(eq(guestSessions.id, actor.id));
     const roomIds = accessRows.map((row) => row.roomId);
     if (!roomIds.length) return [];
     const activeMessageCondition = or(isNull(messages.expiresAt), gt(messages.expiresAt, Date.now()));
     const ownMessageCondition = actor.kind === 'user'
       ? or(isNull(messages.senderId), ne(messages.senderId, actor.id))
       : or(isNull(messages.guestSessionId), ne(messages.guestSessionId, actor.id));
+    const blockBoundaryCondition = actor.kind === 'user' ? sql`not exists (
+      select 1 from ${userBlocks}
+      where (${userBlocks.blockerId} = ${actor.id} and ${userBlocks.blockedId} = ${messages.senderId})
+         or (${userBlocks.blockedId} = ${actor.id} and ${userBlocks.blockerId} = ${messages.senderId})
+    )` : undefined;
     const unreadQuery = actor.kind === 'user'
-      ? this.db.select({ roomId: messages.roomId, count: sql<number>`count(*)::int` })
+      ? this.db.select({ roomId: messages.roomId, count: sql<number>`count(*)::int`, firstSequence: sql<number>`min(${messages.sequence})::bigint` })
         .from(messages)
         .innerJoin(roomMembers, and(
           eq(roomMembers.roomId, messages.roomId),
           eq(roomMembers.userId, actor.id),
           gt(messages.sequence, roomMembers.lastReadSequence),
         ))
-        .where(and(inArray(messages.roomId, roomIds), activeMessageCondition, ownMessageCondition))
+        .where(and(inArray(messages.roomId, roomIds), activeMessageCondition, ownMessageCondition, blockBoundaryCondition))
         .groupBy(messages.roomId)
-      : this.db.select({ roomId: messages.roomId, count: sql<number>`count(*)::int` })
+      : this.db.select({ roomId: messages.roomId, count: sql<number>`count(*)::int`, firstSequence: sql<number>`min(${messages.sequence})::bigint` })
         .from(messages)
         .innerJoin(guestSessions, and(
           eq(guestSessions.roomId, messages.roomId),
@@ -89,7 +97,7 @@ export class ChatService {
         type: messages.type,
         body: messages.body,
         createdAt: messages.createdAt,
-      }).from(messages).where(and(inArray(messages.roomId, roomIds), activeMessageCondition))
+      }).from(messages).where(and(inArray(messages.roomId, roomIds), activeMessageCondition, blockBoundaryCondition))
         .orderBy(messages.roomId, desc(messages.sequence)),
       unreadQuery,
       this.db.select({
@@ -108,6 +116,8 @@ export class ChatService {
     ]);
     const latestByRoom = new Map(latest.map((message) => [message.roomId, message]));
     const unreadByRoom = new Map(unreadRows.map((row) => [row.roomId, row.count]));
+    const firstUnreadByRoom = new Map(unreadRows.map((row) => [row.roomId, Number(row.firstSequence)]));
+    const accessByRoom = new Map(accessRows.map((row) => [row.roomId, row]));
     const statisticsByRoom = new Map(statisticRows.map((row) => [row.roomId, row]));
     const counterpartByRoom = new Map(counterpartRows.map((row) => [row.roomId, row.displayName]));
     return roomRows.map((room) => {
@@ -123,6 +133,9 @@ export class ChatService {
         preview,
         lastActivity: last?.createdAt ?? room.createdAt,
         unreadCount: unreadByRoom.get(room.id) ?? 0,
+        firstUnreadSequence: firstUnreadByRoom.get(room.id) ?? null,
+        lastReadSequence: Number(accessByRoom.get(room.id)?.lastReadSequence ?? 0),
+        muted: Boolean(accessByRoom.get(room.id)?.mutedAt),
         messageCount: statistics?.messageCount ?? 0,
         mediaCount: statistics?.mediaCount ?? 0,
       };
@@ -138,9 +151,13 @@ export class ChatService {
       kind: rooms.kind,
       createdBy: rooms.createdBy,
       createdAt: rooms.createdAt,
+      inviteActive: rooms.inviteActive,
+      inviteExpiresAt: rooms.inviteExpiresAt,
+      inviteMaxUses: rooms.inviteMaxUses,
+      inviteUseCount: rooms.inviteUseCount,
     }).from(rooms)
       .where(eq(rooms.inviteCode, inviteCode)).limit(1);
-    if (!room || room.kind === 'direct') throw new NotFoundException('The invite link is invalid or has expired.');
+    if (!room || room.kind === 'direct' || !room.inviteActive || (room.inviteExpiresAt !== null && room.inviteExpiresAt <= Date.now()) || (room.inviteMaxUses !== null && room.inviteUseCount >= room.inviteMaxUses)) throw new NotFoundException('The invite link is invalid or has expired.');
     const now = Date.now();
     const [memberRows, memberCounts, hostRows, activeGuests, activeGuestCounts, recentMessages] = await Promise.all([
       this.db.select({
@@ -152,7 +169,7 @@ export class ChatService {
         .innerJoin(users, eq(users.id, roomMembers.userId))
         .where(eq(roomMembers.roomId, room.id))
         .orderBy(asc(roomMembers.joinedAt))
-        .limit(5),
+        .limit(20),
       this.db.select({ count: sql<number>`count(*)::int` })
         .from(roomMembers)
         .where(eq(roomMembers.roomId, room.id)),
@@ -165,7 +182,7 @@ export class ChatService {
         .from(guestSessions)
         .where(and(eq(guestSessions.roomId, room.id), gt(guestSessions.expiresAt, now)))
         .orderBy(asc(guestSessions.createdAt))
-        .limit(5),
+        .limit(20),
       this.db.select({ count: sql<number>`count(*)::int` })
         .from(guestSessions)
         .where(and(eq(guestSessions.roomId, room.id), gt(guestSessions.expiresAt, now))),
@@ -185,7 +202,7 @@ export class ChatService {
       room: {
         name: room.name,
         hostedBy: hostRows[0]?.displayName ?? null,
-        participants: participants.slice(0, 5),
+        participants: participants.slice(0, 20),
         participantCount: (memberCounts[0]?.count ?? 0) + (activeGuestCounts[0]?.count ?? 0),
         recentActivity: recentMessages[0] ?? null,
         createdAt: room.createdAt,
@@ -211,10 +228,14 @@ export class ChatService {
             eq(rooms.id, candidate.id),
             eq(rooms.inviteCode, inviteCode),
             eq(rooms.allowGuests, true),
+            eq(rooms.inviteActive, true),
+            or(isNull(rooms.inviteExpiresAt), gt(rooms.inviteExpiresAt, now)),
+            or(isNull(rooms.inviteMaxUses), sql`${rooms.inviteUseCount} < ${rooms.inviteMaxUses}`),
             ne(rooms.kind, 'direct'),
           )).limit(1);
         if (!availableRoom) throw new NotFoundException('The invite link is invalid or the room does not accept guests.');
         room = availableRoom;
+        await tx.update(rooms).set({ inviteUseCount: sql`${rooms.inviteUseCount} + 1` }).where(eq(rooms.id, room.id));
       } else {
         [room] = await tx.insert(rooms).values({ name: `${displayName}'s Session`, kind: 'guest', inviteCode: this.makeCode(), allowGuests: true, createdAt: now }).returning();
       }
@@ -287,12 +308,15 @@ export class ChatService {
     if (actor.kind !== 'user') throw new UnauthorizedException('Sign in to find members.');
     const query = typeof queryInput === 'string' ? queryInput.trim().replaceAll('%', '').replaceAll('_', '') : '';
     if (query.length < 2) return { users: [] };
-    const rows = await this.db.select({ id: users.id, displayName: users.displayName, email: users.email, avatarColor: users.avatarColor })
-      .from(users).where(and(
-        or(ilike(users.displayName, `%${query}%`), ilike(users.email, `%${query}%`)),
-        // The current user is filtered in application code to keep the query expression typed.
-      )).orderBy(asc(users.displayName)).limit(13);
-    return { users: rows.filter((user) => user.id !== actor.id).slice(0, 12).map((user) => ({ ...user, email: this.maskEmail(user.email) })) };
+    const [rows, blockRows] = await Promise.all([
+      this.db.select({ id: users.id, displayName: users.displayName, email: users.email, avatarColor: users.avatarColor })
+        .from(users).where(or(ilike(users.displayName, `%${query}%`), ilike(users.email, `%${query}%`))).orderBy(asc(users.displayName)).limit(30),
+      this.db.select({ blockerId: userBlocks.blockerId, blockedId: userBlocks.blockedId }).from(userBlocks)
+        .where(or(eq(userBlocks.blockerId, actor.id), eq(userBlocks.blockedId, actor.id))),
+    ]);
+    const unavailable = new Set(blockRows.flatMap((block) => [block.blockerId, block.blockedId]));
+    unavailable.add(actor.id);
+    return { users: rows.filter((user) => !unavailable.has(user.id)).slice(0, 12).map((user) => ({ ...user, email: this.maskEmail(user.email) })) };
   }
 
   async createRoom(actor: Actor, body: { name?: unknown; allowGuests?: boolean; memberIds?: unknown[] }) {
@@ -300,6 +324,13 @@ export class ChatService {
     const memberIds = [...new Set((body.memberIds ?? []).filter((id): id is string => typeof id === 'string' && id !== actor.id))].slice(0, 20);
     const members = memberIds.length ? await this.db.select({ id: users.id, displayName: users.displayName }).from(users).where(inArray(users.id, memberIds)) : [];
     if (members.length !== memberIds.length) throw new BadRequestException('One of the selected members is no longer available.');
+    if (memberIds.length) {
+      const blocked = await this.db.select({ blockerId: userBlocks.blockerId }).from(userBlocks).where(or(
+        and(eq(userBlocks.blockerId, actor.id), inArray(userBlocks.blockedId, memberIds)),
+        and(eq(userBlocks.blockedId, actor.id), inArray(userBlocks.blockerId, memberIds)),
+      )).limit(1);
+      if (blocked.length) throw new BadRequestException('A blocked member cannot be added to a new conversation.');
+    }
     const requestedName = typeof body.name === 'string' ? body.name.trim() : '';
     const suggestedName = members.length === 1
       ? `${actor.displayName} & ${members[0].displayName}`
@@ -352,7 +383,7 @@ export class ChatService {
     const outboxId = await this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${room.id}, 0))`);
       const [availableRoom] = await tx.select({ id: rooms.id, kind: rooms.kind }).from(rooms)
-        .where(and(eq(rooms.id, room.id), eq(rooms.inviteCode, inviteCode))).limit(1);
+        .where(and(eq(rooms.id, room.id), eq(rooms.inviteCode, inviteCode), eq(rooms.inviteActive, true), or(isNull(rooms.inviteExpiresAt), gt(rooms.inviteExpiresAt, Date.now())), or(isNull(rooms.inviteMaxUses), sql`${rooms.inviteUseCount} < ${rooms.inviteMaxUses}`))).limit(1);
       if (!availableRoom) throw new NotFoundException('The conversation no longer exists.');
       if (availableRoom.kind === 'direct') {
         const [existingMember] = await tx.select({ roomId: roomMembers.roomId }).from(roomMembers)
@@ -360,8 +391,10 @@ export class ChatService {
         if (!existingMember) throw new NotFoundException('No conversation was found for this invite link.');
         return null;
       }
-      await tx.insert(roomMembers).values({ roomId: room.id, userId: actor.id, role: 'member', joinedAt: Date.now() })
-        .onConflictDoNothing({ target: [roomMembers.roomId, roomMembers.userId] });
+      const insertedMembership = await tx.insert(roomMembers).values({ roomId: room.id, userId: actor.id, role: 'member', joinedAt: Date.now() })
+        .onConflictDoNothing({ target: [roomMembers.roomId, roomMembers.userId] }).returning({ userId: roomMembers.userId });
+      await tx.update(roomMembers).set({ archivedAt: null }).where(and(eq(roomMembers.roomId, room.id), eq(roomMembers.userId, actor.id)));
+      if (insertedMembership.length) await tx.update(rooms).set({ inviteUseCount: sql`${rooms.inviteUseCount} + 1` }).where(eq(rooms.id, room.id));
       await tx.update(messages).set({ expiresAt: null }).where(and(
         eq(messages.roomId, room.id),
         isNotNull(messages.guestSessionId),
@@ -377,7 +410,7 @@ export class ChatService {
     return { roomId: room.id };
   }
 
-  async listMessages(roomId: string, actor: Actor, limitInput?: unknown, cursorInput?: unknown, queryInput?: unknown) {
+  async listMessages(roomId: string, actor: Actor, limitInput?: unknown, cursorInput?: unknown, fromInput?: unknown, queryInput?: unknown) {
     await this.actors.assertRoomAccess(roomId, actor);
     const now = Date.now();
     const limit = Math.min(100, Math.max(20, Number(limitInput) || 80));
@@ -385,7 +418,11 @@ export class ChatService {
       ? queryInput.trim().replaceAll('%', '').replaceAll('_', '').slice(0, 80)
       : '';
     const beforeSequence = Number(cursorInput);
+    const fromSequence = Number(fromInput);
     const cursorCondition = !query && Number.isSafeInteger(beforeSequence) && beforeSequence > 0 ? lt(messages.sequence, beforeSequence) : undefined;
+    const fromCondition = !query && !cursorCondition && Number.isSafeInteger(fromSequence) && fromSequence > 0
+      ? sql`${messages.sequence} >= ${fromSequence}`
+      : undefined;
     const queryCondition = query
       ? or(ilike(messages.senderName, `%${query}%`), ilike(messages.body, `%${query}%`))
       : undefined;
@@ -393,21 +430,39 @@ export class ChatService {
       eq(messages.roomId, roomId),
       or(isNull(messages.expiresAt), gt(messages.expiresAt, now)),
       cursorCondition,
+      fromCondition,
       queryCondition,
     );
-    const [rows, totalRows] = await Promise.all([
-      this.db.select().from(messages).where(messageCondition).orderBy(desc(messages.sequence)).limit(limit),
+    const loadingFromUnread = Boolean(fromCondition);
+    const [selectedRows, totalRows] = await Promise.all([
+      this.db.select().from(messages).where(messageCondition)
+        .orderBy(loadingFromUnread ? asc(messages.sequence) : desc(messages.sequence))
+        .limit(loadingFromUnread ? limit + 1 : limit),
       query
         ? this.db.select({ count: sql<number>`count(*)::int` }).from(messages).where(messageCondition)
         : Promise.resolve([]),
     ]);
-    rows.reverse();
+    const hasMoreAfter = loadingFromUnread && selectedRows.length > limit;
+    const rows = selectedRows.slice(0, limit);
+    if (!loadingFromUnread) rows.reverse();
     const messageIds = rows.map((message) => message.id);
-    const [reactionRows, memberReaders, guestReaders] = await Promise.all([
+    const blockedRows = actor.kind === 'user' ? await this.db.select({ blockedId: userBlocks.blockedId }).from(userBlocks).where(eq(userBlocks.blockerId, actor.id)) : [];
+    const blockedIds = new Set(blockedRows.map((row) => row.blockedId));
+    const lineageRootIds = rows.flatMap((message) => message.canvasRootId ? [message.canvasRootId] : []);
+    const [reactionRows, memberReaders, guestReaders, continuationRows, lineageRootRows] = await Promise.all([
       messageIds.length ? this.db.select().from(reactions).where(and(inArray(reactions.messageId, messageIds), or(isNull(reactions.expiresAt), gt(reactions.expiresAt, now)))) : [],
       this.db.select({ userId: roomMembers.userId, lastReadSequence: roomMembers.lastReadSequence }).from(roomMembers).where(eq(roomMembers.roomId, roomId)),
       this.db.select({ id: guestSessions.id, lastReadSequence: guestSessions.lastReadSequence }).from(guestSessions).where(and(eq(guestSessions.roomId, roomId), gt(guestSessions.expiresAt, now))),
+      messageIds.length ? this.db.select({ parentId: messages.canvasParentId, count: sql<number>`count(*)::int` }).from(messages).where(and(
+        eq(messages.roomId, roomId),
+        eq(messages.type, 'canvas'),
+        inArray(messages.canvasParentId, messageIds),
+        or(isNull(messages.expiresAt), gt(messages.expiresAt, now)),
+      )).groupBy(messages.canvasParentId) : [],
+      lineageRootIds.length ? this.db.select({ id: messages.id, type: messages.type, senderName: messages.senderName, deletedAt: messages.deletedAt }).from(messages).where(inArray(messages.id, lineageRootIds)) : [],
     ]);
+    const continuationCountByMessage = new Map(continuationRows.flatMap((row) => row.parentId ? [[row.parentId, row.count] as const] : []));
+    const lineageRootById = new Map(lineageRootRows.map((root) => [root.id, root]));
     const reactionMap = new Map<string, Map<string, { count: number; reacted: boolean }>>();
     for (const reaction of reactionRows) {
       const byEmoji = reactionMap.get(reaction.messageId) ?? new Map();
@@ -419,8 +474,11 @@ export class ChatService {
     }
     const output = await Promise.all(rows.map(async (message) => ({
       ...message,
-      assetUrl: message.assetKey ? await this.assetService.issueReadUrl(message.assetKey, roomId, actor) : null,
+      assetUrl: message.assetKey && !blockedIds.has(message.senderId ?? '') ? await this.assetService.issueReadUrl(message.assetKey, roomId, actor) : null,
+      blockedAuthor: blockedIds.has(message.senderId ?? ''),
       reactions: [...(reactionMap.get(message.id)?.entries() ?? [])].map(([emoji, value]) => ({ emoji, ...value })),
+      continuationCount: continuationCountByMessage.get(message.id) ?? 0,
+      lineageRoot: message.canvasRootId ? lineageRootById.get(message.canvasRootId) ?? null : null,
       readCount: memberReaders.filter((reader) => reader.userId !== message.senderId && this.hasRead(reader, message)).length
         + guestReaders.filter((reader) => reader.id !== message.guestSessionId && this.hasRead(reader, message)).length,
     })));
@@ -429,6 +487,7 @@ export class ChatService {
       messages: output,
       readAt: now,
       nextCursor: !query && output.length === limit && oldest ? String(oldest.sequence) : null,
+      hasMoreAfter,
       totalCount: query ? totalRows[0]?.count ?? 0 : null,
     };
   }
@@ -445,16 +504,22 @@ export class ChatService {
       assetKey: messages.assetKey,
       canvasParentId: messages.canvasParentId,
       canvasVersion: messages.canvasVersion,
+      type: messages.type,
+      deletedAt: messages.deletedAt,
       createdAt: messages.createdAt,
+      visualStatus: messages.visualStatus,
+      decisionNote: messages.decisionNote,
+      decisionOwnerId: messages.decisionOwnerId,
+      decidedAt: messages.decidedAt,
     };
-    const activeCanvas = or(isNull(messages.expiresAt), gt(messages.expiresAt, now));
+    const activeVisual = or(isNull(messages.expiresAt), gt(messages.expiresAt, now));
     const [target] = await this.db.select(selection).from(messages).where(and(
       eq(messages.id, messageId),
       eq(messages.roomId, roomId),
-      eq(messages.type, 'canvas'),
-      activeCanvas,
+      inArray(messages.type, ['image', 'canvas']),
+      activeVisual,
     )).limit(1);
-    if (!target) throw new NotFoundException('The drawing version no longer exists.');
+    if (!target) throw new NotFoundException('The visual version no longer exists.');
 
     let root = target;
     const visitedAncestors = new Set<string>();
@@ -463,8 +528,8 @@ export class ChatService {
       const [parent] = await this.db.select(selection).from(messages).where(and(
         eq(messages.id, root.canvasParentId),
         eq(messages.roomId, roomId),
-        eq(messages.type, 'canvas'),
-        activeCanvas,
+        inArray(messages.type, ['image', 'canvas']),
+        activeVisual,
       )).limit(1);
       if (!parent) break;
       root = parent;
@@ -479,7 +544,7 @@ export class ChatService {
         eq(messages.roomId, roomId),
         eq(messages.type, 'canvas'),
         inArray(messages.canvasParentId, frontier),
-        activeCanvas,
+        activeVisual,
       )).orderBy(asc(messages.sequence)).limit(remaining + 1);
       if (children.length > remaining) truncated = true;
       const accepted = children.slice(0, remaining);
@@ -488,20 +553,75 @@ export class ChatService {
     }
 
     const rows = [...lineageById.values()].sort((left, right) => left.sequence - right.sequence);
+    const voteRows = rows.length ? await this.db.select({ messageId: visualVotes.messageId, actorKey: visualVotes.actorKey }).from(visualVotes).where(inArray(visualVotes.messageId, rows.map((row) => row.id))) : [];
+    const votesByMessage = new Map<string, { count: number; voted: boolean }>();
+    for (const vote of voteRows) {
+      const current = votesByMessage.get(vote.messageId) ?? { count: 0, voted: false };
+      current.count += 1;
+      current.voted ||= vote.actorKey === actor.actorKey;
+      votesByMessage.set(vote.messageId, current);
+    }
     const lineage = await Promise.all(rows.map(async (row) => ({
       ...row,
       assetUrl: row.assetKey ? await this.assetService.issueReadUrl(row.assetKey, roomId, actor) : null,
+      voteCount: votesByMessage.get(row.id)?.count ?? 0,
+      voted: votesByMessage.get(row.id)?.voted ?? false,
     })));
-    return { lineage, truncated };
+    const [ownMembership, decisionOwners] = await Promise.all([
+      actor.kind === 'user' ? this.db.select({ role: roomMembers.role }).from(roomMembers).where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, actor.id))).limit(1) : Promise.resolve([]),
+      this.db.select({ id: users.id, displayName: users.displayName }).from(roomMembers).innerJoin(users, eq(users.id, roomMembers.userId)).where(eq(roomMembers.roomId, roomId)).orderBy(asc(users.displayName)),
+    ]);
+    const canDecide = actor.kind === 'user' && ownMembership[0]?.role === 'owner';
+    return { lineage, truncated, canDecide, decisionOwners };
   }
 
-  async sendMessage(roomId: string, actor: Actor, body: { type?: string; text?: unknown; assetKey?: string; replyToId?: string | null; canvasParentId?: string | null; clientRequestId?: string }) {
+  async updateVisualDecision(roomId: string, messageId: string, actor: Actor, body: { voted?: unknown; status?: unknown; note?: unknown; ownerId?: unknown }) {
+    await this.actors.assertRoomAccess(roomId, actor);
+    const [target] = await this.db.select({ id: messages.id, rootId: messages.canvasRootId, type: messages.type }).from(messages)
+      .where(and(eq(messages.id, messageId), eq(messages.roomId, roomId), inArray(messages.type, ['image', 'canvas']), isNull(messages.deletedAt))).limit(1);
+    if (!target) throw new NotFoundException('The visual version no longer exists.');
+    const wantsDecision = body.status !== undefined || body.note !== undefined || body.ownerId !== undefined;
+    if (wantsDecision) await this.requireRoomOwner(roomId, actor);
+    const allowedStatuses = new Set(['exploring', 'needs_changes', 'selected']);
+    const status = typeof body.status === 'string' && allowedStatuses.has(body.status) ? body.status as 'exploring' | 'needs_changes' | 'selected' : undefined;
+    if (body.status !== undefined && !status) throw new BadRequestException('The visual status is invalid.');
+    const note = typeof body.note === 'string' ? body.note.trim().slice(0, 500) : undefined;
+    const ownerId = typeof body.ownerId === 'string' && body.ownerId ? body.ownerId : body.ownerId === null ? null : undefined;
+    if (ownerId) {
+      const [member] = await this.db.select({ id: roomMembers.userId }).from(roomMembers).where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, ownerId))).limit(1);
+      if (!member) throw new BadRequestException('The decision owner must be a conversation member.');
+    }
+    const result = await this.db.transaction(async (tx) => {
+      if (typeof body.voted === 'boolean') {
+        if (body.voted) await tx.insert(visualVotes).values({ messageId, actorKey: actor.actorKey, createdAt: Date.now() }).onConflictDoNothing();
+        else await tx.delete(visualVotes).where(and(eq(visualVotes.messageId, messageId), eq(visualVotes.actorKey, actor.actorKey)));
+      }
+      if (wantsDecision) {
+        const rootId = target.rootId ?? target.id;
+        if (status === 'selected') await tx.update(messages).set({ visualStatus: 'exploring', decisionNote: null, decisionOwnerId: null, decidedAt: null }).where(and(eq(messages.roomId, roomId), or(eq(messages.id, rootId), eq(messages.canvasRootId, rootId))));
+        await tx.update(messages).set({
+          ...(status ? { visualStatus: status } : {}),
+          ...(note !== undefined ? { decisionNote: note || null } : {}),
+          ...(ownerId !== undefined ? { decisionOwnerId: ownerId } : {}),
+          decidedAt: Date.now(),
+        }).where(eq(messages.id, messageId));
+      }
+      return this.outbox.enqueue(tx, roomId, 'message.updated', { messageId, decisionUpdated: true });
+    });
+    await this.outbox.deliverIds([result]);
+    return { updated: true };
+  }
+
+  async sendMessage(roomId: string, actor: Actor, body: { type?: string; text?: unknown; assetKey?: string; imageDescription?: unknown; imagePurpose?: unknown; replyToId?: string | null; canvasParentId?: string | null; clientRequestId?: string }) {
     await this.actors.assertRoomAccess(roomId, actor);
     if (!['text', 'image', 'canvas'].includes(body.type ?? '')) throw new BadRequestException('The message type is invalid.');
     const type = body.type as 'text' | 'image' | 'canvas';
     const text = body.text ? this.requireText(body.text, 'Content', 1, 2000) : null;
     if (type === 'text' && !text) throw new BadRequestException('Messages cannot be empty.');
     if ((type === 'image' || type === 'canvas') && !body.assetKey) throw new BadRequestException('Image content is missing.');
+    const imageDescription = typeof body.imageDescription === 'string' ? body.imageDescription.trim() : '';
+    if (imageDescription.length > 500) throw new BadRequestException('The image description must be 500 characters or fewer.');
+    const imagePurpose: 'creative' | 'reference' = body.imagePurpose === 'reference' ? 'reference' : 'creative';
     const clientRequestId = typeof body.clientRequestId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.clientRequestId)
       ? body.clientRequestId
       : null;
@@ -512,6 +632,8 @@ export class ChatService {
       assetKey: body.assetKey ?? null,
       replyToId: body.replyToId ?? null,
       canvasParentId: body.canvasParentId ?? null,
+      imageDescription: imageDescription || null,
+      imagePurpose,
     };
     if (clientRequestId) {
       const existing = await this.findIdempotentMessage(clientRequestId, roomId, actor, idempotencyInput);
@@ -519,16 +641,28 @@ export class ChatService {
     }
     if (body.assetKey) await this.assetService.assertPending(body.assetKey, roomId, actor);
     if (body.replyToId) {
-      const [reply] = await this.db.select({ id: messages.id }).from(messages).where(and(eq(messages.id, body.replyToId), eq(messages.roomId, roomId))).limit(1);
+      const [reply] = await this.db.select({ id: messages.id, senderId: messages.senderId }).from(messages).where(and(eq(messages.id, body.replyToId), eq(messages.roomId, roomId))).limit(1);
       if (!reply) throw new BadRequestException('The replied-to message no longer exists.');
+      if (actor.kind === 'user' && reply.senderId) {
+        const [blocked] = await this.db.select({ blockerId: userBlocks.blockerId }).from(userBlocks).where(or(and(eq(userBlocks.blockerId, actor.id), eq(userBlocks.blockedId, reply.senderId)), and(eq(userBlocks.blockerId, reply.senderId), eq(userBlocks.blockedId, actor.id)))).limit(1);
+        if (blocked) throw new BadRequestException('Replies are unavailable across a block boundary.');
+      }
     }
     let canvasVersion: number | null = null;
+    let canvasRootId: string | null = null;
     if (type === 'canvas') {
       if (body.canvasParentId) {
-        const [parent] = await this.db.select({ version: messages.canvasVersion }).from(messages)
-          .where(and(eq(messages.id, body.canvasParentId), eq(messages.roomId, roomId), eq(messages.type, 'canvas'))).limit(1);
-        if (!parent) throw new BadRequestException('The original drawing no longer exists.');
-        canvasVersion = (parent.version ?? 1) + 1;
+        const [parent] = await this.db.select({ id: messages.id, version: messages.canvasVersion, type: messages.type, rootId: messages.canvasRootId, imagePurpose: messages.imagePurpose }).from(messages)
+          .where(and(
+            eq(messages.id, body.canvasParentId),
+            eq(messages.roomId, roomId),
+            inArray(messages.type, ['image', 'canvas']),
+            or(isNull(messages.expiresAt), gt(messages.expiresAt, Date.now())),
+          )).limit(1);
+        if (!parent) throw new BadRequestException('The source visual no longer exists.');
+        if (parent.type === 'image' && parent.imagePurpose === 'reference') throw new BadRequestException('Reference attachments cannot start a drawing thread.');
+        canvasVersion = parent.type === 'image' ? 1 : (parent.version ?? 1) + 1;
+        canvasRootId = parent.rootId ?? parent.id;
       } else canvasVersion = 1;
     }
     const now = Date.now();
@@ -550,6 +684,8 @@ export class ChatService {
           assetKey: messages.assetKey,
           replyToId: messages.replyToId,
           canvasParentId: messages.canvasParentId,
+          imageDescription: messages.imageDescription,
+          imagePurpose: messages.imagePurpose,
         }).from(messages).where(eq(messages.clientRequestId, clientRequestId)).limit(1);
         if (existing) return { ...this.assertIdempotentMessage(existing, roomId, actor, idempotencyInput), outboxId: null };
       }
@@ -574,7 +710,10 @@ export class ChatService {
         assetKey: body.assetKey ?? null,
         replyToId: body.replyToId ?? null,
         canvasParentId: body.canvasParentId ?? null,
+        canvasRootId,
         canvasVersion,
+        imageDescription: imageDescription || null,
+        imagePurpose,
         clientRequestId,
         createdAt: now,
         expiresAt: guestContentExpiresAt,
@@ -604,11 +743,289 @@ export class ChatService {
     return { readAt: target.createdAt, messageId: target.id, sequence: target.sequence };
   }
 
+  async editMessage(roomId: string, messageId: string, actor: Actor, textInput: unknown) {
+    await this.actors.assertRoomAccess(roomId, actor);
+    const [message] = await this.db.select({
+      id: messages.id,
+      type: messages.type,
+      senderId: messages.senderId,
+      guestSessionId: messages.guestSessionId,
+      deletedAt: messages.deletedAt,
+    }).from(messages).where(and(eq(messages.id, messageId), eq(messages.roomId, roomId))).limit(1);
+    if (!message || message.deletedAt) throw new NotFoundException('The message is no longer editable.');
+    this.assertMessageOwner(message, actor);
+    const text = typeof textInput === 'string' ? textInput.trim() : '';
+    if (message.type === 'text' && !text) throw new BadRequestException('Messages cannot be empty.');
+    if (text.length > 2000) throw new BadRequestException('Content must be 2000 characters or fewer.');
+    const editedAt = Date.now();
+    const outboxId = await this.db.transaction(async (tx) => {
+      await tx.update(messages).set({ body: text || null, editedAt }).where(eq(messages.id, messageId));
+      return this.outbox.enqueue(tx, roomId, 'message.updated', { messageId, body: text, editedAt });
+    });
+    await this.outbox.deliverIds([outboxId]);
+    return { id: messageId, body: text || null, editedAt };
+  }
+
+  async deleteMessage(roomId: string, messageId: string, actor: Actor) {
+    await this.actors.assertRoomAccess(roomId, actor);
+    const deletedAt = Date.now();
+    const result = await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${roomId}, 0))`);
+      const [message] = await tx.select({
+        id: messages.id,
+        senderId: messages.senderId,
+        guestSessionId: messages.guestSessionId,
+        assetKey: messages.assetKey,
+        deletedAt: messages.deletedAt,
+      }).from(messages).where(and(eq(messages.id, messageId), eq(messages.roomId, roomId))).for('update').limit(1);
+      if (!message) throw new NotFoundException('The message no longer exists.');
+      this.assertMessageOwner(message, actor);
+      if (message.deletedAt) return { assetKey: null, outboxId: null };
+      if (message.assetKey) await tx.update(assets).set({ status: 'deleting' }).where(eq(assets.key, message.assetKey));
+      await tx.update(messages).set({ body: null, assetKey: null, deletedAt, editedAt: null }).where(eq(messages.id, messageId));
+      await tx.delete(reactions).where(eq(reactions.messageId, messageId));
+      const outboxId = await this.outbox.enqueue(tx, roomId, 'message.deleted', { messageId, deletedAt });
+      return { assetKey: message.assetKey, outboxId };
+    });
+    if (result.outboxId) await this.outbox.deliverIds([result.outboxId]);
+    if (result.assetKey) await this.assetService.deleteKeys([result.assetKey]);
+    return { id: messageId, deletedAt };
+  }
+
+  async undoMessage(roomId: string, messageId: string, actor: Actor) {
+    await this.actors.assertRoomAccess(roomId, actor);
+    const now = Date.now();
+    const result = await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${roomId}, 0))`);
+      const [message] = await tx.select({
+        id: messages.id,
+        sequence: messages.sequence,
+        senderId: messages.senderId,
+        guestSessionId: messages.guestSessionId,
+        assetKey: messages.assetKey,
+        createdAt: messages.createdAt,
+        deletedAt: messages.deletedAt,
+      }).from(messages).where(and(eq(messages.id, messageId), eq(messages.roomId, roomId))).for('update').limit(1);
+      if (!message || message.deletedAt) throw new NotFoundException('The contribution is no longer available.');
+      this.assertMessageOwner(message, actor);
+      if (now - message.createdAt > 10_000) throw new ConflictException('Undo Send has expired. Remove the contribution instead.');
+      const [reply, continuation, reaction, memberRead, guestRead] = await Promise.all([
+        tx.select({ id: messages.id }).from(messages).where(and(eq(messages.replyToId, messageId), isNull(messages.deletedAt))).limit(1),
+        tx.select({ id: messages.id }).from(messages).where(and(eq(messages.canvasParentId, messageId), isNull(messages.deletedAt))).limit(1),
+        tx.select({ id: reactions.messageId }).from(reactions).where(eq(reactions.messageId, messageId)).limit(1),
+        tx.select({ userId: roomMembers.userId }).from(roomMembers).where(and(eq(roomMembers.roomId, roomId), gt(roomMembers.lastReadSequence, message.sequence - 1), message.senderId ? ne(roomMembers.userId, message.senderId) : undefined)).limit(1),
+        tx.select({ id: guestSessions.id }).from(guestSessions).where(and(eq(guestSessions.roomId, roomId), gt(guestSessions.lastReadSequence, message.sequence - 1), message.guestSessionId ? ne(guestSessions.id, message.guestSessionId) : undefined)).limit(1),
+      ]);
+      if (reply.length || continuation.length || reaction.length || memberRead.length || guestRead.length) {
+        throw new ConflictException('This contribution was already seen or used. Remove it with the disclosed history instead.');
+      }
+      if (message.assetKey) await tx.update(assets).set({ status: 'deleting' }).where(eq(assets.key, message.assetKey));
+      await tx.delete(messages).where(eq(messages.id, messageId));
+      const outboxId = await this.outbox.enqueue(tx, roomId, 'message.deleted', { messageId, hard: true });
+      return { assetKey: message.assetKey, outboxId };
+    });
+    await this.outbox.deliverIds([result.outboxId]);
+    if (result.assetKey) await this.assetService.deleteKeys([result.assetKey]);
+    return { id: messageId, undone: true };
+  }
+
+  async listPeople(roomId: string, actor: Actor) {
+    await this.actors.assertRoomAccess(roomId, actor);
+    const now = Date.now();
+    const [room, memberRows, guestRows, ownMembership, blockedAccounts] = await Promise.all([
+      this.db.select({ id: rooms.id, kind: rooms.kind, createdBy: rooms.createdBy, allowGuests: rooms.allowGuests, inviteActive: rooms.inviteActive, inviteExpiresAt: rooms.inviteExpiresAt, inviteMaxUses: rooms.inviteMaxUses, inviteUseCount: rooms.inviteUseCount }).from(rooms).where(eq(rooms.id, roomId)).limit(1),
+      this.db.select({ id: users.id, displayName: users.displayName, avatarColor: users.avatarColor, role: roomMembers.role, joinedAt: roomMembers.joinedAt })
+        .from(roomMembers).innerJoin(users, eq(users.id, roomMembers.userId)).where(eq(roomMembers.roomId, roomId)).orderBy(asc(roomMembers.joinedAt)),
+      this.db.select({ id: guestSessions.id, displayName: guestSessions.displayName, joinedAt: guestSessions.createdAt })
+        .from(guestSessions).where(and(eq(guestSessions.roomId, roomId), gt(guestSessions.expiresAt, now))).orderBy(asc(guestSessions.createdAt)),
+      actor.kind === 'user'
+        ? this.db.select({ role: roomMembers.role, mutedAt: roomMembers.mutedAt }).from(roomMembers).where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, actor.id))).limit(1)
+        : this.db.select({ mutedAt: guestSessions.mutedAt }).from(guestSessions).where(and(eq(guestSessions.roomId, roomId), eq(guestSessions.id, actor.id))).limit(1),
+      actor.kind === 'user' ? this.db.select({ id: users.id, displayName: users.displayName, avatarColor: users.avatarColor }).from(userBlocks).innerJoin(users, eq(users.id, userBlocks.blockedId)).where(eq(userBlocks.blockerId, actor.id)).orderBy(asc(users.displayName)) : Promise.resolve([]),
+    ]);
+    if (!room[0]) throw new NotFoundException('The conversation no longer exists.');
+    return {
+      members: [
+        ...memberRows.map((member) => ({ ...member, kind: 'user' as const })),
+        ...guestRows.map((guest) => ({ ...guest, kind: 'guest' as const, avatarColor: null, role: 'guest' as const })),
+      ],
+      currentRole: actor.kind === 'user' ? ownMembership[0] && 'role' in ownMembership[0] ? ownMembership[0].role : null : 'guest',
+      muted: Boolean(ownMembership[0]?.mutedAt),
+      allowGuests: room[0].allowGuests,
+      canManage: actor.kind === 'user' && ownMembership[0] && 'role' in ownMembership[0] && ownMembership[0].role === 'owner',
+      kind: room[0].kind,
+      inviteActive: room[0].inviteActive,
+      inviteExpiresAt: room[0].inviteExpiresAt,
+      inviteMaxUses: room[0].inviteMaxUses,
+      inviteUseCount: room[0].inviteUseCount,
+      blockedAccounts,
+    };
+  }
+
+  async updateRoomGovernance(roomId: string, actor: Actor, body: { allowGuests?: unknown; inviteActive?: unknown; inviteExpiresInHours?: unknown; inviteMaxUses?: unknown }) {
+    const membership = await this.requireRoomOwner(roomId, actor);
+    if (membership.kind === 'direct') throw new BadRequestException('Direct conversations do not use guest invites.');
+    const patch: Partial<typeof rooms.$inferInsert> = {};
+    if (typeof body.allowGuests === 'boolean') patch.allowGuests = body.allowGuests;
+    if (typeof body.inviteActive === 'boolean') patch.inviteActive = body.inviteActive;
+    if (body.inviteExpiresInHours !== undefined) {
+      const hours = Number(body.inviteExpiresInHours);
+      patch.inviteExpiresAt = Number.isFinite(hours) && hours > 0 ? Date.now() + Math.min(hours, 24 * 30) * 60 * 60 * 1000 : null;
+    }
+    if (body.inviteMaxUses !== undefined) {
+      const maxUses = Number(body.inviteMaxUses);
+      patch.inviteMaxUses = Number.isInteger(maxUses) && maxUses > 0 ? Math.min(maxUses, 1000) : null;
+      patch.inviteUseCount = 0;
+    }
+    if (!Object.keys(patch).length) throw new BadRequestException('No conversation setting was changed.');
+    if (body.inviteActive === true) {
+      patch.inviteCode = this.makeCode();
+      patch.inviteUseCount = 0;
+    }
+    const [updated] = await this.db.update(rooms).set(patch).where(eq(rooms.id, roomId)).returning();
+    return updated;
+  }
+
+  async updateRoomPreferences(roomId: string, actor: Actor, body: { muted?: unknown }) {
+    await this.actors.assertRoomAccess(roomId, actor);
+    if (typeof body.muted !== 'boolean') throw new BadRequestException('The mute preference is invalid.');
+    const mutedAt = body.muted ? Date.now() : null;
+    const updated = actor.kind === 'user'
+      ? await this.db.update(roomMembers).set({ mutedAt }).where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, actor.id))).returning({ roomId: roomMembers.roomId })
+      : await this.db.update(guestSessions).set({ mutedAt }).where(and(eq(guestSessions.roomId, roomId), eq(guestSessions.id, actor.id), gt(guestSessions.expiresAt, Date.now()))).returning({ roomId: guestSessions.roomId });
+    if (!updated.length) throw new UnauthorizedException('You no longer have access to this conversation.');
+    return { muted: body.muted };
+  }
+
+  async revokeInvite(roomId: string, actor: Actor) {
+    const membership = await this.requireRoomOwner(roomId, actor);
+    if (membership.kind === 'direct') throw new BadRequestException('Direct conversations do not use public invite links.');
+    const outboxId = await this.db.transaction(async (tx) => {
+      await tx.update(rooms).set({ inviteActive: false }).where(eq(rooms.id, roomId));
+      return this.outbox.enqueue(tx, roomId, 'room.updated', { inviteRevoked: true });
+    });
+    await this.outbox.deliverIds([outboxId]);
+    return { inviteActive: false };
+  }
+
+  async transferOwnership(roomId: string, userId: string, actor: Actor) {
+    await this.requireRoomOwner(roomId, actor);
+    if (actor.kind !== 'user' || userId === actor.id) throw new BadRequestException('Choose another signed-in member.');
+    await this.db.transaction(async (tx) => {
+      const [target] = await tx.select({ id: roomMembers.userId }).from(roomMembers).where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, userId), eq(roomMembers.role, 'member'))).for('update').limit(1);
+      if (!target) throw new BadRequestException('The new owner must be a signed-in member.');
+      await tx.update(roomMembers).set({ role: 'member' }).where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, actor.id)));
+      await tx.update(roomMembers).set({ role: 'owner' }).where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, userId)));
+      await tx.update(rooms).set({ createdBy: userId }).where(eq(rooms.id, roomId));
+    });
+    return { ownerId: userId };
+  }
+
+  async removeGuest(roomId: string, guestId: string, actor: Actor) {
+    await this.requireRoomOwner(roomId, actor);
+    const [guest] = await this.db.select({ id: guestSessions.id }).from(guestSessions).where(and(eq(guestSessions.id, guestId), eq(guestSessions.roomId, roomId))).limit(1);
+    if (!guest) throw new NotFoundException('That guest session is no longer active.');
+    await this.endGuestById(guestId);
+    return { removed: true };
+  }
+
+  async archiveRoom(roomId: string, actor: Actor, archivedInput: unknown) {
+    if (actor.kind !== 'user') throw new UnauthorizedException('Sign in to archive conversations.');
+    await this.actors.assertRoomAccess(roomId, actor);
+    const archived = archivedInput !== false;
+    await this.db.update(roomMembers).set({ archivedAt: archived ? Date.now() : null }).where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, actor.id)));
+    return { archived };
+  }
+
+  async deleteRoom(roomId: string, actor: Actor) {
+    await this.requireRoomOwner(roomId, actor);
+    const assetRows = await this.db.select({ key: assets.key }).from(assets).where(eq(assets.roomId, roomId));
+    await this.db.delete(rooms).where(eq(rooms.id, roomId));
+    await this.assetService.deleteKeys(assetRows.map((asset) => asset.key));
+    return { deleted: true, removedAssets: assetRows.length };
+  }
+
+  async removeMember(roomId: string, userId: string, actor: Actor) {
+    await this.requireRoomOwner(roomId, actor);
+    if (actor.kind === 'user' && userId === actor.id) throw new BadRequestException('Use Leave conversation to remove yourself.');
+    const removed = await this.db.transaction(async (tx) => {
+      const rows = await tx.delete(roomMembers).where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, userId), eq(roomMembers.role, 'member'))).returning({ userId: roomMembers.userId });
+      if (!rows.length) throw new NotFoundException('That member is no longer in the conversation.');
+      const outboxId = await this.outbox.enqueue(tx, roomId, 'room.updated', { removedMemberId: userId });
+      return { outboxId };
+    });
+    await this.outbox.deliverIds([removed.outboxId]);
+    return { removed: true };
+  }
+
+  async leaveRoom(roomId: string, actor: Actor) {
+    if (actor.kind !== 'user') throw new BadRequestException('End the guest session to leave this conversation.');
+    await this.actors.assertRoomAccess(roomId, actor);
+    const result = await this.db.transaction(async (tx) => {
+      const [membership] = await tx.select({ role: roomMembers.role }).from(roomMembers).where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, actor.id))).for('update').limit(1);
+      if (!membership) throw new NotFoundException('You are no longer in this conversation.');
+      if (membership.role === 'owner') throw new BadRequestException('An owner must remove the conversation or transfer ownership before leaving.');
+      await tx.delete(roomMembers).where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, actor.id)));
+      return this.outbox.enqueue(tx, roomId, 'room.updated', { leftMemberId: actor.id });
+    });
+    await this.outbox.deliverIds([result]);
+    return { left: true };
+  }
+
+  async reportRoom(roomId: string, actor: Actor, body: { reason?: unknown; details?: unknown; reportedUserId?: unknown; messageId?: unknown }) {
+    await this.actors.assertRoomAccess(roomId, actor);
+    const allowedReasons = new Set(['spam', 'harassment', 'unsafe-content', 'impersonation', 'other']);
+    const reason = typeof body.reason === 'string' ? body.reason : '';
+    if (!allowedReasons.has(reason)) throw new BadRequestException('Choose a valid report reason.');
+    const details = typeof body.details === 'string' ? body.details.trim().slice(0, 1000) : null;
+    const reportedUserId = typeof body.reportedUserId === 'string' ? body.reportedUserId : null;
+    const messageId = typeof body.messageId === 'string' ? body.messageId : null;
+    if (reportedUserId) {
+      const [member] = await this.db.select({ userId: roomMembers.userId }).from(roomMembers).where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, reportedUserId))).limit(1);
+      if (!member) throw new BadRequestException('The reported member is not in this conversation.');
+    }
+    if (messageId) {
+      const [message] = await this.db.select({ id: messages.id }).from(messages).where(and(eq(messages.roomId, roomId), eq(messages.id, messageId))).limit(1);
+      if (!message) throw new BadRequestException('The reported message is not in this conversation.');
+    }
+    const [report] = await this.db.insert(roomReports).values({
+      roomId,
+      reporterId: actor.kind === 'user' ? actor.id : null,
+      guestSessionId: actor.kind === 'guest' ? actor.id : null,
+      reportedUserId,
+      messageId,
+      reason,
+      details,
+      createdAt: Date.now(),
+    }).returning({ id: roomReports.id });
+    return { id: report.id, received: true };
+  }
+
+  async blockUser(userId: string, actor: Actor) {
+    if (actor.kind !== 'user') throw new UnauthorizedException('Sign in to block members.');
+    if (userId === actor.id) throw new BadRequestException('You cannot block yourself.');
+    const [target] = await this.db.select({ id: users.id }).from(users).where(eq(users.id, userId)).limit(1);
+    if (!target) throw new NotFoundException('That member no longer exists.');
+    await this.db.insert(userBlocks).values({ blockerId: actor.id, blockedId: userId, createdAt: Date.now() })
+      .onConflictDoNothing({ target: [userBlocks.blockerId, userBlocks.blockedId] });
+    return { blocked: true };
+  }
+
+  async unblockUser(userId: string, actor: Actor) {
+    if (actor.kind !== 'user') throw new UnauthorizedException('Sign in to manage blocked accounts.');
+    await this.db.delete(userBlocks).where(and(eq(userBlocks.blockerId, actor.id), eq(userBlocks.blockedId, userId)));
+    return { blocked: false };
+  }
+
   async toggleReaction(messageId: string, actor: Actor, emoji: string) {
     if (!EMOJIS.includes(emoji)) throw new BadRequestException('The reaction is invalid.');
-    const [message] = await this.db.select({ roomId: messages.roomId }).from(messages).where(eq(messages.id, messageId)).limit(1);
+    const [message] = await this.db.select({ roomId: messages.roomId, senderId: messages.senderId }).from(messages).where(eq(messages.id, messageId)).limit(1);
     if (!message) throw new NotFoundException('The message no longer exists.');
     await this.actors.assertRoomAccess(message.roomId, actor);
+    if (actor.kind === 'user' && message.senderId) {
+      const [blocked] = await this.db.select({ blockerId: userBlocks.blockerId }).from(userBlocks).where(or(and(eq(userBlocks.blockerId, actor.id), eq(userBlocks.blockedId, message.senderId)), and(eq(userBlocks.blockerId, message.senderId), eq(userBlocks.blockedId, actor.id)))).limit(1);
+      if (blocked) throw new BadRequestException('Reactions are unavailable across a block boundary.');
+    }
     const result = await this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`${messageId}:${actor.actorKey}:${emoji}`}, 0))`);
       if (actor.kind === 'guest') {
@@ -709,7 +1126,7 @@ export class ChatService {
     clientRequestId: string,
     roomId: string,
     actor: Actor,
-    input: { type: string; body: string | null; assetKey: string | null; replyToId: string | null; canvasParentId: string | null },
+    input: { type: string; body: string | null; assetKey: string | null; replyToId: string | null; canvasParentId: string | null; imageDescription: string | null; imagePurpose: 'creative' | 'reference' },
   ) {
     const [existing] = await this.db.select({
       id: messages.id,
@@ -724,6 +1141,8 @@ export class ChatService {
       assetKey: messages.assetKey,
       replyToId: messages.replyToId,
       canvasParentId: messages.canvasParentId,
+      imageDescription: messages.imageDescription,
+      imagePurpose: messages.imagePurpose,
     }).from(messages).where(eq(messages.clientRequestId, clientRequestId)).limit(1);
     return existing ? this.assertIdempotentMessage(existing, roomId, actor, input) : null;
   }
@@ -732,19 +1151,34 @@ export class ChatService {
     message: {
       id: string; roomId: string; senderId: string | null; guestSessionId: string | null; sequence: number;
       createdAt: number; canvasVersion: number | null; type: string; body: string | null; assetKey: string | null;
-      replyToId: string | null; canvasParentId: string | null;
+      replyToId: string | null; canvasParentId: string | null; imageDescription: string | null; imagePurpose: 'creative' | 'reference';
     },
     roomId: string,
     actor: Actor,
-    input: { type: string; body: string | null; assetKey: string | null; replyToId: string | null; canvasParentId: string | null },
+    input: { type: string; body: string | null; assetKey: string | null; replyToId: string | null; canvasParentId: string | null; imageDescription: string | null; imagePurpose: 'creative' | 'reference' },
   ) {
     const owned = message.roomId === roomId && (actor.kind === 'user' ? message.senderId === actor.id : message.guestSessionId === actor.id);
     if (!owned) throw new BadRequestException('The duplicate-prevention key belongs to another request.');
     if (message.type !== input.type || message.body !== input.body || message.assetKey !== input.assetKey
-      || message.replyToId !== input.replyToId || message.canvasParentId !== input.canvasParentId) {
+      || message.replyToId !== input.replyToId || message.canvasParentId !== input.canvasParentId
+      || message.imageDescription !== input.imageDescription || message.imagePurpose !== input.imagePurpose) {
       throw new BadRequestException('The duplicate-prevention key cannot be reused for different content.');
     }
     return { id: message.id, sequence: message.sequence, createdAt: message.createdAt, canvasVersion: message.canvasVersion };
+  }
+
+  private assertMessageOwner(message: { senderId: string | null; guestSessionId: string | null }, actor: Actor) {
+    const owned = actor.kind === 'user' ? message.senderId === actor.id : message.guestSessionId === actor.id;
+    if (!owned) throw new UnauthorizedException('Only the creator can change this contribution.');
+  }
+
+  private async requireRoomOwner(roomId: string, actor: Actor) {
+    if (actor.kind !== 'user') throw new UnauthorizedException('Only the conversation owner can manage members and invites.');
+    const [membership] = await this.db.select({ role: roomMembers.role, kind: rooms.kind }).from(roomMembers)
+      .innerJoin(rooms, eq(rooms.id, roomMembers.roomId))
+      .where(and(eq(roomMembers.roomId, roomId), eq(roomMembers.userId, actor.id))).limit(1);
+    if (!membership || membership.role !== 'owner') throw new UnauthorizedException('Only the conversation owner can manage members and invites.');
+    return membership;
   }
 
   private makeCode(length = 20) { return crypto.randomUUID().replaceAll('-', '').slice(0, length); }

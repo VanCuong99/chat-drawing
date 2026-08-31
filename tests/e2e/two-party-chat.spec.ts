@@ -14,7 +14,7 @@ async function startGuest(page: Page, name: string, inviteUrl = '/') {
   const response = await created;
   expect(response.status()).toBe(200);
   const body = await response.json() as { sessionId: string; roomId: string };
-  await expect(page.getByText('Đã đồng bộ')).toBeVisible();
+  await expect(page.getByText(/Vừa đồng bộ|Đã đồng bộ/)).toBeVisible();
   return body;
 }
 
@@ -88,7 +88,7 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     await expect(bobOnAlice.locator('.reaction-list').getByRole('button', { name: /❤️.*1/ })).toBeVisible();
 
     await contextB.setOffline(true);
-    await expect(pageB.getByText('Đang kết nối lại')).toBeVisible();
+    await expect(pageB.getByText(/Ngoại tuyến|Đang kết nối lại/)).toBeVisible();
     const missedWhileOffline = `Tin gửi lúc Bob offline ${stamp}`;
     await sendText(pageA, missedWhileOffline);
     const missedOnBob = pageB.getByRole('article').filter({ hasText: missedWhileOffline });
@@ -96,7 +96,7 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     await contextB.setOffline(false);
     await expect(missedOnBob).toBeVisible({ timeout: 15_000 });
     await expect(missedOnBob).toHaveCount(1);
-    await expect(pageB.getByText('Đã đồng bộ')).toBeVisible({ timeout: 15_000 });
+    await expect(pageB.getByText(/Vừa đồng bộ|Đã đồng bộ/)).toBeVisible({ timeout: 15_000 });
 
     const other = await request.post(`${API_URL}/guest`, { data: { displayName: `Phòng khác ${stamp}` } });
     expect(other.status()).toBe(200);
@@ -106,7 +106,7 @@ test('hai guest chat hai chiều, reply/reaction/read, offline catch-up và kế
     const otherBootstrap = await request.get(`${API_URL}/bootstrap`, { headers: { 'x-net-guest-session': otherSession } });
     const otherRoom = ((await otherBootstrap.json()).rooms as Array<{ inviteCode: string }>)[0];
     await pageB.goto(`/?room=${otherRoom.inviteCode}`);
-    await expect(pageB.getByRole('status')).toContainText('Bạn đang ở trong một phiên khách khác');
+    await expect(pageB.getByRole('status').filter({ hasText: 'Bạn đang ở trong một phiên khách khác' })).toBeVisible();
     await expect(pageB.locator('.message-bubble').getByText(fromAlice, { exact: true })).toBeVisible();
 
     await pageB.reload();

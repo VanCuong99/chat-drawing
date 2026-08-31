@@ -15,8 +15,15 @@ export type RoomView = {
   preview: string;
   lastActivity: number;
   unreadCount: number;
+  firstUnreadSequence: number | null;
+  lastReadSequence: number;
+  muted: boolean;
   messageCount: number;
   mediaCount: number;
+  inviteActive: boolean;
+  inviteExpiresAt: number | null;
+  inviteMaxUses: number | null;
+  inviteUseCount: number;
 };
 
 export type ReactionView = { emoji: string; count: number; reacted: boolean };
@@ -45,15 +52,49 @@ export type MessageView = {
   body: string | null;
   assetKey: string | null;
   assetUrl: string | null;
+  imageDescription: string | null;
+  imagePurpose: 'creative' | 'reference';
   replyToId: string | null;
   canvasParentId: string | null;
+  canvasRootId: string | null;
   canvasVersion: number | null;
+  lineageRoot: { id: string; type: 'image' | 'canvas'; senderName: string; deletedAt: number | null } | null;
+  continuationCount: number;
   createdAt: number;
   editedAt: number | null;
+  deletedAt: number | null;
   readCount: number;
   reactions: ReactionView[];
+  visualStatus: 'exploring' | 'needs_changes' | 'selected';
+  decisionNote: string | null;
+  decisionOwnerId: string | null;
+  decidedAt: number | null;
+  blockedAuthor: boolean;
 };
 
 export type CanvasLineageItem = Pick<MessageView,
-  'id' | 'sequence' | 'roomId' | 'senderName' | 'body' | 'assetKey' | 'assetUrl' | 'canvasParentId' | 'canvasVersion' | 'createdAt'
->;
+  'id' | 'sequence' | 'roomId' | 'senderName' | 'type' | 'body' | 'assetKey' | 'assetUrl' | 'canvasParentId' | 'canvasVersion' | 'createdAt' | 'deletedAt' | 'visualStatus' | 'decisionNote' | 'decisionOwnerId' | 'decidedAt'
+> & { voteCount: number; voted: boolean };
+
+export type RoomPersonView = {
+  id: string;
+  kind: 'user' | 'guest';
+  displayName: string;
+  avatarColor: string | null;
+  role: 'owner' | 'member' | 'guest';
+  joinedAt: number;
+};
+
+export type RoomPeopleView = {
+  members: RoomPersonView[];
+  currentRole: 'owner' | 'member' | 'guest' | null;
+  muted: boolean;
+  allowGuests: boolean;
+  canManage: boolean;
+  kind: string;
+  inviteActive: boolean;
+  inviteExpiresAt: number | null;
+  inviteMaxUses: number | null;
+  inviteUseCount: number;
+  blockedAccounts?: Array<{ id: string; displayName: string; avatarColor: string }>;
+};
