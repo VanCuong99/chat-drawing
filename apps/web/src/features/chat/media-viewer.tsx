@@ -1,6 +1,6 @@
 'use client';
 
-import { type CSSProperties, type KeyboardEvent, type MouseEvent as ReactMouseEvent, useEffect, useState } from 'react';
+import { type CSSProperties, type KeyboardEvent, type MouseEvent as ReactMouseEvent, useEffect, useRef, useState } from 'react';
 import AppDialog from '@/src/shared/app-dialog';
 import type { MessageView } from '@/src/shared/chat.types';
 import { useLanguage } from '@/src/i18n/language-provider';
@@ -34,6 +34,7 @@ export default function MediaViewer({
   onRefresh: (assetKey: string) => void;
 }) {
   const { t } = useLanguage();
+  const titleRef = useRef<HTMLHeadingElement>(null);
   const [zoom, setZoom] = useState(100);
   const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
   const [imageSize, setImageSize] = useState({ width: 1200, height: 720 });
@@ -50,6 +51,12 @@ export default function MediaViewer({
       window.removeEventListener('resize', updateViewport);
     };
   }, []);
+
+  useEffect(() => {
+    if (!message?.assetUrl) return;
+    const frame = requestAnimationFrame(() => titleRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [message?.assetUrl]);
 
   if (!message?.assetUrl) return null;
   const title = message.type === 'canvas' ? t('Drawing Version {version}', { version: message.canvasVersion ?? 1 }) : t('Image in the Conversation');
@@ -85,14 +92,16 @@ export default function MediaViewer({
       <section className="media-viewer" onKeyDown={handleKeyboard}>
         <header className="media-viewer-header">
           <div>
-            <h2 id="media-viewer-title" tabIndex={-1} autoFocus>{title}</h2>
+            <h2 id="media-viewer-title" ref={titleRef} tabIndex={-1}>{title}</h2>
             <p>{message.senderName} · {t('use +/− to zoom')}</p>
           </div>
           <div className="media-viewer-actions">
-            <button type="button" onClick={() => changeZoom(zoom - ZOOM_STEP)} disabled={zoom <= MIN_ZOOM} aria-label={t('Zoom image out')} data-tooltip={t('Zoom Out')} data-tooltip-placement="below"><MediaIcon name="minus" /></button>
-            <output aria-label={t('Zoom level')} aria-live="polite">{zoom}%</output>
-            <button type="button" onClick={() => changeZoom(zoom + ZOOM_STEP)} disabled={zoom >= MAX_ZOOM} aria-label={t('Zoom image in')} data-tooltip={t('Zoom In')} data-tooltip-placement="below"><MediaIcon name="plus" /></button>
-            <button type="button" onClick={() => changeZoom(100)} disabled={zoom === 100} aria-label={t('Reset image size')} data-tooltip={t('Fit to Screen')} data-tooltip-placement="below"><MediaIcon name="reset" /></button>
+            <div className="media-zoom-group" role="group" aria-label={t('Zoom level')}>
+              <button type="button" onClick={() => changeZoom(zoom - ZOOM_STEP)} disabled={zoom <= MIN_ZOOM} aria-label={t('Zoom image out')} data-tooltip={t('Zoom Out')} data-tooltip-placement="below"><MediaIcon name="minus" /></button>
+              <output aria-label={t('Zoom level')} aria-live="polite">{zoom}%</output>
+              <button type="button" onClick={() => changeZoom(zoom + ZOOM_STEP)} disabled={zoom >= MAX_ZOOM} aria-label={t('Zoom image in')} data-tooltip={t('Zoom In')} data-tooltip-placement="below"><MediaIcon name="plus" /></button>
+              <button type="button" onClick={() => changeZoom(100)} disabled={zoom === 100} aria-label={t('Reset image size')} data-tooltip={t('Fit to Screen')} data-tooltip-placement="below"><MediaIcon name="reset" /></button>
+            </div>
             <button type="button" className="media-download-button" onClick={() => void onDownload(message)} disabled={downloading} aria-label={downloading ? t('Downloading image') : t('Download image')} data-tooltip={downloading ? t('Downloading…') : t('Download Image')} data-tooltip-placement="below"><MediaIcon name="download" /><span>{downloading ? t('Downloading…') : t('Download')}</span></button>
             <button type="button" className="media-close-button" onClick={onClose} aria-label={t('Close image viewer')} data-tooltip={t('Close')} data-tooltip-placement="below"><MediaIcon name="close" /></button>
           </div>

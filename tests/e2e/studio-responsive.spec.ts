@@ -75,13 +75,13 @@ test('Studio không bị cắt ở màn hình ngang thấp và mobile @critical'
   expect(Math.abs(mixerBox!.width - 390)).toBeLessThan(0.5);
   expect(Math.abs(mixerBox!.height - 844)).toBeLessThan(0.5);
   await expect(mixer.getByRole('button', { name: 'Dùng màu' })).toBeInViewport();
-  await expect(mixer.getByRole('button', { name: 'Lưu trong phiên' })).toBeInViewport();
+  await expect(mixer.getByText('Lưu vào bảng màu')).toBeInViewport();
   await mixer.getByRole('button', { name: 'Đóng pha màu nâng cao' }).click();
   await page.locator('.tool-inspector').getByRole('button', { name: 'Đóng cài đặt công cụ' }).click();
   await studio.locator('.studio-header').getByRole('button', { name: /Đóng/ }).click();
   await page.getByRole('button', { name: 'Thêm thao tác cuộc trò chuyện' }).click();
   await page.getByRole('button', { name: 'Tìm trong tin nhắn' }).click();
-  await expect(page.getByRole('textbox', { name: 'Tìm nội dung tin nhắn' })).toBeVisible();
+  await expect(page.getByRole('searchbox', { name: 'Tìm nội dung tin nhắn' })).toBeVisible();
   await page.getByRole('button', { name: 'Đóng tìm kiếm' }).click();
   await page.getByRole('button', { name: 'Mở danh sách trò chuyện' }).click();
   await page.getByRole('button', { name: 'Kết thúc phiên khách' }).click();

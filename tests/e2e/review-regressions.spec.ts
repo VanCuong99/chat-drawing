@@ -1261,6 +1261,8 @@ test('lịch sử bản vẽ cho phép so sánh và tiếp tục từ bất kỳ
     const title = element.querySelector('h2');
     const close = element.querySelector<HTMLButtonElement>('.dialog-close');
     const metadata = element.querySelector<HTMLElement>('.lineage-filmstrip small');
+    const footer = element.querySelector<HTMLElement>('.lineage-footer');
+    const decisionActions = [...element.querySelectorAll<HTMLElement>('.lineage-decision-actions button')];
     return {
       width: bounds.width,
       height: bounds.height,
@@ -1269,6 +1271,8 @@ test('lịch sử bản vẽ cho phép so sánh và tiếp tục từ bất kỳ
       closeWidth: close?.getBoundingClientRect().width ?? 0,
       closeIconWidth: close?.querySelector('svg')?.getBoundingClientRect().width ?? 0,
       metadataSize: metadata ? Number.parseFloat(getComputedStyle(metadata).fontSize) : 0,
+      footerHeight: footer?.getBoundingClientRect().height ?? 99,
+      decisionActionHeights: decisionActions.map((button) => button.getBoundingClientRect().height),
     };
   });
   expect(lineageGeometry.width).toBe(390);
@@ -1278,6 +1282,8 @@ test('lịch sử bản vẽ cho phép so sánh và tiếp tục từ bất kỳ
   expect(lineageGeometry.closeWidth).toBeGreaterThanOrEqual(44);
   expect(lineageGeometry.closeIconWidth).toBe(18);
   expect(lineageGeometry.metadataSize).toBeGreaterThanOrEqual(12);
+  expect(lineageGeometry.footerHeight).toBeLessThanOrEqual(64);
+  expect(lineageGeometry.decisionActionHeights.every((height) => height >= 44)).toBe(true);
   await expect(dialog.getByText('3 phiên bản')).toBeVisible();
   await expect(dialog.getByRole('img', { name: 'Bản vẽ phiên bản 3 của Review User' })).toBeVisible();
   await expect(dialog.getByRole('combobox', { name: 'So sánh với' })).toHaveCount(0);
@@ -1333,6 +1339,7 @@ test('lịch sử chỉ có một phiên bản không hiển thị hành động
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole('button', { name: 'So sánh phiên bản' })).toHaveCount(0);
   await expect(dialog.getByRole('combobox', { name: 'So sánh với' })).toHaveCount(0);
+  await expect(dialog.locator('.lineage-filmstrip')).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: /Vẽ tiếp từ phiên bản 1/ })).toBeVisible();
 });
 

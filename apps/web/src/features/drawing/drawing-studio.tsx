@@ -81,7 +81,6 @@ const PAPER_FORMATS: Array<{ id: Exclude<PaperFormat, 'freeform'>; label: string
 const INITIAL_MIXER_COMPONENTS: MixerPigment[] = [
   { id: 'pigment-1', color: '#FCF046', weight: 1 },
   { id: 'pigment-2', color: '#E53166', weight: 1 },
-  { id: 'pigment-3', color: '#3375DA', weight: 1 },
 ];
 const ADDED_PIGMENT_COLORS = ['#FCD200', '#002185', '#EF7668', '#3AA694', '#D34D8B', '#E19A3F'];
 const FILL_MATERIALS: Array<{ id: FillMaterial; label: string; description: string }> = [
@@ -948,7 +947,7 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, source
   const [sourceVisible, setSourceVisible] = useState(true);
   const [sourceOpacity, setSourceOpacity] = useState(1);
   const [sourcePlacement, setSourcePlacement] = useState<SourcePlacement>('fit');
-  const [hint, setHint] = useState(() => t('Drag on the paper to begin'));
+  const [hint, setHint] = useState(() => t('Draw to begin'));
   const [gestureCoachOpen, setGestureCoachOpen] = useState(false);
   const actions = history.present.actions;
   const paper = history.present.paper;
@@ -2047,7 +2046,7 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, source
                 <section id="pigment-mixer" className="pigment-mixer" role="region" aria-label={t('Advanced Color Mixing')}>
                   <div className="mixer-heading"><div><small>{t('Advanced Color Mixing')}</small><strong>{t('Mix Multiple Colors')}</strong></div><button type="button" onClick={() => closeMixer(true)} aria-label={t('Close advanced color mixing')} data-tooltip={t('Close Mixer')} data-tooltip-placement="below">×</button></div>
                   <div className="mixer-preview-sticky">
-                    <div className="mixed-result"><span style={{ background: mixedColor }} aria-hidden="true" /><div><small>{t('Mixed Color')}</small><strong>{mixedColor}</strong></div><output>{t('{count} components', { count: mixerComponents.length })}</output></div>
+                    <div className="mixed-result"><span style={{ background: mixedColor }} aria-hidden="true" /><div><small>{t('Digital approximation')}</small><strong>{t('Mixed Color')}</strong></div><output>{t('{count} colors', { count: mixerComponents.length })}</output></div>
                     <div className="mixture-composition" aria-label={t('Normalized proportions')}>{mixerComponents.map((component, index) => <i key={component.id} style={{ background: component.color, width: `${mixerPercentages[index]}%` }} title={t('Color {number}: {percentage}%', { number: index + 1, percentage: mixerPercentages[index] })} />)}</div>
                   </div>
                   <div className="pigment-components" role="list" aria-label={t('Component colors')}>
@@ -2055,20 +2054,19 @@ export default function DrawingStudio({ sourceUrl, sourceIsDraft = false, source
                       <article key={component.id} className="pigment-component" role="listitem">
                         <header><strong>{t('Color {number}', { number: index + 1 })}</strong><output>{mixerPercentages[index]}%</output><button type="button" onClick={() => removeMixerComponent(component.id)} disabled={mixerComponents.length <= 2} aria-label={t('Remove color {number}', { number: index + 1 })}>×</button></header>
                         <div>
-                          <label className="pigment-color-input"><input type="color" value={component.color} onChange={(event) => updateMixerComponent(component.id, { color: event.target.value.toUpperCase() })} aria-label={t('Color {number}', { number: index + 1 })} /><span style={{ background: component.color }} aria-hidden="true" /><output>{component.color.toUpperCase()}</output></label>
-                          <label className="pigment-weight-input"><span>{t('Parts')}</span><input type="number" min="1" max="100" step="1" value={component.weight} onChange={(event) => updateMixerComponent(component.id, { weight: Math.max(1, Math.min(100, Math.round(Number(event.target.value) || 1))) })} aria-label={t('Parts for color {number}', { number: index + 1 })} /></label>
+                          <label className="pigment-color-input"><input type="color" value={component.color} onChange={(event) => updateMixerComponent(component.id, { color: event.target.value.toUpperCase() })} aria-label={t('Color {number}', { number: index + 1 })} /><span style={{ background: component.color }} aria-hidden="true" /><output className="pigment-color-name">{t('Choose Color')}</output></label>
+                          <label className="pigment-weight-input"><span>{t('Amount')}</span><input type="range" min="1" max="100" step="1" value={component.weight} onChange={(event) => updateMixerComponent(component.id, { weight: Number(event.target.value) })} aria-label={t('Amount for color {number}', { number: index + 1 })} style={rangeStyle(component.weight, 1, 100)} /></label>
                         </div>
                       </article>
                     ))}
                   </div>
                   <button type="button" className="add-pigment" onClick={addMixerComponent} disabled={mixerComponents.length >= MAX_PIGMENT_COMPONENTS} aria-label={t('Add component color')}>＋ {t('Add Color')} <span>{mixerComponents.length}/{MAX_PIGMENT_COMPONENTS}</span></button>
-                  <p className="mix-parts-note">{t('Add 2 to 12 colors. Parts describe each color’s contribution; Nét converts them to percentages automatically.')}</p>
+                  <p className="mix-parts-note">{t('Add 2 to 12 colors. Adjust each amount and Nét converts the mix to percentages automatically.')}</p>
                   <div className="mixer-footer-actions">
                     <button type="button" className="use-mixed-color" onClick={() => applyPaletteColor(mixedColor)}>{t('Use Color')}</button>
-                    <label className="mix-name" htmlFor="mixed-color-name">{t('Palette Name')}<input id="mixed-color-name" name="mixed-color-name" autoComplete="off" value={mixerName} onChange={(event) => setMixerName(event.target.value)} maxLength={40} placeholder={t('Mixed color {number}…', { number: paletteColors.length + 1 })} aria-label={t('Mixed color name')} /></label>
-                    <button type="button" className="save-mixed-color" onClick={() => void saveMixedColor()} disabled={paletteLoading || paletteMutating || paletteSaving || paletteColors.length >= 24}>{paletteLoading ? t('Opening palette…') : paletteMutating || paletteSaving ? t('Saving…') : paletteColors.length >= 24 ? t('Palette is full at 24 colors') : palettePersistence === 'account' ? t('Save to Account') : t('Save for Session')}</button>
+                    <details className="mixer-save-disclosure"><summary>{t('Save to Palette')}</summary><label className="mix-name" htmlFor="mixed-color-name">{t('Palette Name')}<input id="mixed-color-name" name="mixed-color-name" autoComplete="off" value={mixerName} onChange={(event) => setMixerName(event.target.value)} maxLength={40} placeholder={t('Mixed color {number}…', { number: paletteColors.length + 1 })} aria-label={t('Mixed color name')} /></label><button type="button" className="save-mixed-color" onClick={() => void saveMixedColor()} disabled={paletteLoading || paletteMutating || paletteSaving || paletteColors.length >= 24}>{paletteLoading ? t('Opening palette…') : paletteMutating || paletteSaving ? t('Saving…') : paletteColors.length >= 24 ? t('Palette is full at 24 colors') : palettePersistence === 'account' ? t('Save to Account') : t('Save for Session')}</button></details>
                   </div>
-                  <details className="pigment-details"><summary>{t('About Color Simulation')}</summary><p className="pigment-note">{t('This is an approximate multi-color Kubelka–Munk simulation derived from sRGB/D65. Ratios are model inputs, not physical recipes. Accurate paint or ink prediction requires measured K/S data for each pigment, binder, and paper.')}</p></details>
+                  <details className="pigment-details"><summary>{t('About Color Simulation')}</summary><dl className="pigment-formula"><div><dt>{t('Mixed Color')}</dt><dd>{mixedColor}</dd></div>{mixerComponents.map((component, index) => <div key={component.id}><dt>{t('Color {number}', { number: index + 1 })}</dt><dd>{component.color.toUpperCase()} · {mixerPercentages[index]}%</dd></div>)}</dl><p className="pigment-note">{t('This is an approximate multi-color Kubelka–Munk simulation derived from sRGB/D65. Ratios are model inputs, not physical recipes. Accurate paint or ink prediction requires measured K/S data for each pigment, binder, and paper.')}</p></details>
                   {paletteError ? <p className="palette-error" role="alert">{paletteError}</p> : null}
                 </section></>
               ) : null}

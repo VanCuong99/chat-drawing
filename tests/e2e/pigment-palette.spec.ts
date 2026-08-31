@@ -40,16 +40,15 @@ test('pha từ nhiều sắc tố, lưu và nạp lại công thức trong palet
   await expect(mixer.getByText(/Mô phỏng gần đúng/)).toBeVisible();
 
   const components = mixer.getByRole('list', { name: 'Các màu thành phần' });
+  await expect(components.getByRole('listitem')).toHaveCount(2);
+  await mixer.getByRole('button', { name: 'Thêm màu thành phần' }).click();
   await expect(components.getByRole('listitem')).toHaveCount(3);
   await components.getByLabel('Màu 1', { exact: true }).fill('#FCF046');
   await components.getByLabel('Màu 2', { exact: true }).fill('#E53166');
   await components.getByLabel('Màu 3', { exact: true }).fill('#3375DA');
-  await components.getByLabel('Phần pha màu 1').fill('1');
-  await components.getByLabel('Phần pha màu 2').fill('1');
-  await components.getByLabel('Phần pha màu 3').fill('1');
-  await components.getByLabel('Phần pha màu 1').fill('1.5');
-  await expect(components.getByLabel('Phần pha màu 1')).toHaveValue('2');
-  await components.getByLabel('Phần pha màu 1').fill('1');
+  await components.getByLabel('Lượng của màu 1').fill('1');
+  await components.getByLabel('Lượng của màu 2').fill('1');
+  await components.getByLabel('Lượng của màu 3').fill('1');
   await expect(components.getByRole('listitem').nth(0)).toContainText('33.3%');
   const addComponent = mixer.getByRole('button', { name: 'Thêm màu thành phần' });
   for (let index = 0; index < 9; index += 1) await addComponent.click();
@@ -63,6 +62,7 @@ test('pha từ nhiều sắc tố, lưu và nạp lại công thức trong palet
 
   await mixer.getByRole('button', { name: 'Dùng màu' }).click();
   await expect(page.getByText('#705C71').first()).toBeVisible();
+  await mixer.getByText('Lưu vào bảng màu').click();
   await mixer.getByRole('textbox', { name: 'Tên màu đã pha' }).fill('Nâu trung tính ba màu');
   await page.route('**/api/palette', async (route) => {
     if (route.request().method() === 'POST') await new Promise((resolve) => setTimeout(resolve, 250));
@@ -85,8 +85,10 @@ test('pha từ nhiều sắc tố, lưu và nạp lại công thức trong palet
   await expect(page.getByRole('button', { name: 'Dùng màu Nâu trung tính ba màu' })).toBeVisible();
   await page.getByRole('button', { name: 'Nạp công thức Nâu trung tính ba màu' }).click();
   await expect(page.getByRole('region', { name: 'Pha màu nâng cao' }).getByRole('listitem')).toHaveCount(3);
-  await expect(page.getByRole('region', { name: 'Pha màu nâng cao' }).getByText('#705C71')).toBeVisible();
+  await page.getByRole('region', { name: 'Pha màu nâng cao' }).getByText('Thông tin mô phỏng màu').click();
+  await expect(page.getByRole('region', { name: 'Pha màu nâng cao' }).getByText(/#FCF046/)).toBeVisible();
 
+  await page.getByRole('region', { name: 'Pha màu nâng cao' }).getByRole('button', { name: 'Đóng pha màu nâng cao' }).click();
   await page.getByRole('button', { name: 'Đóng Esc', exact: true }).click();
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error('DATABASE_URL is required for guest cascade E2E');
