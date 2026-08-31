@@ -1,6 +1,6 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { del, get, head, put } from '@vercel/blob';
+import { BlobNotFoundError, del, get, head, put } from '@vercel/blob';
 import { access, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
@@ -58,7 +58,7 @@ export class StorageService implements OnModuleInit {
         await head(this.objectKey(key));
         return true;
       } catch (error) {
-        if (error instanceof Error && /not found/i.test(error.message)) return false;
+        if (error instanceof BlobNotFoundError) return false;
         throw error;
       }
     }
