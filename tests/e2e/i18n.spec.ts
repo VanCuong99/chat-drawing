@@ -34,9 +34,24 @@ test('language controls remain touch-safe and do not cause mobile overflow @crit
   for (const viewport of [{ width: 390, height: 844 }, { width: 844, height: 390 }]) {
     await page.setViewportSize(viewport);
     await page.goto('/', { waitUntil: 'domcontentloaded' });
-    const box = await page.locator('.language-switcher select').boundingBox();
+    const switcher = page.locator('.language-switcher').first();
+    const box = await switcher.locator('select').boundingBox();
     expect(box?.width).toBeGreaterThanOrEqual(44);
     expect(box?.height).toBeGreaterThanOrEqual(44);
+    const alignment = await switcher.evaluate((element) => {
+      const bounds = element.getBoundingClientRect();
+      const items = [...element.querySelectorAll<HTMLElement>('svg, .language-value')];
+      return {
+        width: bounds.width,
+        center: bounds.top + bounds.height / 2,
+        itemCenters: items.map((item) => {
+          const itemBounds = item.getBoundingClientRect();
+          return itemBounds.top + itemBounds.height / 2;
+        }),
+      };
+    });
+    expect(alignment.width).toBeLessThanOrEqual(80);
+    expect(alignment.itemCenters.every((center) => Math.abs(center - alignment.center) <= 1)).toBe(true);
     const widths = await page.locator('body').evaluate((body) => ({ client: body.clientWidth, scroll: body.scrollWidth }));
     expect(widths.scroll).toBe(widths.client);
   }

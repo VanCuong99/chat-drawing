@@ -82,7 +82,24 @@ test('Studio không bị cắt ở màn hình ngang thấp và mobile @critical'
   await page.getByRole('button', { name: 'Thêm thao tác cuộc trò chuyện' }).click();
   await page.getByRole('button', { name: 'Tìm trong tin nhắn' }).click();
   await expect(page.getByRole('searchbox', { name: 'Tìm nội dung tin nhắn' })).toBeVisible();
+  const messageSearch = page.getByRole('searchbox', { name: 'Tìm nội dung tin nhắn' });
+  const moreConversationActions = page.getByRole('button', { name: 'Thêm thao tác cuộc trò chuyện' });
+  await expect(messageSearch).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(messageSearch).toHaveCount(0);
+  await expect(moreConversationActions).toBeFocused();
+
+  await moreConversationActions.click();
+  await page.getByRole('button', { name: 'Tìm trong tin nhắn' }).click();
+  await expect(messageSearch).toBeFocused();
+  await page.locator('.message-scroll').click({ position: { x: 8, y: 8 } });
+  await expect(messageSearch).toHaveCount(0);
+
+  await moreConversationActions.click();
+  await page.getByRole('button', { name: 'Tìm trong tin nhắn' }).click();
   await page.getByRole('button', { name: 'Đóng tìm kiếm' }).click();
+  await expect(messageSearch).toHaveCount(0);
+  await expect(moreConversationActions).toBeFocused();
   await page.getByRole('button', { name: 'Mở danh sách trò chuyện' }).click();
   await page.getByRole('button', { name: 'Kết thúc phiên khách' }).click();
   await page.getByRole('button', { name: 'Kết thúc phiên', exact: true }).click();

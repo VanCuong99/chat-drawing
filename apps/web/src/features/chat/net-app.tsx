@@ -488,6 +488,10 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const messagesRef = useRef<MessageView[]>([]);
   const conversationAtBottomRef = useRef(false);
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
+  const messageSearchRef = useRef<HTMLDivElement>(null);
+  const messageSearchInputRef = useRef<HTMLInputElement>(null);
+  const messageSearchToggleRef = useRef<HTMLButtonElement>(null);
+  const messageSearchReturnFocusRef = useRef<HTMLButtonElement>(null);
   const mobileHeaderMenuTriggerRef = useRef<HTMLButtonElement>(null);
   const mobileHeaderActionsRef = useRef<HTMLDivElement>(null);
   const joinedInvite = useRef(false);
@@ -525,11 +529,17 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
   const activeRoomUnreadCount = activeRoom?.unreadCount ?? 0;
   const activeRoomFirstUnreadSequence = activeRoom?.firstUnreadSequence ?? null;
   const actorId = actor?.id ?? null;
+  const messageSearchOpen = messageQuery !== '';
   const normalizedMessageQuery = messageQuery.trim().toLocaleLowerCase(localeTag(locale));
   const outboxStoragePrefix = actor ? `net_message_outbox:v3:${actor.kind}:${actor.id}:` : null;
   const activePendingMessages = activeRoomId ? pendingMessages.filter((message) => message.roomId === activeRoomId) : [];
 
   useEffect(() => { messagesRef.current = messages; }, [messages]);
+
+  const closeMessageSearch = useCallback((restoreFocus = false) => {
+    setMessageQuery('');
+    if (restoreFocus) window.requestAnimationFrame(() => messageSearchReturnFocusRef.current?.focus());
+  }, []);
 
   useEffect(() => () => {
     if (pendingPreview?.revoke) URL.revokeObjectURL(pendingPreview.url);
@@ -823,6 +833,28 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       document.removeEventListener('keydown', dismissFromKeyboard);
     };
   }, [mobileHeaderMenuOpen]);
+
+  useEffect(() => {
+    if (!messageSearchOpen) return;
+    const frame = window.requestAnimationFrame(() => messageSearchInputRef.current?.focus());
+    const dismissFromOutside = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node) || messageSearchRef.current?.contains(target) || messageSearchToggleRef.current?.contains(target)) return;
+      closeMessageSearch();
+    };
+    const dismissFromKeyboard = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      closeMessageSearch(true);
+    };
+    document.addEventListener('pointerdown', dismissFromOutside);
+    document.addEventListener('keydown', dismissFromKeyboard);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener('pointerdown', dismissFromOutside);
+      document.removeEventListener('keydown', dismissFromKeyboard);
+    };
+  }, [closeMessageSearch, messageSearchOpen]);
 
   useEffect(() => {
     const onOffline = () => setNetworkOnline(false);
@@ -2551,18 +2583,18 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
               <div className="conversation-actions">
                 {activeRoom.kind !== 'direct' && <button type="button" className={showInviteOnboarding ? 'invite-header-action contextual' : 'invite-header-action'} onClick={() => void copyInvite()} aria-label={t('Copy invite link')} data-tooltip={t('Invite by Link')} data-tooltip-placement="below"><UiIcon name="link" size={17} /><span>{t('Invite')}</span></button>}
                 {installPrompt && <button type="button" className="install-header-action" onClick={() => { void installPrompt.prompt(); setInstallPrompt(null); }} aria-label={t('Install App')} data-tooltip={t('Install App')} data-tooltip-placement="below"><UiIcon name="install" size={18} /></button>}
-                <button type="button" className="desktop-header-action" onClick={() => setMessageQuery((value) => value ? '' : ' ')} aria-label={t('Search messages')} data-tooltip={t('Search Messages')} data-tooltip-placement="below"><UiIcon name="search" size={18} /></button>
+                <button ref={messageSearchToggleRef} type="button" className="desktop-header-action" onClick={(event) => { messageSearchReturnFocusRef.current = event.currentTarget; setMessageQuery((value) => value ? '' : ' '); }} aria-label={t('Search messages')} aria-expanded={messageSearchOpen} aria-controls="message-search" data-tooltip={t('Search Messages')} data-tooltip-placement="below"><UiIcon name="search" size={18} /></button>
                 {activeRoom.pendingRequestCount > 0 ? <button type="button" className="request-queue-action request-aware-action" onClick={() => void openPeopleSafety('requests', activeRoom.id, guestRequestHighlightByRoomRef.current.get(activeRoom.id))} aria-label={t('Open {count} join requests', { count: activeRoom.pendingRequestCount })} data-tooltip={t('Join Requests')} data-tooltip-placement="below"><UiIcon name="group" size={17} /><span className="header-request-badge" aria-hidden="true">{Math.min(activeRoom.pendingRequestCount, 99)}</span></button> : null}
                 <button type="button" className="desktop-header-action" onClick={() => setInfoOpen((value) => !value)} aria-label={t('Conversation details')} data-tooltip={t('Details')} data-tooltip-placement="below"><UiIcon name="info" size={18} /></button>
                 <button ref={mobileHeaderMenuTriggerRef} type="button" className="mobile-header-overflow-trigger" onClick={() => setMobileHeaderMenuOpen((value) => !value)} aria-label={t('More conversation actions')} aria-expanded={mobileHeaderMenuOpen} aria-controls="mobile-header-actions"><UiIcon name="more" size={20} /></button>
               </div>
               {mobileHeaderMenuOpen ? <div ref={mobileHeaderActionsRef} id="mobile-header-actions" className="mobile-header-actions" role="group" aria-label={t('More conversation actions')}>
-                <button type="button" onClick={() => { setMobileHeaderMenuOpen(false); setMessageQuery((value) => value ? '' : ' '); }}><UiIcon name="search" size={18} /> {t('Search Messages')}</button>
+                <button type="button" onClick={() => { messageSearchReturnFocusRef.current = mobileHeaderMenuTriggerRef.current; setMobileHeaderMenuOpen(false); setMessageQuery((value) => value ? '' : ' '); }}><UiIcon name="search" size={18} /> {t('Search Messages')}</button>
                 <button type="button" onClick={() => { setMobileHeaderMenuOpen(false); setInfoOpen(true); }}><UiIcon name="info" size={18} /> {t('Conversation details')}</button>
                 {activeRoom.kind !== 'direct' && !showInviteOnboarding ? <button type="button" onClick={() => { setMobileHeaderMenuOpen(false); void copyInvite(); }}><UiIcon name="link" size={18} /> {t('Invite by Link')}</button> : null}
               </div> : null}
             </header>
-            {messageQuery !== '' && <div className="message-search"><div className="message-search-field"><span aria-hidden="true"><UiIcon name="search" size={18} /></span><input name="message-search" type="search" autoComplete="off" value={messageQuery.trimStart()} onChange={(event) => setMessageQuery(event.target.value || ' ')} placeholder={t('Search content or sender…')} aria-label={t('Search message content')} aria-describedby="message-search-status" /><button type="button" onClick={() => setMessageQuery('')} aria-label={t('Close search')} data-tooltip={t('Close Search')}><UiIcon name="close" size={17} /></button></div><small id="message-search-status" role="status" aria-live="polite">{messageSearchLoading ? t('Searching…') : normalizedMessageQuery.length === 1 ? t('Enter 1 more character') : normalizedMessageQuery ? t('{count} results across full history', { count: messageSearchTotal }) : t('Search this conversation')}</small></div>}
+            {messageSearchOpen && <div ref={messageSearchRef} id="message-search" className="message-search" role="search"><div className="message-search-field"><span aria-hidden="true"><UiIcon name="search" size={18} /></span><input ref={messageSearchInputRef} name="message-search" type="search" autoComplete="off" value={messageQuery.trimStart()} onChange={(event) => setMessageQuery(event.target.value || ' ')} placeholder={t('Search content or sender…')} aria-label={t('Search message content')} aria-describedby="message-search-status" /><button type="button" onClick={() => closeMessageSearch(true)} aria-label={t('Close search')} data-tooltip={t('Close Search')}><UiIcon name="close" size={17} /></button></div><small id="message-search-status" role="status" aria-live="polite">{messageSearchLoading ? t('Searching…') : normalizedMessageQuery.length === 1 ? t('Enter 1 more character') : normalizedMessageQuery ? t('{count} results across full history', { count: messageSearchTotal }) : t('Search this conversation')}</small></div>}
             <section ref={messageScrollRef} className="message-scroll" aria-label={t('Message history')}>
               <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{historyAnnouncement}</span>
               <div className="message-lane">
@@ -2638,7 +2670,7 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
               <input ref={replaceFileRef} hidden name="replace-outbox-image" aria-label={t('Replacement image file')} type="file" accept="image/png,image/jpeg,image/gif,image/webp" onChange={(event) => void replacePendingMedia(event)} />
               <p><kbd>Enter</kbd> {t('send')} · <kbd>Shift</kbd> + <kbd>Enter</kbd> {t('new line')} · {t('images up to 8 MB')}</p>
             </footer>
-            <AppDialog open={infoOpen} onClose={() => setInfoOpen(false)} labelledBy="conversation-details-title" describedBy="conversation-details-description" className="details-backdrop"><aside className="info-drawer"><button type="button" className="dialog-close" onClick={() => setInfoOpen(false)} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below"><UiIcon name="close" size={18} /></button><header className="info-identity"><span className="avatar info-avatar" style={avatarStyle(activeRoom.name)}>{activeRoom.name.slice(0, 1)}</span><div><h2 id="conversation-details-title">{activeRoom.name}</h2><p id="conversation-details-description">{t('A space to continue ideas with words and drawings.')}</p></div></header><div className="info-stats"><span><strong>{activeRoom.messageCount ?? messages.length}</strong><small>{t('Messages')}</small></span><span><strong>{activeRoom.mediaCount ?? messages.filter((item) => item.assetKey).length}</strong><small>{t('Images & Drawings')}</small></span></div>{activeRoom.kind !== 'direct' && <section className="info-section"><h3>{t('Invite Link')}</h3>{activeRoom.inviteActive ? <><label className="sr-only" htmlFor="conversation-invite-link">{t('Invite Link')}</label><input id="conversation-invite-link" name="invite-link" readOnly value={`${typeof window !== 'undefined' ? window.location.origin : ''}/?room=${activeRoom.inviteCode}`} /><button type="button" className="primary-button wide" onClick={() => void copyInvite()}>{t('Copy Invite Link')}</button></> : <div className="invite-revoked-state"><UiIcon name="link" size={20} /><div><strong>{t('Invite Revoked')}</strong><small>{t('This old link cannot admit anyone. Create a new invite from Access settings.')}</small></div><button type="button" onClick={() => void openPeopleSafety('access')}>{t('Open Access Settings')}</button></div>}</section>}<section className="info-section info-safety"><h3>{t('People & Safety')}</h3><button type="button" className="secondary-button wide people-safety-entry" onClick={() => void openPeopleSafety()}><UiIcon name="group" size={18} /> {t('Manage People & Safety')}{activeRoom.pendingRequestCount ? <span>{t('{count} requests', { count: activeRoom.pendingRequestCount })}</span> : null}</button><small className="privacy-note"><UiIcon name="lock" size={15} /> {t('Signed-in members keep access long term. Guest messages and attached images remain after they leave.')}</small></section></aside></AppDialog>
+            <AppDialog open={infoOpen} onClose={() => setInfoOpen(false)} labelledBy="conversation-details-title" describedBy="conversation-details-description" className="details-backdrop"><aside className="info-drawer"><button type="button" className="dialog-close" onClick={() => setInfoOpen(false)} aria-label={t('Close')} data-tooltip={t('Close')} data-tooltip-placement="below"><UiIcon name="close" size={18} /></button><header className="info-identity"><span className="avatar info-avatar" style={avatarStyle(activeRoom.name)}>{activeRoom.name.slice(0, 1)}</span><div><h2 id="conversation-details-title">{activeRoom.name}</h2><p id="conversation-details-description">{t('A space to continue ideas with words and drawings.')}</p></div></header><div className="info-stats"><span><strong>{activeRoom.messageCount ?? messages.length}</strong><small>{t('Messages')}</small></span><span><strong>{activeRoom.mediaCount ?? messages.filter((item) => item.assetKey).length}</strong><small>{t('Images & Drawings')}</small></span></div>{activeRoom.kind !== 'direct' && <section className="info-section"><h3>{t('Invite Link')}</h3>{activeRoom.inviteActive ? <><label className="sr-only" htmlFor="conversation-invite-link">{t('Invite Link')}</label><input id="conversation-invite-link" name="invite-link" readOnly value={`${typeof window !== 'undefined' ? window.location.origin : ''}/?room=${activeRoom.inviteCode}`} /><button type="button" className="primary-button wide" onClick={() => void copyInvite()}>{t('Copy Invite Link')}</button></> : <div className="invite-revoked-state"><UiIcon name="link" size={20} /><div><strong>{t('Invite Revoked')}</strong><small>{t('This old link cannot admit anyone. Create a new invite from Access settings.')}</small></div><button type="button" onClick={() => void openPeopleSafety('access')}>{t('Open Access Settings')}</button></div>}</section>}<section className="info-section info-safety"><button type="button" className="people-safety-entry" onClick={() => void openPeopleSafety()}><span className="people-safety-entry-icon"><UiIcon name="group" size={18} /></span><span className="people-safety-entry-copy"><strong>{t('Manage People & Safety')}</strong><small>{t('See who is here, review access requests, and keep this conversation safe.')}</small></span>{activeRoom.pendingRequestCount ? <span className="people-safety-request-count">{t('{count} requests', { count: activeRoom.pendingRequestCount })}</span> : null}<UiIcon name="arrow" size={16} /></button><small className="privacy-note"><UiIcon name="lock" size={15} /> {t('Signed-in members keep access long term. Guest messages and attached images remain after they leave.')}</small></section></aside></AppDialog>
           </>
         ) : <div className="no-room"><Logo /><h1>{t('No Conversations Yet')}</h1><p>{actor?.kind === 'user' ? t('Find someone to message or create a new group.') : t('This invite link is no longer active.')}</p>{actor?.kind === 'user' && <button type="button" className="primary-button" onClick={() => openConversationStarter()}>{t('Start a Conversation')}</button>}</div>}
       </main>
@@ -2699,9 +2731,11 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
       <AppDialog open={peopleSafetyOpen} onClose={() => { setPeopleSafetyOpen(false); setReportOpen(false); setReportTarget(null); }} labelledBy="people-safety-title" describedBy="people-safety-description" className="management-backdrop">
         <section className="dialog-card people-safety-dialog">
           <button type="button" className="dialog-close" onClick={() => setPeopleSafetyOpen(false)} aria-label={t('Close')}><UiIcon name="close" size={18} /></button>
-          <span className="eyebrow">{t('Conversation Controls')}</span>
-          <h2 id="people-safety-title">{t('People & Safety')}</h2>
-          <p id="people-safety-description">{t('See who is here, review access requests, and keep this conversation safe.')}</p>
+          <header className="people-safety-header">
+            <span className="eyebrow">{t('Conversation Controls')}</span>
+            <h2 id="people-safety-title">{t('People & Safety')}</h2>
+            <p id="people-safety-description">{t('See who is here, review access requests, and keep this conversation safe.')}</p>
+          </header>
           {roomPeopleLoading ? <div className="people-safety-loading" role="status">{t('Loading people…')}</div> : null}
           {roomPeople ? <>
             <div className="people-safety-tabs" role="tablist" aria-label={t('Conversation control sections')}>
@@ -2736,7 +2770,15 @@ export default function NetApp({ initialUser, initialApiToken, signInPath, signO
               <small className="signed-in-policy-note"><UiIcon name="info" size={15} /> {t('Signed-in people still join directly from a valid invite. Approval currently applies to guests.')}</small>
             </section> : null}
 
-            {peopleSafetySection === 'safety' ? <section className="people-safety-section safety-zone" role="tabpanel"><section className="notification-section" aria-labelledby="notification-section-title"><h3 id="notification-section-title">{t('Notifications')}</h3><button type="button" className="notification-setting" onClick={() => void toggleRoomMute()} aria-pressed={roomPeople.muted}><UiIcon name="message" size={18} /><span><strong>{roomPeople.muted ? t('Unmute Conversation') : t('Mute Conversation')}</strong><small>{roomPeople.muted ? t('Resume in-app notifications for new activity.') : t('Pause conversation activity notifications. Join requests remain visible to owners.')}</small></span></button></section><button type="button" className="wide" onClick={() => { setReportTarget(null); setReportOpen(true); }}>{t('Report Conversation')}</button>{(roomPeople.blockedAccounts ?? []).length ? <section className="blocked-accounts" aria-labelledby="blocked-accounts-title"><h3 id="blocked-accounts-title">{t('Blocked Accounts')}</h3>{(roomPeople.blockedAccounts ?? []).map((account) => <div key={account.id}><span className="avatar" style={{ '--avatar': account.avatarColor } as CSSProperties}>{account.displayName.slice(0, 1)}</span><strong>{account.displayName}</strong><button type="button" onClick={() => void unblockAccount(account.id)}>{t('Unblock')}</button></div>)}</section> : null}<div className="danger-zone"><span className="eyebrow destructive">{t('Danger Zone')}</span>{actor?.kind === 'user' ? <button type="button" onClick={() => void archiveConversation()}>{t('Archive for Me')}</button> : null}{actor?.kind === 'user' && roomPeople.currentRole !== 'owner' ? <button type="button" className="danger-button" onClick={() => setSafetyAction({ kind: 'leave' })}>{t('Leave Conversation')}</button> : null}{roomPeople.canManage ? <button type="button" className="danger-button" onClick={() => setDeleteRoomConfirmOpen(true)}>{t('Delete Conversation')}</button> : null}</div></section> : null}
+            {peopleSafetySection === 'safety' ? <section className="people-safety-section safety-zone" role="tabpanel">
+              <section className="notification-section" aria-labelledby="notification-section-title"><h3 id="notification-section-title">{t('Notifications')}</h3><button type="button" className="notification-setting" onClick={() => void toggleRoomMute()} aria-pressed={roomPeople.muted}><span className="safety-action-icon"><UiIcon name="message" size={18} /></span><span><strong>{roomPeople.muted ? t('Unmute Conversation') : t('Mute Conversation')}</strong><small>{roomPeople.muted ? t('Resume in-app notifications for new activity.') : t('Pause conversation activity notifications. Join requests remain visible to owners.')}</small></span></button></section>
+              <div className="safety-action-list">
+                <button type="button" className="safety-action-row" onClick={() => { setReportTarget(null); setReportOpen(true); }}><span className="safety-action-icon"><UiIcon name="info" size={18} /></span><span><strong>{t('Report Conversation')}</strong><small>{t('Reports are private. Include only the context needed to understand what happened.')}</small></span><UiIcon name="arrow" size={16} /></button>
+                {actor?.kind === 'user' ? <button type="button" className="safety-action-row" onClick={() => void archiveConversation()}><span className="safety-action-icon"><UiIcon name="history" size={18} /></span><span><strong>{t('Archive for Me')}</strong></span><UiIcon name="arrow" size={16} /></button> : null}
+              </div>
+              {(roomPeople.blockedAccounts ?? []).length ? <section className="blocked-accounts" aria-labelledby="blocked-accounts-title"><h3 id="blocked-accounts-title">{t('Blocked Accounts')}</h3>{(roomPeople.blockedAccounts ?? []).map((account) => <div key={account.id}><span className="avatar" style={{ '--avatar': account.avatarColor } as CSSProperties}>{account.displayName.slice(0, 1)}</span><strong>{account.displayName}</strong><button type="button" onClick={() => void unblockAccount(account.id)}>{t('Unblock')}</button></div>)}</section> : null}
+              {(actor?.kind === 'user' && roomPeople.currentRole !== 'owner') || roomPeople.canManage ? <div className="danger-zone"><span className="eyebrow destructive">{t('Danger Zone')}</span><div className="danger-action-list">{actor?.kind === 'user' && roomPeople.currentRole !== 'owner' ? <button type="button" className="danger-button" onClick={() => setSafetyAction({ kind: 'leave' })}><span>{t('Leave Conversation')}</span><UiIcon name="arrow" size={16} /></button> : null}{roomPeople.canManage ? <button type="button" className="danger-button" onClick={() => setDeleteRoomConfirmOpen(true)}><span>{t('Delete Conversation')}</span><UiIcon name="arrow" size={16} /></button> : null}</div></div> : null}
+            </section> : null}
           </> : null}
         </section>
       </AppDialog>

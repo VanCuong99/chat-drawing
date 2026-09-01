@@ -1239,7 +1239,7 @@ test('lịch sử bản vẽ cho phép so sánh và tiếp tục từ bất kỳ
     rooms: [canvasRoom],
   } }));
   await page.route('**/api/realtime/token', (route) => route.fulfill({ status: 503, json: { error: 'Dùng polling trong test' } }));
-  await page.route('**/api/rooms/canvas-lineage-room/messages/canvas-v3/lineage', (route) => route.fulfill({ json: { lineage } }));
+  await page.route('**/api/rooms/canvas-lineage-room/messages/canvas-v3/lineage', (route) => route.fulfill({ json: { lineage, canDecide: true, decisionOwners: [{ id: 'review-user', displayName: 'Review User' }] } }));
   await page.route('**/api/rooms/canvas-lineage-room/messages*', (route) => route.fulfill({ json: { messages: [lineage[2]], nextCursor: null } }));
   await page.route('**/api/assets/canvas-asset-v*', (route) => route.fulfill({
     status: 200,
@@ -1303,8 +1303,31 @@ test('lịch sử bản vẽ cho phép so sánh và tiếp tục từ bất kỳ
   await expect(dialog.getByRole('heading', { name: 'So sánh với Phiên bản 1', exact: true })).toBeVisible();
   await expect(dialog.getByRole('combobox', { name: 'So sánh với' })).toHaveValue('canvas-v2');
   await expect(dialog.getByRole('button', { name: /Vẽ tiếp từ phiên bản 1/ })).toBeVisible();
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await dialog.getByRole('button', { name: 'Ghi chú' }).click();
+  const editorGeometry = await dialog.locator('.decision-owner-controls').evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    const dialogBounds = element.closest('.lineage-dialog')!.getBoundingClientRect();
+    const fields = [...element.querySelectorAll<HTMLElement>('.decision-owner-fields > label')].map((field) => field.getBoundingClientRect());
+    const save = element.querySelector<HTMLButtonElement>('.decision-owner-footer button')?.getBoundingClientRect();
+    return {
+      fitsDialog: bounds.left >= dialogBounds.left && bounds.right <= dialogBounds.right,
+      fieldTops: fields.map((field) => Math.round(field.top)),
+      editorHeight: bounds.height,
+      saveHeight: save?.height ?? 0,
+      saveBottomAligned: save ? Math.abs(Math.round(bounds.bottom - save.bottom)) <= 1 : false,
+    };
+  });
+  expect(editorGeometry.fitsDialog).toBe(true);
+  expect(new Set(editorGeometry.fieldTops).size).toBe(1);
+  expect(editorGeometry.editorHeight).toBeLessThanOrEqual(180);
+  expect(editorGeometry.saveHeight).toBeGreaterThanOrEqual(44);
+  expect(editorGeometry.saveBottomAligned).toBe(true);
   await dialog.getByRole('button', { name: /Vẽ tiếp từ phiên bản 1/ }).click();
-  await expect(page.getByRole('dialog', { name: /Nét Studio · V1/ })).toBeVisible();
+  const studio = page.getByRole('dialog', { name: /Nét Studio/ });
+  await expect(studio).toBeVisible();
+  const sourceControlsFit = await studio.locator('.source-layer-toggle button').evaluateAll((buttons) => buttons.every((button) => button.scrollWidth <= button.clientWidth && button.scrollHeight <= button.clientHeight));
+  expect(sourceControlsFit).toBe(true);
 });
 
 test('lịch sử chỉ có một phiên bản không hiển thị hành động so sánh @critical', async ({ page }) => {
@@ -1461,6 +1484,7 @@ test('People & Safety hiển thị vai trò, mute, report và thu hồi invite t
     const people = element.querySelector<HTMLElement>('.people-list');
     return {
       width: bounds.width,
+      height: bounds.height,
       rightGap: window.innerWidth - bounds.right,
       titleSize: title ? Number.parseFloat(getComputedStyle(title).fontSize) : 99,
       closeWidth: close?.getBoundingClientRect().width ?? 0,
@@ -1469,8 +1493,10 @@ test('People & Safety hiển thị vai trò, mute, report và thu hồi invite t
       peopleBorder: people ? getComputedStyle(people).borderTopWidth : '1px',
     };
   });
-  expect(managementGeometry.width).toBeLessThanOrEqual(720);
-  expect(managementGeometry.rightGap).toBeLessThanOrEqual(1);
+  expect(managementGeometry.width).toBeLessThanOrEqual(600);
+  expect(managementGeometry.height).toBeLessThan(700);
+  expect(managementGeometry.rightGap).toBeGreaterThanOrEqual(15);
+  expect(managementGeometry.rightGap).toBeLessThanOrEqual(17);
   expect(managementGeometry.titleSize).toBeLessThanOrEqual(24);
   expect(managementGeometry.closeWidth).toBeGreaterThanOrEqual(44);
   expect(managementGeometry.closeIconWidth).toBe(18);
@@ -1484,6 +1510,19 @@ test('People & Safety hiển thị vai trò, mute, report và thu hồi invite t
   await dialog.getByRole('tab', { name: 'An toàn' }).click();
   const mute = dialog.getByRole('button', { name: /Tắt thông báo/ });
   expect((await mute.boundingBox())?.height).toBeGreaterThanOrEqual(44);
+  const muteAlignment = await mute.evaluate((element) => {
+    const tile = element.querySelector<HTMLElement>('.safety-action-icon')!.getBoundingClientRect();
+    const icon = element.querySelector<SVGElement>('.safety-action-icon svg')!.getBoundingClientRect();
+    const copy = element.querySelector<HTMLElement>('.safety-action-icon + span')!;
+    return {
+      horizontalOffset: Math.abs((tile.left + tile.width / 2) - (icon.left + icon.width / 2)),
+      verticalOffset: Math.abs((tile.top + tile.height / 2) - (icon.top + icon.height / 2)),
+      copyFits: copy.scrollWidth <= copy.clientWidth && copy.scrollHeight <= copy.clientHeight,
+    };
+  });
+  expect(muteAlignment.horizontalOffset).toBeLessThanOrEqual(1);
+  expect(muteAlignment.verticalOffset).toBeLessThanOrEqual(1);
+  expect(muteAlignment.copyFits).toBe(true);
   await mute.click();
   await expect(dialog.getByRole('button', { name: /Bật lại thông báo/ })).toBeVisible();
   await dialog.getByRole('tab', { name: /Mọi người/ }).click();
